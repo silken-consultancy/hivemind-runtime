@@ -1,8 +1,8 @@
 // routes/setup.ts — first-login mTLS enrollment popup.
 //
 // Companion to bin/fos-beta-enroll (B2, cross-repo — 4tuenyOS) which mints the
-// enrollment token server-side. Token contract (against POST /ca/issue on
-// kernel.silken.ia.br:4443):
+// enrollment token server-side. Token contract (against POST /ca/issue on the
+// product endpoint, HIVEMIND_ENDPOINT — default hivemind.silken.ia.br:4443):
 //
 //   Request:  POST /ca/issue  body: { token: string, csr_pem: string }
 //   Response: { cert_pem: string, ca_cert_pem: string }
@@ -19,6 +19,10 @@ import { Hono } from 'hono';
 import { existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+
+// Product endpoint — parametrized (P0 fix). Set via HIVEMIND_ENDPOINT env
+// (written by install.sh --endpoint; preserved across enrollment).
+const ENDPOINT = process.env.HIVEMIND_ENDPOINT ?? 'hivemind.silken.ia.br:4443';
 
 export const setupRouter = new Hono();
 
@@ -183,7 +187,7 @@ setupRouter.post('/enroll', async (c) => {
       return c.json({ ok: false, message: 'CSR file empty after openssl — check openssl installation' }, 500);
     }
 
-    const caUrl = 'https://kernel.silken.ia.br:4443/ca/issue';
+    const caUrl = `https://${ENDPOINT}/ca/issue`;
     let caRes: Response;
     try {
       // No client cert here — /ca/issue validates via enrollment token.
@@ -231,8 +235,9 @@ setupRouter.post('/enroll', async (c) => {
       `MTLS_CERT_PATH=${certPath}`,
       `MTLS_KEY_PATH=${keyPath}`,
       `MTLS_CA_PATH=${caPath}`,
-      `MTLS_UPSTREAM=https://kernel.silken.ia.br:4443/v1/mcp`,
+      `MTLS_UPSTREAM=https://${ENDPOINT}/v1/mcp`,
       `MTLS_PROXY_PORT=${proxyPort}`,
+      `HIVEMIND_ENDPOINT=${ENDPOINT}`,
       `HIVEMIND_OWNER=${ownerId}`,
       '',
     ].join('\n');
