@@ -11,6 +11,7 @@
 set -euo pipefail
 
 HIVEMIND_HOME="${HIVEMIND_HOME:-$HOME/.hivemind}"
+HIVEMIND_ENDPOINT="${HIVEMIND_ENDPOINT:-hivemind.silken.ia.br:4443}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_PREFIX="/usr/local"
 
@@ -20,8 +21,11 @@ while [[ $# -gt 0 ]]; do
     --prefix)
       if [ -z "${2:-}" ]; then echo "Error: --prefix requires a value" >&2; exit 1; fi
       INSTALL_PREFIX="$2"; shift 2 ;;
+    --endpoint)
+      if [ -z "${2:-}" ]; then echo "Error: --endpoint requires a value" >&2; exit 1; fi
+      HIVEMIND_ENDPOINT="$2"; shift 2 ;;
     --help|-h)
-      echo "Usage: bash install.sh [--prefix <dir>]"; exit 0 ;;
+      echo "Usage: bash install.sh [--prefix <dir>] [--endpoint <host:port>]"; exit 0 ;;
     *)
       echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -49,6 +53,15 @@ echo "  HIVEMIND_HOME: ${HIVEMIND_HOME}"
 # ── Create directories ────────────────────────────────────────────────────────
 mkdir -p "${HIVEMIND_HOME}/.claude"
 mkdir -p "${HIVEMIND_HOME}/runtime"
+
+# Persist the product endpoint so the runtime reads it at startup (before enrollment).
+touch "${HIVEMIND_HOME}/.env"
+if grep -q '^HIVEMIND_ENDPOINT=' "${HIVEMIND_HOME}/.env"; then
+  sed -i "s|^HIVEMIND_ENDPOINT=.*|HIVEMIND_ENDPOINT=${HIVEMIND_ENDPOINT}|" "${HIVEMIND_HOME}/.env"
+else
+  printf 'HIVEMIND_ENDPOINT=%s\n' "${HIVEMIND_ENDPOINT}" >> "${HIVEMIND_HOME}/.env"
+fi
+echo "  Endpoint:    ${HIVEMIND_ENDPOINT}"
 
 # ── Copy files ────────────────────────────────────────────────────────────────
 cp "${SCRIPT_DIR}/CLAUDE.md" "${HIVEMIND_HOME}/CLAUDE.md"
