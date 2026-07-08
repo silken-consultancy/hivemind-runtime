@@ -45,7 +45,9 @@ const schema = z.object({
   // MTLS_PROXY_PORT absent = proxy disabled (feature opt-in).
   // MTLS_PROXY_PORT set without the 3 cert paths = proxy disabled + log warning.
   MTLS_PROXY_PORT: z.coerce.number().int().positive().optional(),
-  MTLS_UPSTREAM: z.string().url().optional().default('https://kernel.silken.ia.br:4443/v1/mcp'),
+  // Product endpoint (host:port). Single source of truth; MTLS_UPSTREAM derives from it.
+  HIVEMIND_ENDPOINT: z.string().default('hivemind.silken.ia.br:4443'),
+  MTLS_UPSTREAM: z.string().url().optional(),
   MTLS_CERT_PATH: z.string().optional(),
   MTLS_KEY_PATH: z.string().optional(),
   MTLS_CA_PATH: z.string().optional(),
@@ -63,6 +65,11 @@ function loadEnv(): EnvConfig {
     process.exit(1);
   }
   const cfg = parsed.data;
+
+  // Derive MTLS_UPSTREAM from HIVEMIND_ENDPOINT unless explicitly overridden.
+  if (!cfg.MTLS_UPSTREAM) {
+    cfg.MTLS_UPSTREAM = `https://${cfg.HIVEMIND_ENDPOINT}/v1/mcp`;
+  }
 
   // Guard: proxy and main server must not share a port.
   if (cfg.MTLS_PROXY_PORT !== undefined && cfg.MTLS_PROXY_PORT === cfg.AR_PORT) {
@@ -97,7 +104,7 @@ export function mtlsProxyConfig(): {
   const port = env.MTLS_PROXY_PORT;
   if (!port) return null;
 
-  // MTLS_UPSTREAM has .default() in the Zod schema — never undefined here.
+  // MTLS_UPSTREAM is derived from HIVEMIND_ENDPOINT in loadEnv — defined here.
   const upstream = env.MTLS_UPSTREAM;
   const certPath = env.MTLS_CERT_PATH;
   const keyPath  = env.MTLS_KEY_PATH;

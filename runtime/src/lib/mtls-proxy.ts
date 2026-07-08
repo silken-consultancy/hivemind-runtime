@@ -1,7 +1,7 @@
 // mTLS loopback proxy for hivemind-runtime.
 //
 // Listens on 127.0.0.1:<MTLS_PROXY_PORT> (HTTP plain) and forwards every
-// request to the upstream mTLS endpoint (https://kernel.silken.ia.br:4443)
+// request to the upstream mTLS endpoint (the product endpoint (HIVEMIND_ENDPOINT))
 // presenting the user client certificate.
 //
 // STREAMING / SSE: MCP streamable-HTTP uses long-lived SSE responses.
