@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# hivemind — HiveMind thin CLI.
+#
+# Analogous to silken-runtime but standalone — zero lab deps.
+# Runs in the user's project directory; slug = arg or basename(cwd).
+#
+# Usage:
+#   hivemind [<slug>]     # start proxy + exec claude; slug = arg or basename(cwd)
+#   hivemind start        # start proxy only (no claude)
+#   hivemind stop         # stop the proxy
+#   hivemind status       # proxy health + cert validity
+#   hivemind --version    # print version and exit
+
+set -euo pipefail
+
+HIVEMIND_VERSION="0.1.0"
+HIVEMIND_HOME="${HIVEMIND_HOME:-$HOME/.hivemind}"
+RUNTIME_PORT="${AR_PORT:-7777}"
+PROXY_PORT="${MTLS_PROXY_PORT:-7779}"
+RUNTIME_LOG="${HOME}/.fos/.cache/hivemind-runtime.log"
+RUNTIME_PID_FILE="${HOME}/.fos/.cache/hivemind-runtime.pid"
+CERT_DIR="${HOME}/.fos/mtls"
+RUNTIME_BIN="${HIVEMIND_HOME}/runtime/src/server.ts"
+
+# Load user env if present (sets MTLS_* + HIVEMIND_OWNER).
+if [ -f "${HIVEMIND_HOME}/.env" ]; then
+  # shellcheck disable=SC1090
+  set -a; . "${HIVEMIND_HOME}/.env"; set +a
+fi
+
+# Refresh port vars after env load (env may override AR_PORT / MTLS_PROXY_PORT).
+RUNTIME_PORT="${AR_PORT:-${RUNTIME_PORT}}"
+PROXY_PORT="${MTLS_PROXY_PORT:-${PROXY_PORT}}"
+
+# ── ANSI helpers (NO_COLOR-aware) ────────────────────────────────────────────
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  _ok()  { printf '\033[0;32m%s\033[0m' "$*"; }
+  _err() { printf '\033[0;31m%s\033[0m' "$*"; }
+  _dim() { printf '\033[2m%s\033[0m' "$*"; }
+else
+  _ok()  { printf '%s' "$*"; }
+  _err() { printf '%s' "$*"; }
+  _dim() { printf '%s' "$*"; }
+fi
+
+# ── _has_cert: returns 0 if at least one *.cert.pem exists ───────────────────
+_has_cert() {
+  [ -d "${CERT_DIR}" ] && ls "${CERT_DIR}"/*.cert.pem > /dev/null 2>&1
+}
+
+# ── _setup_mode: first-login flow ─────────────────────────────────────────────
+# Starts server in setup-only mode, opens browser, polls /setup/status until done.
+_setup_mode() {
+  echo ""
+  echo "HiveMind: first run detected — no certificate found."
+  echo "Starting setup server..."
+
+  if ! command -v bun > /dev/null 2>&1; then
+    echo "Error: 'bun' is required but not found." >&2
+    echo "Install bun: curl -fsSL https://bun.sh/install | bash" >&2
+    exit 1
+  fi
+  if ! command -v openssl > /dev/null 2>&1; then
+    echo "Error: 'openssl' is required but not found." >&2
+    exit 1
+  fi
+  if [ ! -f "${RUNTIME_BIN}" ]; then
+    echo "Error: runtime not found at ${RUNTIME_BIN}" >&2
+    echo "Re-run: bash install.sh" >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "${RUNTIME_LOG}")"
+  bun run "${RUNTIME_BIN}" --setup-only >> "${RUNTIME_LOG}" 2>&1 &
+  _SETUP_PID=$!
+
+  # Poll until setup server ready (timeout 15s).
+  _TRIES=0
+  until curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; do
+    _TRIES=$((_TRIES + 1))
+    if [ "${_TRIES}" -ge 15 ]; then
+      echo "Error: setup server did not start after 15s. Check: ${RUNTIME_LOG}" >&2
+      kill "${_SETUP_PID}" 2>/dev/null || true
+      exit 1
+    fi
+    sleep 1
+  done
+
+  local _SETUP_URL="http://localhost:${RUNTIME_PORT}/setup"
+  echo "Opening browser: ${_SETUP_URL}"
+
+  if command -v xdg-open > /dev/null 2>&1; then
+    xdg-open "${_SETUP_URL}" > /dev/null 2>&1 &
+  elif command -v open > /dev/null 2>&1; then
+    open "${_SETUP_URL}" &
+  else
+    echo "(Could not auto-open browser — open manually: ${_SETUP_URL})"
+  fi
+
+  echo "Fill in your Enrollment Token and Owner ID, then click 'Configure mTLS'."
+  echo "Waiting for enrollment to complete (timeout: 5 min)..."
+
+  # Poll /setup/status until done (timeout 300s / 5 min).
+  _TRIES=0
+  while :; do
+    _DONE=$(curl -sf "http://127.0.0.1:${RUNTIME_PORT}/setup/status" 2>/dev/null \
+      | grep -c '"done":true' 2>/dev/null || echo 0)
+    if [ "${_DONE}" -gt 0 ]; then
+      break
+    fi
+    _TRIES=$((_TRIES + 1))
+    if [ "${_TRIES}" -ge 300 ]; then
+      echo "Timeout: enrollment did not complete in 5 minutes." >&2
+      kill "${_SETUP_PID}" 2>/dev/null || true
+      exit 1
+    fi
+    sleep 1
+  done
+
+  kill "${_SETUP_PID}" 2>/dev/null || true
+  echo ""
+  echo "Done. Run 'hivemind' in your project directory to start."
+  exit 0
+}
+
+# ── _start_proxy: ensure the runtime+proxy is running ─────────────────────────
+_start_proxy() {
+  if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! command -v bun > /dev/null 2>&1; then
+    echo "Error: 'bun' is required. Install: curl -fsSL https://bun.sh/install | bash" >&2
+    exit 1
+  fi
+  if [ ! -f "${RUNTIME_BIN}" ]; then
+    echo "Error: runtime not found at ${RUNTIME_BIN}. Re-run: bash install.sh" >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "${RUNTIME_LOG}")"
+  bun run "${RUNTIME_BIN}" >> "${RUNTIME_LOG}" 2>&1 &
+  echo $! > "${RUNTIME_PID_FILE}"
+
+  echo "[hivemind] starting runtime..." >&2
+  _TRIES=0
+  until curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; do
+    _TRIES=$((_TRIES + 1))
+    if [ "${_TRIES}" -ge 15 ]; then
+      echo "Error: hivemind runtime did not start after 15s. Check: ${RUNTIME_LOG}" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+  echo "[hivemind] runtime up (pid=$(cat "${RUNTIME_PID_FILE}" 2>/dev/null || echo '?'))" >&2
+}
+
+# ── Subcommands ───────────────────────────────────────────────────────────────
+
+cmd_version() {
+  echo "HiveMind v${HIVEMIND_VERSION}"
+}
+
+cmd_help() {
+  echo "Usage: hivemind [<slug>] | start | stop | status | --version"
+  echo ""
+  echo "  hivemind [<slug>]   Start proxy + open Claude Code (slug = arg or basename of cwd)"
+  echo "  hivemind start      Start proxy only"
+  echo "  hivemind stop       Stop the proxy"
+  echo "  hivemind status     Show proxy health and certificate validity"
+  echo "  hivemind --version  Print version"
+}
+
+cmd_status() {
+  echo "HiveMind v${HIVEMIND_VERSION} — status"
+  echo ""
+
+  # Runtime health.
+  if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; then
+    echo "  Runtime:    $(_ok "OK") (port ${RUNTIME_PORT})"
+  else
+    echo "  Runtime:    $(_err "STOPPED") (port ${RUNTIME_PORT})"
+  fi
+
+  # Proxy (mTLS loopback) health.
+  if curl -sf "http://127.0.0.1:${PROXY_PORT}/v1/mcp" > /dev/null 2>&1; then
+    echo "  mTLS proxy: $(_ok "OK") (port ${PROXY_PORT})"
+  else
+    echo "  mTLS proxy: $(_dim "not responding") (port ${PROXY_PORT})"
+  fi
+
+  # Certificate validity.
+  local _owner="${HIVEMIND_OWNER:-}"
+  if _has_cert; then
+    if [ -n "${_owner}" ] && [ -f "${CERT_DIR}/${_owner}.cert.pem" ] && [ -f "${CERT_DIR}/ca.cert.pem" ]; then
+      if openssl verify -CAfile "${CERT_DIR}/ca.cert.pem" \
+           "${CERT_DIR}/${_owner}.cert.pem" > /dev/null 2>&1; then
+        echo "  Cert:       $(_ok "VALID") (owner=${_owner})"
+      else
+        echo "  Cert:       $(_err "INVALID") — re-enroll: rm -rf ${CERT_DIR} && hivemind"
+      fi
+    else
+      echo "  Cert:       $(_dim "present (run 'hivemind' to validate)")"
+    fi
+  else
+    echo "  Cert:       $(_dim "NOT FOUND") — run 'hivemind' to enroll"
+  fi
+}
+
+cmd_start() {
+  if ! _has_cert; then _setup_mode; fi
+  _start_proxy
+  echo "[hivemind] proxy running on port ${PROXY_PORT}"
+}
+
+cmd_stop() {
+  if [ -f "${RUNTIME_PID_FILE}" ]; then
+    local _pid
+    _pid=$(cat "${RUNTIME_PID_FILE}" 2>/dev/null || echo '')
+    if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
+      kill "${_pid}"
+      rm -f "${RUNTIME_PID_FILE}"
+      echo "[hivemind] runtime stopped"
+    else
+      echo "[hivemind] no running runtime at pid ${_pid}"
+      rm -f "${RUNTIME_PID_FILE}"
+    fi
+  else
+    echo "[hivemind] no runtime pid file found (already stopped?)"
+  fi
+}
+
+# cmd_open: start proxy + exec claude.
+# $1 = slug (optional); remaining $@ passed to claude.
+cmd_open() {
+  local _slug="${1:-}"
+  if [ $# -gt 0 ]; then shift; fi
+
+  if ! _has_cert; then _setup_mode; fi
+
+  # Determine slug: arg > basename(cwd).
+  local _project_slug
+  if [ -n "${_slug}" ]; then
+    _project_slug="${_slug}"
+  else
+    _project_slug="$(basename "$(pwd)")"
+  fi
+
+  _start_proxy
+
+  exec env \
+    CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" \
+    FOS_SLUG="${_project_slug}" \
+    HIVEMIND_HOME="${HIVEMIND_HOME}" \
+    claude "$@"
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+case "${1:-}" in
+  start)          shift || true; cmd_start ;;
+  stop)           shift || true; cmd_stop ;;
+  status)         shift || true; cmd_status ;;
+  --version|-v)   cmd_version ;;
+  --help|-h)      cmd_help ;;
+  *)              cmd_open "$@" ;;
+esac

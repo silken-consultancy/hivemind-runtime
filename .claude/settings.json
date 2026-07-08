@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__engram__fos_boot_skeleton",
+      "mcp__engram__fos_memory",
+      "mcp__engram__fos_recall",
+      "mcp__engram__fos_memory_lookup",
+      "mcp__engram__fos_memory_delete",
+      "mcp__engram__fos_decision",
+      "mcp__engram__fos_implementation",
+      "mcp__engram__fos_implementation_phase",
+      "mcp__engram__fos_phase_item",
+      "mcp__engram__fos_planning_status",
+      "mcp__engram__fos_session",
+      "mcp__engram__fos_heartbeat",
+      "Bash(git *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Read(**)",
+      "Edit(**)",
+      "Write(**)"
+    ],
+    "defaultMode": "default"
+  },
+  "hooks": {}
+}
