@@ -19,15 +19,15 @@ INSTALL_PREFIX="/usr/local"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix)
-      if [ -z "${2:-}" ]; then echo "Error: --prefix requires a value" >&2; exit 1; fi
+      if [ -z "${2:-}" ]; then echo "Erro: --prefix requer um valor" >&2; exit 1; fi
       INSTALL_PREFIX="$2"; shift 2 ;;
     --endpoint)
-      if [ -z "${2:-}" ]; then echo "Error: --endpoint requires a value" >&2; exit 1; fi
+      if [ -z "${2:-}" ]; then echo "Erro: --endpoint requer um valor" >&2; exit 1; fi
       HIVEMIND_ENDPOINT="$2"; shift 2 ;;
     --help|-h)
-      echo "Usage: bash install.sh [--prefix <dir>] [--endpoint <host:port>]"; exit 0 ;;
+      echo "Uso: bash install.sh [--prefix <dir>] [--endpoint <host:port>]"; exit 0 ;;
     *)
-      echo "Unknown option: $1" >&2; exit 1 ;;
+      echo "Opção desconhecida: $1" >&2; exit 1 ;;
   esac
 done
 
@@ -35,19 +35,19 @@ INSTALL_BIN_DIR="${INSTALL_PREFIX}/bin"
 
 # ── Dependency checks ─────────────────────────────────────────────────────────
 if ! command -v bun > /dev/null 2>&1; then
-  echo "Error: 'bun' is required but not found." >&2
-  echo "Install bun: curl -fsSL https://bun.sh/install | bash" >&2
-  echo "Then re-run: bash install.sh" >&2
+  echo "Erro: 'bun' é necessário mas não foi encontrado." >&2
+  echo "Instale o bun: curl -fsSL https://bun.sh/install | bash" >&2
+  echo "Depois rode novamente: bash install.sh" >&2
   exit 1
 fi
 
 if ! command -v openssl > /dev/null 2>&1; then
-  echo "Error: 'openssl' is required but not found." >&2
-  echo "Install: sudo apt-get install openssl  (Ubuntu/Debian)" >&2
+  echo "Erro: 'openssl' é necessário mas não foi encontrado." >&2
+  echo "Instale: sudo apt-get install openssl  (Ubuntu/Debian)" >&2
   exit 1
 fi
 
-echo "Installing HiveMind..."
+echo "Instalando o HiveMind..."
 echo "  HIVEMIND_HOME: ${HIVEMIND_HOME}"
 
 # ── Create directories ────────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ rsync -a --exclude='node_modules/' --exclude='bun.lock' \
   || cp -r "${SCRIPT_DIR}/runtime/." "${HIVEMIND_HOME}/runtime/"
 
 # ── Install bun dependencies ──────────────────────────────────────────────────
-echo "Installing runtime dependencies (bun install)..."
+echo "Instalando dependências do runtime (bun install)..."
 (cd "${HIVEMIND_HOME}/runtime" && bun install --silent 2>/dev/null || bun install)
 
 # ── Install hivemind binary ───────────────────────────────────────────────────
@@ -84,20 +84,20 @@ _install_binary() {
   [ -w "${_dest_dir}" ] || return 1
   cp "${SCRIPT_DIR}/bin/hivemind" "${_dest_dir}/hivemind"
   chmod +x "${_dest_dir}/hivemind"
-  echo "  Binary:      ${_dest_dir}/hivemind"
+  echo "  Binário:     ${_dest_dir}/hivemind"
   return 0
 }
 
 if ! _install_binary "${INSTALL_BIN_DIR}"; then
   LOCAL_BIN="${HOME}/.local/bin"
   if ! _install_binary "${LOCAL_BIN}"; then
-    echo "Error: cannot write to ${INSTALL_BIN_DIR} or ${LOCAL_BIN}" >&2
+    echo "Erro: não foi possível escrever em ${INSTALL_BIN_DIR} ou ${LOCAL_BIN}" >&2
     exit 1
   fi
   # Warn if ~/.local/bin is not on PATH.
   if [[ ":${PATH}:" != *":${LOCAL_BIN}:"* ]]; then
     echo ""
-    echo "Note: ${LOCAL_BIN} is not in your PATH. Add it:"
+    echo "Nota: ${LOCAL_BIN} não está no seu PATH. Adicione:"
     echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
   fi
 fi
@@ -106,9 +106,9 @@ fi
 if command -v hivemind > /dev/null 2>&1; then
   echo "  Smoke:       $(hivemind --version)"
 else
-  echo "  Smoke:       (hivemind not yet on PATH — see PATH note above)"
+  echo "  Smoke:       (hivemind ainda não está no PATH — veja a nota acima)"
 fi
 
 echo ""
-echo "HiveMind installed. Run: hivemind"
-echo "On first run, you'll be guided through certificate setup."
+echo "HiveMind instalado. Rode: hivemind"
+echo "Na primeira execução, você será guiado pela configuração do certificado."

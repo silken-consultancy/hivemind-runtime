@@ -32,11 +32,11 @@ let enrollmentDone = false;
 
 setupRouter.get('/', (c) => {
   const html = `<!DOCTYPE html>
-<html lang="en">
+<html lang="pt-br">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>HiveMind — First Setup</title>
+  <title>HiveMind — Configuração inicial</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: system-ui, sans-serif; background: #0f1117; color: #e1e4e8; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
@@ -60,12 +60,12 @@ setupRouter.get('/', (c) => {
 <body>
   <div class="card">
     <h1>HiveMind</h1>
-    <p class="sub">Configure your personal certificate to connect to memory.</p>
-    <label for="token">Enrollment Token</label>
-    <input type="password" id="token" placeholder="Paste the token sent by your admin" autocomplete="off">
-    <label for="owner">Owner ID</label>
-    <input type="text" id="owner" placeholder="e.g. beta-joao" autocomplete="off">
-    <button id="btn" onclick="enroll()">Configure mTLS</button>
+    <p class="sub">Configure seu certificado pessoal para conectar à memória.</p>
+    <label for="token">Token de Inscrição</label>
+    <input type="password" id="token" placeholder="Cole o token enviado pelo seu admin" autocomplete="off">
+    <label for="owner">ID do Usuário</label>
+    <input type="text" id="owner" placeholder="ex: beta-joao" autocomplete="off">
+    <button id="btn" onclick="enroll()">Configurar mTLS</button>
     <div id="log"></div>
   </div>
   <script>
@@ -74,10 +74,10 @@ setupRouter.get('/', (c) => {
       const owner = document.getElementById('owner').value.trim();
       const log = document.getElementById('log');
       const btn = document.getElementById('btn');
-      if (!token || !owner) { step('Token and Owner ID are required.', 'err'); return; }
+      if (!token || !owner) { step('Token e ID do Usuário são obrigatórios.', 'err'); return; }
       btn.disabled = true;
       log.innerHTML = '';
-      step('Sending enrollment request...', '');
+      step('Enviando pedido de inscrição...', '');
       try {
         const res = await fetch('/setup/enroll', {
           method: 'POST',
@@ -86,18 +86,18 @@ setupRouter.get('/', (c) => {
         });
         const data = await res.json();
         if (data.ok) {
-          step('Keypair generated (EC P-256)', 'ok');
-          step('CSR submitted to CA', 'ok');
-          step('Certificate received and saved', 'ok');
-          step('Proxy configuration written', 'ok');
-          log.innerHTML += '<div class="go">GO — Certificate configured.<br>Close this tab and run <code>hivemind</code> in your project directory.</div>';
+          step('Par de chaves gerado (EC P-256)', 'ok');
+          step('CSR enviado para a CA', 'ok');
+          step('Certificado recebido e salvo', 'ok');
+          step('Configuração do proxy gravada', 'ok');
+          log.innerHTML += '<div class="go">GO — Certificado configurado.<br>Feche esta aba e rode <code>hivemind</code> no diretório do seu projeto.</div>';
         } else {
-          step('Error: ' + (data.message || 'unknown error'), 'err');
-          log.innerHTML += '<div class="nogo">NO-GO — ' + escHtml(data.message || 'Enrollment failed.') + '</div>';
+          step('Erro: ' + (data.message || 'erro desconhecido'), 'err');
+          log.innerHTML += '<div class="nogo">NO-GO — ' + escHtml(data.message || 'Falha na inscrição.') + '</div>';
           btn.disabled = false;
         }
       } catch (err) {
-        step('Network error: ' + err.message, 'err');
+        step('Erro de rede: ' + err.message, 'err');
         btn.disabled = false;
       }
     }
@@ -132,17 +132,17 @@ setupRouter.post('/enroll', async (c) => {
   try {
     body = await c.req.json();
   } catch {
-    return c.json({ ok: false, message: 'Invalid JSON body' }, 400);
+    return c.json({ ok: false, message: 'Corpo JSON inválido' }, 400);
   }
 
   const { token, owner_id: ownerId } = body;
   if (!token || !ownerId) {
-    return c.json({ ok: false, message: 'token and owner_id are required' }, 400);
+    return c.json({ ok: false, message: 'Token e ID do usuário são obrigatórios' }, 400);
   }
 
   // Sanitize owner_id: only alphanumeric, dash, underscore (CN-safe).
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(ownerId)) {
-    return c.json({ ok: false, message: 'owner_id must be alphanumeric with dashes/underscores, max 64 chars' }, 400);
+    return c.json({ ok: false, message: 'O ID do usuário deve conter apenas letras, números, hífen ou underscore (máx. 64 caracteres)' }, 400);
   }
 
   const hivemindHome = process.env.HIVEMIND_HOME ?? join(homedir(), '.hivemind');
@@ -182,7 +182,7 @@ setupRouter.post('/enroll', async (c) => {
     // 3. Read CSR and post to CA.
     const csrPem = await Bun.file(csrPath).text();
     if (!csrPem || csrPem.trim().length === 0) {
-      return c.json({ ok: false, message: 'CSR file empty after openssl — check openssl installation' }, 500);
+      return c.json({ ok: false, message: 'Arquivo CSR vazio após o openssl — verifique a instalação do openssl' }, 500);
     }
 
     const caUrl = `https://${ENDPOINT}/ca/issue`;
@@ -199,14 +199,14 @@ setupRouter.post('/enroll', async (c) => {
       });
     } catch (fetchErr: unknown) {
       const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-      return c.json({ ok: false, message: `Cannot reach CA at ${caUrl}: ${msg}` }, 502);
+      return c.json({ ok: false, message: `Não foi possível conectar à CA em ${caUrl}: ${msg}` }, 502);
     }
 
     if (!caRes.ok) {
       const errBody = await caRes.text().catch(() => '');
       return c.json({
         ok: false,
-        message: `CA returned HTTP ${caRes.status}: ${errBody.slice(0, 300)}`,
+        message: `CA retornou HTTP ${caRes.status}: ${errBody.slice(0, 300)}`,
       }, 502);
     }
 
@@ -217,11 +217,11 @@ setupRouter.post('/enroll', async (c) => {
     try {
       caData = await caRes.json();
     } catch {
-      return c.json({ ok: false, message: 'CA response is not valid JSON' }, 502);
+      return c.json({ ok: false, message: 'Resposta da CA não é um JSON válido' }, 502);
     }
 
     if (!caData.cert || !caData.ca_cert_pem) {
-      return c.json({ ok: false, message: 'CA response missing cert or ca_cert_pem fields' }, 502);
+      return c.json({ ok: false, message: 'Resposta da CA não contém os campos cert ou ca_cert_pem' }, 502);
     }
 
     // 4. Save cert + CA cert (chmod 0600).
@@ -279,7 +279,7 @@ setupRouter.post('/enroll', async (c) => {
     // Never expose stack trace to browser.
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[setup/enroll] error:', msg);
-    return c.json({ ok: false, message: `Enrollment error: ${msg.slice(0, 300)}` }, 500);
+    return c.json({ ok: false, message: `Erro na inscrição: ${msg.slice(0, 300)}` }, 500);
   }
 });
 
