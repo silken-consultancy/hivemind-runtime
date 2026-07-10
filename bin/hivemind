@@ -10,6 +10,7 @@
 #   hivemind stop         # stop the proxy
 #   hivemind status       # proxy health + cert validity
 #   hivemind --version    # print version and exit
+#   hivemind --verbose [...]  # show startup/debug logs (default: quiet, GO/NO-GO only)
 
 set -euo pipefail
 
@@ -43,6 +44,20 @@ else
   _dim() { printf '%s' "$*"; }
 fi
 
+# ── _vecho: verbose-only stderr echo — gated behind --verbose (parsed at the
+# entry point, bottom of file). Debug/startup noise lives behind this; GO/NO-GO
+# status and errors stay unconditional.
+_vecho() {
+  [ "${_VERBOSE:-0}" = "1" ] && echo "$@" >&2
+  return 0
+}
+
+# ── _brand_header: quiet-by-default output still shows this once ───────────
+_brand_header() {
+  echo ""
+  echo "$(_ok "HiveMind") — shared memory runtime"
+}
+
 # ── _has_cert: returns 0 if at least one *.cert.pem exists ───────────────────
 _has_cert() {
   [ -d "${CERT_DIR}" ] && ls "${CERT_DIR}"/*.cert.pem > /dev/null 2>&1
@@ -51,8 +66,8 @@ _has_cert() {
 # ── _setup_mode: first-login flow ─────────────────────────────────────────────
 # Starts server in setup-only mode, opens browser, polls /setup/status until done.
 _setup_mode() {
-  echo ""
-  echo "HiveMind: first run detected — no certificate found."
+  _brand_header
+  echo "First run detected — no certificate found."
   echo "Starting setup server..."
 
   if ! command -v bun > /dev/null 2>&1; then
@@ -142,7 +157,7 @@ _start_proxy() {
   bun run "${RUNTIME_BIN}" >> "${RUNTIME_LOG}" 2>&1 &
   echo $! > "${RUNTIME_PID_FILE}"
 
-  echo "[hivemind] starting runtime..." >&2
+  _vecho "[hivemind] starting runtime..."
   _TRIES=0
   until curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; do
     _TRIES=$((_TRIES + 1))
@@ -152,7 +167,7 @@ _start_proxy() {
     fi
     sleep 1
   done
-  echo "[hivemind] runtime up (pid=$(cat "${RUNTIME_PID_FILE}" 2>/dev/null || echo '?'))" >&2
+  _vecho "[hivemind] runtime up (pid=$(cat "${RUNTIME_PID_FILE}" 2>/dev/null || echo '?'))"
 }
 
 # ── Subcommands ───────────────────────────────────────────────────────────────
@@ -169,6 +184,8 @@ cmd_help() {
   echo "  hivemind stop       Stop the proxy"
   echo "  hivemind status     Show proxy health and certificate validity"
   echo "  hivemind --version  Print version"
+  echo ""
+  echo "  --verbose           Show startup/debug logs (default: quiet, GO/NO-GO + errors only)"
 }
 
 cmd_status() {
@@ -236,7 +253,11 @@ cmd_open() {
   local _slug="${1:-}"
   if [ $# -gt 0 ]; then shift; fi
 
-  if ! _has_cert; then _setup_mode; fi
+  if ! _has_cert; then
+    _setup_mode
+  else
+    _brand_header
+  fi
 
   # Determine slug: arg > basename(cwd).
   local _project_slug
@@ -256,6 +277,19 @@ cmd_open() {
 }
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
+# Parse --verbose anywhere in argv; strip it before subcommand dispatch (it's
+# a global flag, not a subcommand argument).
+_VERBOSE=0
+_ARGS=()
+for _arg in "$@"; do
+  case "${_arg}" in
+    --verbose) _VERBOSE=1 ;;
+    *) _ARGS+=("${_arg}") ;;
+  esac
+done
+set -- "${_ARGS[@]+"${_ARGS[@]}"}"
+
 case "${1:-}" in
   start)          shift || true; cmd_start ;;
   stop)           shift || true; cmd_stop ;;
