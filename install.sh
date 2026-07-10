@@ -85,6 +85,12 @@ else
 fi
 
 # ── Copy files ────────────────────────────────────────────────────────────────
+# NOTE (item 1.6, prompts não expostos): self-core.seed does NOT exist in this
+# repo anymore and must NEVER be added back to this copy list. The espinha
+# (identity/posture/resonance/purpose/voice) is provisioned server-side at
+# enrollment and read via fos_recall({mode:'topic', topic:'self/core'}) — see
+# CLAUDE.md's "Espinha (self-core)" section. Copying a real identity file into
+# a public client repo/install is exactly the leak this item closed.
 cp "${SCRIPT_DIR}/CLAUDE.md" "${HIVEMIND_HOME}/CLAUDE.md"
 cp "${SCRIPT_DIR}/.claude/settings.json" "${HIVEMIND_HOME}/.claude/settings.json"
 
