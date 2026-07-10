@@ -54,14 +54,35 @@ echo "  HIVEMIND_HOME: ${HIVEMIND_HOME}"
 mkdir -p "${HIVEMIND_HOME}/.claude"
 mkdir -p "${HIVEMIND_HOME}/runtime"
 
+# _set_env_kv: idempotent set-or-update of a KEY=value line in $HIVEMIND_HOME/.env.
+_set_env_kv() {
+  local _key="$1" _val="$2"
+  if grep -q "^${_key}=" "${HIVEMIND_HOME}/.env"; then
+    sed -i "s|^${_key}=.*|${_key}=${_val}|" "${HIVEMIND_HOME}/.env"
+  else
+    printf '%s=%s\n' "${_key}" "${_val}" >> "${HIVEMIND_HOME}/.env"
+  fi
+}
+
 # Persist the product endpoint so the runtime reads it at startup (before enrollment).
 touch "${HIVEMIND_HOME}/.env"
-if grep -q '^HIVEMIND_ENDPOINT=' "${HIVEMIND_HOME}/.env"; then
-  sed -i "s|^HIVEMIND_ENDPOINT=.*|HIVEMIND_ENDPOINT=${HIVEMIND_ENDPOINT}|" "${HIVEMIND_HOME}/.env"
-else
-  printf 'HIVEMIND_ENDPOINT=%s\n' "${HIVEMIND_ENDPOINT}" >> "${HIVEMIND_HOME}/.env"
-fi
+_set_env_kv HIVEMIND_ENDPOINT "${HIVEMIND_ENDPOINT}"
 echo "  Endpoint:    ${HIVEMIND_ENDPOINT}"
+
+# Pin the update source (item 4.4, hivemind update): the remote URL + branch
+# recorded HERE, once, at install time — 'hivemind update' pulls from this
+# pinned pair, not from whatever the local clone's remote/branch might drift
+# to later. This is requirement 1 (fonte pinada) of the hardened pull-agent.
+if [ -d "${SCRIPT_DIR}/.git" ]; then
+  _pinned_remote="$(git -C "${SCRIPT_DIR}" remote get-url origin 2>/dev/null || echo '')"
+  _pinned_branch="$(git -C "${SCRIPT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'main')"
+  _set_env_kv HIVEMIND_SOURCE_DIR "${SCRIPT_DIR}"
+  _set_env_kv HIVEMIND_UPDATE_REMOTE "${_pinned_remote}"
+  _set_env_kv HIVEMIND_UPDATE_BRANCH "${_pinned_branch}"
+  echo "  Update src:  ${SCRIPT_DIR} (${_pinned_remote:-no remote}@${_pinned_branch})"
+else
+  echo "  Update src:  (skipped — ${SCRIPT_DIR} is not a git clone, 'hivemind update' unavailable)"
+fi
 
 # ── Copy files ────────────────────────────────────────────────────────────────
 cp "${SCRIPT_DIR}/CLAUDE.md" "${HIVEMIND_HOME}/CLAUDE.md"

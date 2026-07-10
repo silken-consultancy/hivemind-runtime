@@ -8,7 +8,10 @@
 #   hivemind [<slug>]     # start proxy + exec claude; slug = arg or basename(cwd)
 #   hivemind start        # start proxy only (no claude)
 #   hivemind stop         # stop the proxy
-#   hivemind status       # proxy health + cert validity
+#   hivemind restart      # stop + start (best-effort; re-reads ~/.hivemind/.env)
+#   hivemind status       # proxy health + cert validity (human-readable)
+#   hivemind health       # same checks as status, script-friendly exit code (0/1/2)
+#   hivemind update       # pull-agent: staged+verified+atomic update, auto-rollback
 #   hivemind --version    # print version and exit
 #   hivemind --verbose [...]  # show startup/debug logs (default: quiet, GO/NO-GO only)
 
@@ -20,6 +23,9 @@ RUNTIME_PORT="${AR_PORT:-7777}"
 PROXY_PORT="${MTLS_PROXY_PORT:-7779}"
 RUNTIME_LOG="${HOME}/.fos/.cache/hivemind-runtime.log"
 RUNTIME_PID_FILE="${HOME}/.fos/.cache/hivemind-runtime.pid"
+# Leftover-session pidfile from an interrupted --setup-only run (see _setup_mode
+# / cmd_stop hardening, item 4.2) — best-effort cleanup, not fatal if absent.
+SETUP_PID_FILE="${HOME}/.fos/.cache/hivemind-setup.pid"
 CERT_DIR="${HOME}/.fos/mtls"
 RUNTIME_BIN="${HIVEMIND_HOME}/runtime/src/server.ts"
 
@@ -63,6 +69,72 @@ _has_cert() {
   [ -d "${CERT_DIR}" ] && ls "${CERT_DIR}"/*.cert.pem > /dev/null 2>&1
 }
 
+# ── _check_health: single source of truth for runtime/proxy/cert/endpoint
+# state — populates _HEALTH_* globals + _HEALTH_SEVERITY (0=ok, 1=degraded,
+# 2=down). Never returns non-zero itself (severity lives in the variable, not
+# in $?) — safe to call as a bare statement under `set -e`. Shared by
+# cmd_status (human-readable) and cmd_health (script-friendly exit code).
+_check_health() {
+  _HEALTH_RUNTIME_OK=0
+  _HEALTH_PROXY_CONFIGURED=0
+  _HEALTH_PROXY_OK=0
+  _HEALTH_CERT_STATE="absent"   # absent | valid | invalid | unknown
+  _HEALTH_ENDPOINT_OK=0
+  _HEALTH_SEVERITY=0
+
+  if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; then
+    _HEALTH_RUNTIME_OK=1
+  fi
+
+  # Proxy is only counted against health if it's actually configured — dev
+  # setups without MTLS_PROXY_PORT are a deliberate mode, not a failure.
+  if [ -n "${MTLS_PROXY_PORT:-}" ]; then
+    _HEALTH_PROXY_CONFIGURED=1
+    if curl -sf "http://127.0.0.1:${PROXY_PORT}/v1/mcp" > /dev/null 2>&1; then
+      _HEALTH_PROXY_OK=1
+    fi
+  fi
+
+  local _owner="${HIVEMIND_OWNER:-}"
+  if _has_cert; then
+    if [ -n "${_owner}" ] && [ -f "${CERT_DIR}/${_owner}.cert.pem" ] && [ -f "${CERT_DIR}/ca.cert.pem" ]; then
+      if openssl verify -CAfile "${CERT_DIR}/ca.cert.pem" \
+           "${CERT_DIR}/${_owner}.cert.pem" > /dev/null 2>&1; then
+        _HEALTH_CERT_STATE="valid"
+      else
+        _HEALTH_CERT_STATE="invalid"
+      fi
+    else
+      _HEALTH_CERT_STATE="unknown"
+    fi
+  fi
+
+  # Endpoint reachability — new check (item 4.3), public path, no cert needed.
+  if curl -sf --max-time 3 "https://${HIVEMIND_ENDPOINT:-hivemind.silken.ia.br:4443}/ca/crl.pem" > /dev/null 2>&1; then
+    _HEALTH_ENDPOINT_OK=1
+  fi
+
+  if [ "${_HEALTH_RUNTIME_OK}" -eq 0 ]; then
+    _HEALTH_SEVERITY=2
+  elif { [ "${_HEALTH_PROXY_CONFIGURED}" -eq 1 ] && [ "${_HEALTH_PROXY_OK}" -eq 0 ]; } \
+    || [ "${_HEALTH_CERT_STATE}" = "invalid" ] \
+    || [ "${_HEALTH_ENDPOINT_OK}" -eq 0 ]; then
+    _HEALTH_SEVERITY=1
+  fi
+  return 0
+}
+
+# ── _pid_is_hivemind_runtime: guards cmd_stop against killing a PID the OS
+# recycled for an unrelated process after a crash left a stale pidfile behind.
+# Matches the FULL absolute RUNTIME_BIN path (fixed-string, not a loose
+# 'server.ts' fragment) — a generic 'server.ts' substring would false-positive
+# on an unrelated `vim server.ts` or `tail -f server.ts.log` sharing the
+# recycled PID, which is exactly the failure this guard exists to prevent.
+_pid_is_hivemind_runtime() {
+  local _pid="$1"
+  ps -p "${_pid}" -o command= 2>/dev/null | grep -qF -- "${RUNTIME_BIN}"
+}
+
 # ── _setup_mode: first-login flow ─────────────────────────────────────────────
 # Starts server in setup-only mode, opens browser, polls /setup/status until done.
 _setup_mode() {
@@ -88,6 +160,8 @@ _setup_mode() {
   mkdir -p "$(dirname "${RUNTIME_LOG}")"
   bun run "${RUNTIME_BIN}" --setup-only >> "${RUNTIME_LOG}" 2>&1 &
   _SETUP_PID=$!
+  mkdir -p "$(dirname "${SETUP_PID_FILE}")"
+  echo "${_SETUP_PID}" > "${SETUP_PID_FILE}"
 
   # Poll until setup server ready (timeout 15s).
   _TRIES=0
@@ -96,6 +170,7 @@ _setup_mode() {
     if [ "${_TRIES}" -ge 15 ]; then
       echo "Error: setup server did not start after 15s. Check: ${RUNTIME_LOG}" >&2
       kill "${_SETUP_PID}" 2>/dev/null || true
+      rm -f "${SETUP_PID_FILE}"
       exit 1
     fi
     sleep 1
@@ -116,23 +191,30 @@ _setup_mode() {
   echo "Waiting for enrollment to complete (timeout: 5 min)..."
 
   # Poll /setup/status until done (timeout 300s / 5 min).
+  # NOTE: `grep -q` used directly as the if-condition — a prior version used
+  # `grep -c ... || echo 0` into a variable, but grep -c exits 1 when the
+  # count is 0 (even though it prints "0"), which under pipefail ALSO fires
+  # the `|| echo 0` fallback, producing a duplicated "0\n0" that broke the
+  # `-gt` integer test every tick. grep -q as a bare condition has no such
+  # count-vs-exit-code mismatch to trip over.
   _TRIES=0
   while :; do
-    _DONE=$(curl -sf "http://127.0.0.1:${RUNTIME_PORT}/setup/status" 2>/dev/null \
-      | grep -c '"done":true' 2>/dev/null || echo 0)
-    if [ "${_DONE}" -gt 0 ]; then
+    if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/setup/status" 2>/dev/null \
+      | grep -q '"done":true'; then
       break
     fi
     _TRIES=$((_TRIES + 1))
     if [ "${_TRIES}" -ge 300 ]; then
       echo "Timeout: enrollment did not complete in 5 minutes." >&2
       kill "${_SETUP_PID}" 2>/dev/null || true
+      rm -f "${SETUP_PID_FILE}"
       exit 1
     fi
     sleep 1
   done
 
   kill "${_SETUP_PID}" 2>/dev/null || true
+  rm -f "${SETUP_PID_FILE}"
   echo ""
   echo "Done. Run 'hivemind' in your project directory to start."
   exit 0
@@ -177,51 +259,64 @@ cmd_version() {
 }
 
 cmd_help() {
-  echo "Usage: hivemind [<slug>] | start | stop | status | --version"
+  echo "Usage: hivemind [<slug>] | start | stop | restart | status | health | update | --version"
   echo ""
   echo "  hivemind [<slug>]   Start proxy + open Claude Code (slug = arg or basename of cwd)"
   echo "  hivemind start      Start proxy only"
   echo "  hivemind stop       Stop the proxy"
-  echo "  hivemind status     Show proxy health and certificate validity"
+  echo "  hivemind restart    Stop + start (best-effort)"
+  echo "  hivemind status     Show proxy health and certificate validity (human-readable)"
+  echo "  hivemind health     Same checks as status; exit 0=ok 1=degraded 2=down"
+  echo "  hivemind update     Pull-agent: staged + verified + atomic update, auto-rollback"
   echo "  hivemind --version  Print version"
   echo ""
   echo "  --verbose           Show startup/debug logs (default: quiet, GO/NO-GO + errors only)"
 }
 
 cmd_status() {
+  _check_health
   echo "HiveMind v${HIVEMIND_VERSION} — status"
   echo ""
 
-  # Runtime health.
-  if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; then
+  if [ "${_HEALTH_RUNTIME_OK}" = "1" ]; then
     echo "  Runtime:    $(_ok "OK") (port ${RUNTIME_PORT})"
   else
     echo "  Runtime:    $(_err "STOPPED") (port ${RUNTIME_PORT})"
   fi
 
-  # Proxy (mTLS loopback) health.
-  if curl -sf "http://127.0.0.1:${PROXY_PORT}/v1/mcp" > /dev/null 2>&1; then
-    echo "  mTLS proxy: $(_ok "OK") (port ${PROXY_PORT})"
-  else
-    echo "  mTLS proxy: $(_dim "not responding") (port ${PROXY_PORT})"
-  fi
-
-  # Certificate validity.
-  local _owner="${HIVEMIND_OWNER:-}"
-  if _has_cert; then
-    if [ -n "${_owner}" ] && [ -f "${CERT_DIR}/${_owner}.cert.pem" ] && [ -f "${CERT_DIR}/ca.cert.pem" ]; then
-      if openssl verify -CAfile "${CERT_DIR}/ca.cert.pem" \
-           "${CERT_DIR}/${_owner}.cert.pem" > /dev/null 2>&1; then
-        echo "  Cert:       $(_ok "VALID") (owner=${_owner})"
-      else
-        echo "  Cert:       $(_err "INVALID") — re-enroll: rm -rf ${CERT_DIR} && hivemind"
-      fi
+  if [ "${_HEALTH_PROXY_CONFIGURED}" = "1" ]; then
+    if [ "${_HEALTH_PROXY_OK}" = "1" ]; then
+      echo "  mTLS proxy: $(_ok "OK") (port ${PROXY_PORT})"
     else
-      echo "  Cert:       $(_dim "present (run 'hivemind' to validate)")"
+      echo "  mTLS proxy: $(_err "not responding") (port ${PROXY_PORT})"
     fi
   else
-    echo "  Cert:       $(_dim "NOT FOUND") — run 'hivemind' to enroll"
+    echo "  mTLS proxy: $(_dim "not configured") (port ${PROXY_PORT})"
   fi
+
+  local _owner="${HIVEMIND_OWNER:-}"
+  case "${_HEALTH_CERT_STATE}" in
+    valid)   echo "  Cert:       $(_ok "VALID") (owner=${_owner})" ;;
+    invalid) echo "  Cert:       $(_err "INVALID") — re-enroll: rm -rf ${CERT_DIR} && hivemind" ;;
+    unknown) echo "  Cert:       $(_dim "present (run 'hivemind' to validate)")" ;;
+    *)       echo "  Cert:       $(_dim "NOT FOUND") — run 'hivemind' to enroll" ;;
+  esac
+
+  if [ "${_HEALTH_ENDPOINT_OK}" = "1" ]; then
+    echo "  Endpoint:   $(_ok "reachable") (${HIVEMIND_ENDPOINT:-hivemind.silken.ia.br:4443})"
+  else
+    echo "  Endpoint:   $(_dim "unreachable") (${HIVEMIND_ENDPOINT:-hivemind.silken.ia.br:4443})"
+  fi
+}
+
+cmd_health() {
+  _check_health
+  case "${_HEALTH_SEVERITY}" in
+    0) echo "$(_ok "OK") — runtime, proxy, cert and endpoint healthy" ;;
+    1) echo "$(_err "DEGRADED") — run 'hivemind status' for details" ;;
+    2) echo "$(_err "DOWN") — runtime not responding on port ${RUNTIME_PORT}" ;;
+  esac
+  return "${_HEALTH_SEVERITY}"
 }
 
 cmd_start() {
@@ -235,9 +330,16 @@ cmd_stop() {
     local _pid
     _pid=$(cat "${RUNTIME_PID_FILE}" 2>/dev/null || echo '')
     if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
-      kill "${_pid}"
-      rm -f "${RUNTIME_PID_FILE}"
-      echo "[hivemind] runtime stopped"
+      if _pid_is_hivemind_runtime "${_pid}"; then
+        kill "${_pid}"
+        rm -f "${RUNTIME_PID_FILE}"
+        echo "[hivemind] runtime stopped"
+      else
+        # Stale pidfile: PID is alive but recycled by the OS for an unrelated
+        # process (crash left the pidfile behind) — do NOT kill it.
+        echo "[hivemind] pidfile PID ${_pid} is not a hivemind runtime (stale/recycled) — not killing, clearing pidfile" >&2
+        rm -f "${RUNTIME_PID_FILE}"
+      fi
     else
       echo "[hivemind] no running runtime at pid ${_pid}"
       rm -f "${RUNTIME_PID_FILE}"
@@ -245,6 +347,233 @@ cmd_stop() {
   else
     echo "[hivemind] no runtime pid file found (already stopped?)"
   fi
+
+  # Best-effort cleanup of a leftover --setup-only session (e.g. hivemind was
+  # interrupted mid-enrollment and the background setup server never exited).
+  if [ -f "${SETUP_PID_FILE}" ]; then
+    local _setup_pid
+    _setup_pid=$(cat "${SETUP_PID_FILE}" 2>/dev/null || echo '')
+    if [ -n "${_setup_pid}" ] && kill -0 "${_setup_pid}" 2>/dev/null; then
+      kill "${_setup_pid}" 2>/dev/null || true
+    fi
+    rm -f "${SETUP_PID_FILE}"
+  fi
+}
+
+cmd_restart() {
+  cmd_stop
+  _start_proxy
+  echo "[hivemind] restarted"
+}
+
+# ── Update mechanism (item 4.4) ───────────────────────────────────────────────
+# Pull-agent for the thin client: bin/hivemind + runtime/src/* ONLY — prompts/
+# seeds are never touched here (they live server-side since the Fase 1 stub).
+# Hardened per OPEN-6 (silent auto-pull): pinned source, integrity check,
+# staged+atomic swap, last-known-good rollback. See docs/wip plan, item 13.
+
+# _verify_commit_integrity: 0 = trusted, 1 = refuse to apply.
+# Two paths, either sufficient: (a) valid GPG signature via `git verify-commit`
+# from a signer git already trusts; (b) commit hash matches a LATEST_SHA
+# manifest published on a channel separate from git itself (the product HTTPS
+# domain, not the repo host) — fallback for when no signer is configured.
+# HONEST GAP: the manifest endpoint (https://<host>/hivemind/LATEST_SHA) does
+# not exist server-side yet (not part of this slice's scope) — until it's
+# stood up, this fails closed for unsigned commits, which is the correct
+# fail-safe default (spec: "se a verificação falhar → NÃO aplica"), not a bug.
+_verify_commit_integrity() {
+  local _dir="$1"
+  if git -C "${_dir}" verify-commit HEAD > /dev/null 2>&1; then
+    return 0
+  fi
+  local _host="${HIVEMIND_ENDPOINT%%:*}"
+  local _manifest_url="https://${_host}/hivemind/LATEST_SHA"
+  local _expected_sha
+  _expected_sha="$(curl -sf --max-time 5 "${_manifest_url}" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "${_expected_sha}" ] || return 1
+  local _actual_sha
+  _actual_sha="$(git -C "${_dir}" rev-parse HEAD)"
+  [ "${_actual_sha}" = "${_expected_sha}" ]
+}
+
+# _stage_build: mirrors install.sh's $HIVEMIND_HOME-scoped copy step (CLAUDE.md,
+# .claude/settings.json, runtime/ + bun install) into a STAGING dir — never
+# touches the live $HIVEMIND_HOME. Deliberately does NOT reinstall the CLI
+# binary to PATH (that's handled separately, see _update_installed_binary) and
+# does NOT run install.sh's dependency/PATH checks or smoke test (those are
+# first-install concerns, not update concerns).
+_stage_build() {
+  local _target="$1"
+  mkdir -p "${_target}/.claude" "${_target}/runtime" || return 1
+  cp "${HIVEMIND_SOURCE_DIR}/CLAUDE.md" "${_target}/CLAUDE.md" || return 1
+  cp "${HIVEMIND_SOURCE_DIR}/.claude/settings.json" "${_target}/.claude/settings.json" || return 1
+  rsync -a --exclude='node_modules/' --exclude='bun.lock' \
+    "${HIVEMIND_SOURCE_DIR}/runtime/" "${_target}/runtime/" 2>/dev/null \
+    || cp -r "${HIVEMIND_SOURCE_DIR}/runtime/." "${_target}/runtime/" || return 1
+  (cd "${_target}/runtime" && bun install --silent 2>/dev/null || bun install) || return 1
+  # Preserve the LIVE .env (cert paths, endpoint, update pinning) — the staged
+  # build must boot with the same identity/config as the current one, not a
+  # fresh/empty one.
+  if [ -f "${HIVEMIND_HOME}/.env" ]; then
+    cp "${HIVEMIND_HOME}/.env" "${_target}/.env" || return 1
+  fi
+  return 0
+}
+
+# _update_installed_binary / _rollback_installed_binary: the system-PATH copy
+# of bin/hivemind is outside $HIVEMIND_HOME, so it needs its own (small,
+# already-atomic) swap — cp-to-temp + rename, mirroring the staging pattern at
+# a smaller scale. Best-effort: if the installed path isn't writable, skip
+# (not fatal — the $HIVEMIND_HOME swap is the load-bearing part).
+_update_installed_binary() {
+  local _installed_bin
+  _installed_bin="$(command -v hivemind 2>/dev/null || true)"
+  [ -n "${_installed_bin}" ] && [ -w "${_installed_bin}" ] || return 0
+  cp "${_installed_bin}" "${_installed_bin}.last-good" 2>/dev/null || true
+  cp "${HIVEMIND_SOURCE_DIR}/bin/hivemind" "${_installed_bin}.new" || return 1
+  chmod +x "${_installed_bin}.new"
+  mv "${_installed_bin}.new" "${_installed_bin}"
+}
+_rollback_installed_binary() {
+  local _installed_bin
+  _installed_bin="$(command -v hivemind 2>/dev/null || true)"
+  if [ -n "${_installed_bin}" ] && [ -f "${_installed_bin}.last-good" ]; then
+    mv "${_installed_bin}.last-good" "${_installed_bin}"
+  fi
+}
+
+cmd_update() {
+  if [ -z "${HIVEMIND_SOURCE_DIR:-}" ] || [ ! -d "${HIVEMIND_SOURCE_DIR}/.git" ]; then
+    echo "Error: HIVEMIND_SOURCE_DIR not set or not a git clone — re-run install.sh to pin the update source." >&2
+    exit 1
+  fi
+
+  local _branch="${HIVEMIND_UPDATE_BRANCH:-main}"
+
+  # Source pinning guard (requirement 1): refuse if origin drifted from what
+  # was recorded at install time — evicts a silent remote/DNS swap.
+  local _current_remote
+  _current_remote="$(git -C "${HIVEMIND_SOURCE_DIR}" remote get-url origin 2>/dev/null || echo '')"
+  if [ -n "${HIVEMIND_UPDATE_REMOTE:-}" ] && [ "${_current_remote}" != "${HIVEMIND_UPDATE_REMOTE}" ]; then
+    echo "Error: origin remote changed since install (pinned: ${HIVEMIND_UPDATE_REMOTE}, current: ${_current_remote}) — refusing to update." >&2
+    exit 1
+  fi
+
+  echo "Checking ${_branch} for updates..."
+  if ! git -C "${HIVEMIND_SOURCE_DIR}" fetch --quiet origin "${_branch}"; then
+    echo "Error: fetch failed (network?) — staying on current version." >&2
+    exit 1
+  fi
+
+  local _before _after
+  _before="$(git -C "${HIVEMIND_SOURCE_DIR}" rev-parse HEAD)"
+  _after="$(git -C "${HIVEMIND_SOURCE_DIR}" rev-parse "origin/${_branch}")"
+
+  if [ "${_before}" = "${_after}" ]; then
+    echo "Already up to date (${_before:0:12})."
+    return 0
+  fi
+
+  if ! git -C "${HIVEMIND_SOURCE_DIR}" merge --ff-only "origin/${_branch}" > /dev/null 2>&1; then
+    echo "Error: local clone diverged from ${_branch} (not fast-forward) — resolve manually." >&2
+    exit 1
+  fi
+
+  # Requirement 2: integrity check. Fail-safe — on failure, revert the clone
+  # to the pre-fetch commit and do NOT touch $HIVEMIND_HOME.
+  if ! _verify_commit_integrity "${HIVEMIND_SOURCE_DIR}"; then
+    echo "Error: integrity check FAILED for ${_after:0:12} — not applying, reverting clone to ${_before:0:12}." >&2
+    git -C "${HIVEMIND_SOURCE_DIR}" reset --hard "${_before}" > /dev/null 2>&1 || true
+    exit 1
+  fi
+
+  echo "Verified ${_after:0:12} — staging..."
+
+  # Requirement 3: apply atomically via a staging dir + rename swap (never
+  # copy-in-place onto the live $HIVEMIND_HOME).
+  local _staging="${HIVEMIND_HOME}.staging"
+  local _lastgood="${HIVEMIND_HOME}.last-good"
+  rm -rf "${_staging}"
+
+  if ! _stage_build "${_staging}"; then
+    echo "Error: staging build failed — current installation untouched." >&2
+    rm -rf "${_staging}"
+    git -C "${HIVEMIND_SOURCE_DIR}" reset --hard "${_before}" > /dev/null 2>&1 || true
+    exit 1
+  fi
+
+  echo "Staged — swapping in (atomic)..."
+  cmd_stop > /dev/null 2>&1 || true
+  rm -rf "${_lastgood}"
+  # NOTE (deferred, not this pass — team-lead review): each `mv` below is
+  # atomic on its own, but the two together are not a single atomic step —
+  # there's a small window between them where $HIVEMIND_HOME doesn't exist at
+  # all. Acceptable for now (auto-update is inert without a signer/manifest,
+  # see _verify_commit_integrity); will be hardened alongside the signing
+  # infra before update goes live. Manual recovery in the meantime: if a crash
+  # lands here, restore from "${HIVEMIND_HOME}.last-good" (or re-run
+  # install.sh from "${HIVEMIND_HOME}.staging" if last-good is also absent).
+  if [ -d "${HIVEMIND_HOME}" ]; then
+    mv "${HIVEMIND_HOME}" "${_lastgood}"
+  fi
+  mv "${_staging}" "${HIVEMIND_HOME}"
+  # Best-effort: a failed binary swap here must NOT abort under set -e — the
+  # $HIVEMIND_HOME swap already happened, and the health-check/rollback below
+  # (requirement 4) still needs to run regardless of this side-swap's outcome.
+  _update_installed_binary || true
+
+  # Requirement 4: last-known-good + automatic rollback on a failed
+  # post-update health check. _start_proxy exits(1) directly on its own
+  # start-up failure (pre-existing behavior, relied on by cmd_start/cmd_open)
+  # — run it in a SUBSHELL here so that exit only ends the subshell, not this
+  # whole update, letting the rollback logic below actually run.
+  ( _start_proxy ) || true
+  _check_health
+
+  if [ "${_HEALTH_SEVERITY}" -ge 2 ]; then
+    echo "Error: post-update health check FAILED — rolling back to ${_before:0:12}." >&2
+    cmd_stop > /dev/null 2>&1 || true
+    rm -rf "${HIVEMIND_HOME}"
+    mv "${_lastgood}" "${HIVEMIND_HOME}"
+    git -C "${HIVEMIND_SOURCE_DIR}" reset --hard "${_before}" > /dev/null 2>&1 || true
+    _rollback_installed_binary
+    ( _start_proxy ) || true
+    echo "Rolled back — running ${_before:0:12}." >&2
+    exit 1
+  fi
+
+  echo "$(_ok "Updated"): ${_before:0:12} -> ${_after:0:12}."
+}
+
+# _maybe_auto_update: silent on-launch check (OPEN-6, founder-approved).
+# Best-effort + fail-open on ANY network/config hiccup — never blocks startup.
+# Short timeout (~2s) on the remote check only; the actual update (if one
+# applies) reuses cmd_update's hardened staged/atomic/rollback path.
+_maybe_auto_update() {
+  [ -n "${HIVEMIND_SOURCE_DIR:-}" ] || return 0
+  [ -d "${HIVEMIND_SOURCE_DIR}/.git" ] || return 0
+  # BLOCKER FIX: `timeout` is not present on stock macOS (only via brew
+  # coreutils). Without this guard, the `$(timeout ...)` command substitution
+  # below fails with 127, and — being a variable assignment — set -e ABORTS
+  # THE WHOLE SCRIPT right here, killing the default `hivemind`/`hivemind
+  # <slug>` path before _start_proxy/exec claude ever run. Degrade instead:
+  # no `timeout` → skip the silent auto-update, continue booting normally.
+  command -v timeout > /dev/null 2>&1 || return 0
+
+  local _branch="${HIVEMIND_UPDATE_BRANCH:-main}"
+  local _remote_head
+  _remote_head="$(timeout 2 git -C "${HIVEMIND_SOURCE_DIR}" ls-remote origin "refs/heads/${_branch}" 2>/dev/null | cut -f1)"
+  [ -n "${_remote_head}" ] || return 0   # offline/timeout — fail-open, continue as-is
+
+  local _local_head
+  _local_head="$(git -C "${HIVEMIND_SOURCE_DIR}" rev-parse HEAD 2>/dev/null || echo '')"
+  [ "${_remote_head}" != "${_local_head}" ] || return 0   # already current
+
+  # cmd_update calls exit(1) directly on several failure paths — run it in a
+  # SUBSHELL so a failed silent update can never take the whole launch down
+  # with it (same reasoning as the _start_proxy wrapping inside cmd_update).
+  ( cmd_update ) > /dev/null 2>&1 || true
+  return 0
 }
 
 # cmd_open: start proxy + exec claude.
@@ -267,6 +596,7 @@ cmd_open() {
     _project_slug="$(basename "$(pwd)")"
   fi
 
+  _maybe_auto_update
   _start_proxy
 
   exec env \
@@ -293,7 +623,10 @@ set -- "${_ARGS[@]+"${_ARGS[@]}"}"
 case "${1:-}" in
   start)          shift || true; cmd_start ;;
   stop)           shift || true; cmd_stop ;;
+  restart)        shift || true; cmd_restart ;;
   status)         shift || true; cmd_status ;;
+  health)         shift || true; cmd_health ;;
+  update)         shift || true; cmd_update ;;
   --version|-v)   cmd_version ;;
   --help|-h)      cmd_help ;;
   *)              cmd_open "$@" ;;
