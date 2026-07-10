@@ -123,7 +123,13 @@ test('POST /enroll fails cleanly (502) if the CA response is missing cert or ca_
     expect(res.status).toBe(502);
     const data = (await res.json()) as { ok: boolean; message?: string };
     expect(data.ok).toBe(false);
-    expect(data.message).toContain('cert or ca_cert_pem');
+    // Message is pt-br copy — assert on the (untranslated) field names it
+    // names, not a hardcoded English phrase. Word-boundary match on 'cert'
+    // (not .toContain) — 'ca_cert_pem' also contains the substring 'cert',
+    // so a plain .toContain('cert') would pass even if the standalone word
+    // vanished from the message.
+    expect(data.message).toMatch(/\bcert\b/);
+    expect(data.message).toContain('ca_cert_pem');
   } finally {
     globalThis.fetch = savedFetch;
   }
