@@ -2,18 +2,16 @@
 //
 // Companion to bin/fos-beta-enroll (B2, cross-repo — 4tuenyOS) which mints the
 // enrollment token server-side. Token contract (against POST /ca/issue on the
-// product endpoint, HIVEMIND_ENDPOINT — default hivemind.silken.ia.br:4443):
+// product endpoint, HIVEMIND_ENDPOINT — default hivemind.silken.ia.br:4443) —
+// contract CONFIRMED against the real ca.controller.ts (ENROLLMENT branch,
+// engram/apps/auth-service/src/ca/ca.controller.ts):
 //
-//   Request:  POST /ca/issue  body: { token: string, csr_pem: string }
-//   Response: { cert_pem: string, ca_cert_pem: string }
+//   Request:  POST /ca/issue  body: { tenant: string, enrollment_token: string, csr: string, days?: number }
+//   Response: { cert: string, serial: string, token: string, ca_cert_pem: string }
 //
 // NOTE: /ca/issue does NOT require a client cert — it validates the enrollment
 // token directly (token is the authorization mechanism at enrollment time).
 // After enrollment, the issued cert is used for all subsequent mTLS connections.
-//
-// SIGNAL: B2 (fos-beta-enroll) is being built concurrently. This handler codes
-// against the expected contract above. If the /ca/issue response shape differs,
-// update the caData destructure and error messaging accordingly.
 
 import { Hono } from 'hono';
 import { existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync } from 'node:fs';
@@ -123,7 +121,7 @@ setupRouter.get('/', (c) => {
 // Steps:
 //  1. Validate body (token + owner_id required)
 //  2. Generate EC keypair + CSR via openssl (Bun.spawnSync)
-//  3. POST /ca/issue → { cert_pem, ca_cert_pem }
+//  3. POST /ca/issue → { cert, ca_cert_pem }
 //  4. Save key + cert + CA to ~/.fos/mtls/ (chmod 0600)
 //  5. Write $HIVEMIND_HOME/.env with MTLS_* vars
 //  6. Write ~/.claude/mcp.json (try) or ~/.mcp.json (fallback)
@@ -191,10 +189,12 @@ setupRouter.post('/enroll', async (c) => {
     let caRes: Response;
     try {
       // No client cert here — /ca/issue validates via enrollment token.
+      // Body shape matches the real server contract (issueBodySchema in
+      // ca.controller.ts): { tenant, enrollment_token, csr }, NOT { token, csr_pem }.
       caRes = await fetch(caUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token, csr_pem: csrPem }),
+        body: JSON.stringify({ tenant: ownerId, enrollment_token: token, csr: csrPem }),
         signal: AbortSignal.timeout(30000),
       });
     } catch (fetchErr: unknown) {
@@ -210,19 +210,22 @@ setupRouter.post('/enroll', async (c) => {
       }, 502);
     }
 
-    let caData: { cert_pem?: string; ca_cert_pem?: string };
+    // Response shape matches the real server contract: { cert, serial, token,
+    // ca_cert_pem } — NOT { cert_pem, ca_cert_pem } (that shape never existed
+    // on the server; this is the contract fix).
+    let caData: { cert?: string; serial?: string; token?: string; ca_cert_pem?: string };
     try {
       caData = await caRes.json();
     } catch {
       return c.json({ ok: false, message: 'CA response is not valid JSON' }, 502);
     }
 
-    if (!caData.cert_pem || !caData.ca_cert_pem) {
-      return c.json({ ok: false, message: 'CA response missing cert_pem or ca_cert_pem fields' }, 502);
+    if (!caData.cert || !caData.ca_cert_pem) {
+      return c.json({ ok: false, message: 'CA response missing cert or ca_cert_pem fields' }, 502);
     }
 
     // 4. Save cert + CA cert (chmod 0600).
-    writeFileSync(certPath, caData.cert_pem, { mode: 0o600 });
+    writeFileSync(certPath, caData.cert, { mode: 0o600 });
     writeFileSync(caPath, caData.ca_cert_pem, { mode: 0o600 });
 
     // Clean up CSR (not needed after enrollment).
