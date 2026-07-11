@@ -2,8 +2,10 @@
 // Loads from $HIVEMIND_HOME/.env before zod parse — makes the service self-sufficient
 // when started directly (bun src/server.ts) rather than via the bash wrapper.
 //
-// KEY CHANGE vs fos-agent-runtime: default home is HIVEMIND_HOME ($HOME/.hivemind),
-// NOT FOS_ROOT (/home/user/projetos/4tuenyOS). FOS_ROOT kept as fallback only.
+// Standalone product client: HIVEMIND_HOME ($HOME/.hivemind) is the only home
+// var this reads — no fallback to any lab-specific root. This runtime is
+// apart from the lab (zero shared env/dir footprint), so there is nothing to
+// stay compatible with here.
 
 import { z } from 'zod';
 import { existsSync, readFileSync } from 'node:fs';
@@ -12,7 +14,6 @@ import { join } from 'node:path';
 
 function loadHivemindEnv() {
   const hivemindHome = process.env.HIVEMIND_HOME
-    ?? process.env.FOS_ROOT  // fallback de compatibilidade — não expandido aqui
     ?? join(homedir(), '.hivemind');
   const envFile = join(hivemindHome, '.env');
   if (!existsSync(envFile)) return;

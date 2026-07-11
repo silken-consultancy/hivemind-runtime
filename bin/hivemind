@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # hivemind — HiveMind thin CLI.
 #
-# Analogous to silken-runtime but standalone — zero lab deps.
+# Standalone product client — zero lab deps, talks only to the engram backend.
 # Runs in the user's project directory; slug = arg or basename(cwd).
 #
 # Usage:
@@ -21,12 +21,16 @@ HIVEMIND_VERSION="0.1.0"
 HIVEMIND_HOME="${HIVEMIND_HOME:-$HOME/.hivemind}"
 RUNTIME_PORT="${AR_PORT:-7777}"
 PROXY_PORT="${MTLS_PROXY_PORT:-7779}"
-RUNTIME_LOG="${HOME}/.fos/.cache/hivemind-runtime.log"
-RUNTIME_PID_FILE="${HOME}/.fos/.cache/hivemind-runtime.pid"
+# Product state lives under ~/.engram — a dedicated, hidden dir, fully
+# isolated from the lab's own ~/.fos (which the lab's own agent-runtime/CLI
+# uses). Zero shared footprint: a machine with both the lab and this product
+# installed must never collide on cert material or cache/pid files.
+RUNTIME_LOG="${HOME}/.engram/cache/hivemind-runtime.log"
+RUNTIME_PID_FILE="${HOME}/.engram/cache/hivemind-runtime.pid"
 # Leftover-session pidfile from an interrupted --setup-only run (see _setup_mode
 # / cmd_stop hardening, item 4.2) — best-effort cleanup, not fatal if absent.
-SETUP_PID_FILE="${HOME}/.fos/.cache/hivemind-setup.pid"
-CERT_DIR="${HOME}/.fos/mtls"
+SETUP_PID_FILE="${HOME}/.engram/cache/hivemind-setup.pid"
+CERT_DIR="${HOME}/.engram/mtls"
 RUNTIME_BIN="${HIVEMIND_HOME}/runtime/src/server.ts"
 
 # Load user env if present (sets MTLS_* + HIVEMIND_OWNER).
@@ -601,7 +605,7 @@ cmd_open() {
 
   exec env \
     CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" \
-    FOS_SLUG="${_project_slug}" \
+    ENGRAM_SLUG="${_project_slug}" \
     HIVEMIND_HOME="${HIVEMIND_HOME}" \
     claude "$@"
 }
