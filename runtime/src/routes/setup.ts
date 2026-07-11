@@ -122,7 +122,7 @@ setupRouter.get('/', (c) => {
 //  1. Validate body (token + owner_id required)
 //  2. Generate EC keypair + CSR via openssl (Bun.spawnSync)
 //  3. POST /ca/issue → { cert, ca_cert_pem }
-//  4. Save key + cert + CA to ~/.fos/mtls/ (chmod 0600)
+//  4. Save key + cert + CA to ~/.engram/mtls/ (chmod 0600)
 //  5. Write $HIVEMIND_HOME/.env with MTLS_* vars
 //  6. Write ~/.claude/mcp.json (try) or ~/.mcp.json (fallback)
 //  7. Return { ok: true, owner_id }
@@ -146,7 +146,9 @@ setupRouter.post('/enroll', async (c) => {
   }
 
   const hivemindHome = process.env.HIVEMIND_HOME ?? join(homedir(), '.hivemind');
-  const mtlsDir = join(homedir(), '.fos', 'mtls');
+  // Isolated from the lab's own ~/.fos/mtls — see bin/hivemind's CERT_DIR
+  // (must stay in sync; this is where the CLI reads the cert from).
+  const mtlsDir = join(homedir(), '.engram', 'mtls');
 
   try {
     // 1. Prepare dirs.
