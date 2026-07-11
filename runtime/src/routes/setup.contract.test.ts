@@ -28,6 +28,7 @@ const FAKE_CA_CERT_PEM = '-----BEGIN CERTIFICATE-----\nFAKE-CA-CERT\n-----END CE
 const FAKE_CLIENT_CERT_PEM = '-----BEGIN CERTIFICATE-----\nFAKE-CLIENT-CERT\n-----END CERTIFICATE-----\n';
 const PLAINTEXT_TOKEN = 'plaintext-enrollment-token-xyz';
 const OWNER_ID = 'contract-test-owner';
+const API_KEY = 'test-api-key-1234567890';
 
 let capturedUrl: string | undefined;
 let capturedBody: unknown;
@@ -67,7 +68,7 @@ test('POST /enroll sends the REAL server request shape: { tenant, enrollment_tok
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: PLAINTEXT_TOKEN, owner_id: OWNER_ID }),
+    body: JSON.stringify({ token: PLAINTEXT_TOKEN, owner_id: OWNER_ID, api_key: API_KEY }),
   });
 
   const data = (await res.json()) as { ok: boolean; owner_id?: string; message?: string };
@@ -90,7 +91,7 @@ test('POST /enroll destructures the REAL server response shape and persists cert
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'another-token', owner_id: ownerId }),
+    body: JSON.stringify({ token: 'another-token', owner_id: ownerId, api_key: API_KEY }),
   });
   const data = (await res.json()) as { ok: boolean };
   expect(data.ok).toBe(true);
@@ -127,7 +128,7 @@ test('POST /enroll writes $HIVEMIND_HOME/.claude/.claude.json merge-safely (item
     setupRouter.request('/enroll', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: 'p1-token', owner_id: ownerId }),
+      body: JSON.stringify({ token: 'p1-token', owner_id: ownerId, api_key: API_KEY }),
     });
 
   // Run 1.
@@ -136,7 +137,11 @@ test('POST /enroll writes $HIVEMIND_HOME/.claude/.claude.json merge-safely (item
   const configAfterRun1 = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
   expect(configAfterRun1.someArbitraryKey).toBe('keep-me');
   expect(configAfterRun1.mcpServers.otherServer).toEqual({ type: 'stdio', command: 'some-other-mcp' });
-  expect(configAfterRun1.mcpServers.engram).toEqual({ type: 'http', url: 'http://127.0.0.1:7779/v1/mcp' });
+  expect(configAfterRun1.mcpServers.engram).toEqual({
+    type: 'http',
+    url: 'http://127.0.0.1:7779/v1/mcp',
+    headers: { 'x-fos-key': '${FOS_API_KEY}' },
+  });
 
   // Run 2 (idempotency — re-running enrollment must not clobber the survivors).
   const res2 = await enroll();
@@ -164,7 +169,7 @@ test('POST /enroll self-heals a top-level `null` .claude.json instead of throwin
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'null-guard-token', owner_id: ownerId }),
+    body: JSON.stringify({ token: 'null-guard-token', owner_id: ownerId, api_key: API_KEY }),
   });
 
   expect(res.status).toBe(200);
@@ -172,7 +177,11 @@ test('POST /enroll self-heals a top-level `null` .claude.json instead of throwin
   expect(data.ok).toBe(true);
 
   const config = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
-  expect(config.mcpServers.engram).toEqual({ type: 'http', url: 'http://127.0.0.1:7779/v1/mcp' });
+  expect(config.mcpServers.engram).toEqual({
+    type: 'http',
+    url: 'http://127.0.0.1:7779/v1/mcp',
+    headers: { 'x-fos-key': '${FOS_API_KEY}' },
+  });
 });
 
 test('POST /enroll fails cleanly (502) if the CA response is missing cert or ca_cert_pem', async () => {
@@ -187,7 +196,7 @@ test('POST /enroll fails cleanly (502) if the CA response is missing cert or ca_
     const res = await setupRouter.request('/enroll', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-3' }),
+      body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-3', api_key: API_KEY }),
     });
     expect(res.status).toBe(502);
     const data = (await res.json()) as { ok: boolean; message?: string };
@@ -202,4 +211,87 @@ test('POST /enroll fails cleanly (502) if the CA response is missing cert or ca_
   } finally {
     globalThis.fetch = savedFetch;
   }
+});
+
+// ── Item 6.1 (Fase 6) — auth cert+chave: API Key field + x-fos-key header ────
+
+test('POST /enroll rejects a body missing api_key (400)', async () => {
+  const res = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-noapikey' }),
+  });
+  expect(res.status).toBe(400);
+  const data = (await res.json()) as { ok: boolean; message?: string };
+  expect(data.ok).toBe(false);
+  expect(data.message).toMatch(/API Key/);
+});
+
+test('POST /enroll rejects an api_key shorter than 8 chars (400)', async () => {
+  const res = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-shortkey', api_key: 'short' }),
+  });
+  expect(res.status).toBe(400);
+  const data = (await res.json()) as { ok: boolean; message?: string };
+  expect(data.ok).toBe(false);
+  expect(data.message).toMatch(/API Key/);
+});
+
+test('POST /enroll rejects an api_key longer than 512 chars (400)', async () => {
+  const res = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-longkey', api_key: 'x'.repeat(513) }),
+  });
+  expect(res.status).toBe(400);
+  const data = (await res.json()) as { ok: boolean; message?: string };
+  expect(data.ok).toBe(false);
+  expect(data.message).toMatch(/API Key/);
+});
+
+test('POST /enroll rejects an api_key containing a newline (400, P-b guard against env.ts parser corruption)', async () => {
+  const res = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-newlinekey', api_key: 'valid-looking\nkey-with-newline' }),
+  });
+  expect(res.status).toBe(400);
+  const data = (await res.json()) as { ok: boolean; message?: string };
+  expect(data.ok).toBe(false);
+  expect(data.message).toMatch(/API Key/);
+});
+
+test('POST /enroll writes headers[\'x-fos-key\'] into mergedConfig.mcpServers.engram (item 6.1)', async () => {
+  const ownerId = 'contract-test-owner-fos-key';
+  const res = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'fos-key-token', owner_id: ownerId, api_key: API_KEY }),
+  });
+  expect((await res.json() as { ok: boolean }).ok).toBe(true);
+
+  const claudeConfigPath = join(process.env.HIVEMIND_HOME!, '.claude', '.claude.json');
+  const config = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
+  // Literal template string, NOT the raw secret value — relies on the Claude
+  // Code CLI http transport's ${VAR} expansion from the process env (measured
+  // live, CLI v2.1.207: confirmed the header value IS expanded — see the
+  // OPEN-cfg-A probe in the delivery report).
+  expect(config.mcpServers.engram.headers).toEqual({ 'x-fos-key': '${FOS_API_KEY}' });
+});
+
+test('POST /enroll writes FOS_API_KEY=<pasted value> into $HIVEMIND_HOME/.env, mode 0600 (item 6.1)', async () => {
+  const ownerId = 'contract-test-owner-envkey';
+  const res = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'env-key-token', owner_id: ownerId, api_key: API_KEY }),
+  });
+  expect((await res.json() as { ok: boolean }).ok).toBe(true);
+
+  const envPath = join(process.env.HIVEMIND_HOME!, '.env');
+  const envContent = readFileSync(envPath, 'utf8');
+  expect(envContent).toContain(`FOS_API_KEY=${API_KEY}`);
+  expect(statSync(envPath).mode & 0o777).toBe(0o600);
 });
