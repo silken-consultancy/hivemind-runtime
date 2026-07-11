@@ -3,5 +3,5 @@ node_modules/
 *.pem
 *.key
 bun.lock
-.fos/
+.engram/
 *.log

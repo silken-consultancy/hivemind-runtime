@@ -6,7 +6,7 @@
 // SANDBOX SAFETY: setup.ts derives the mTLS material path from `homedir()` (node:os),
 // which is NOT overridable via env — only $HIVEMIND_HOME is. Without mocking
 // node:os, this test would write (and OVERWRITE) real cert material into the
-// developer's actual ~/.fos/mtls/ca.cert.pem. We mock node:os to redirect
+// developer's actual ~/.engram/mtls/ca.cert.pem. We mock node:os to redirect
 // homedir() into an ephemeral tmp dir BEFORE importing setup.ts, and mock
 // globalThis.fetch to intercept the /ca/issue call instead of a real network call.
 import { test, expect, beforeAll, afterAll, mock } from 'bun:test';
@@ -94,7 +94,7 @@ test('POST /enroll destructures the REAL server response shape and persists cert
   const data = (await res.json()) as { ok: boolean };
   expect(data.ok).toBe(true);
 
-  const mtlsDir = join(testHome, '.fos', 'mtls');
+  const mtlsDir = join(testHome, '.engram', 'mtls');
   const certPath = join(mtlsDir, `${ownerId}.cert.pem`);
   const caPath = join(mtlsDir, 'ca.cert.pem');
 

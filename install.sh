@@ -33,22 +33,45 @@ done
 
 INSTALL_BIN_DIR="${INSTALL_PREFIX}/bin"
 
-# ── Dependency checks ─────────────────────────────────────────────────────────
+# ── Dependency checks + auto-install ──────────────────────────────────────────
 if ! command -v bun > /dev/null 2>&1; then
-  echo "Erro: 'bun' é necessário mas não foi encontrado." >&2
-  echo "Instale o bun: curl -fsSL https://bun.sh/install | bash" >&2
-  echo "Depois rode novamente: bash install.sh" >&2
-  exit 1
+  echo "'bun' não encontrado — instalando..."
+  curl -fsSL https://bun.sh/install | bash > /dev/null 2>&1 || {
+    echo "Erro: falha ao instalar o bun automaticamente." >&2
+    echo "Instale manualmente: curl -fsSL https://bun.sh/install | bash" >&2
+    exit 1
+  }
+  # The bun installer places the binary in ~/.bun/bin, which isn't on PATH yet
+  # in THIS shell (the installer patches the user's rc file for future
+  # sessions, not the currently-running script) — extend it here so the rest
+  # of this install can use bun immediately.
+  export PATH="${HOME}/.bun/bin:${PATH}"
+  if ! command -v bun > /dev/null 2>&1; then
+    echo "Erro: bun instalado mas não encontrado no PATH (esperado em ~/.bun/bin)." >&2
+    exit 1
+  fi
 fi
 
 if ! command -v openssl > /dev/null 2>&1; then
-  echo "Erro: 'openssl' é necessário mas não foi encontrado." >&2
-  echo "Instale: sudo apt-get install openssl  (Ubuntu/Debian)" >&2
-  exit 1
+  echo "'openssl' não encontrado — instalando..."
+  if command -v apt-get > /dev/null 2>&1; then
+    sudo apt-get install -y openssl > /dev/null 2>&1 \
+      || { echo "Erro: falha ao instalar openssl via apt-get." >&2; exit 1; }
+  elif command -v brew > /dev/null 2>&1; then
+    brew install openssl > /dev/null 2>&1 \
+      || { echo "Erro: falha ao instalar openssl via brew." >&2; exit 1; }
+  else
+    echo "Erro: 'openssl' não encontrado e nenhum gerenciador de pacotes suportado (apt-get/brew) disponível." >&2
+    echo "Instale manualmente e rode novamente." >&2
+    exit 1
+  fi
+  if ! command -v openssl > /dev/null 2>&1; then
+    echo "Erro: openssl instalado mas ainda não encontrado no PATH." >&2
+    exit 1
+  fi
 fi
 
 echo "Instalando o HiveMind..."
-echo "  HIVEMIND_HOME: ${HIVEMIND_HOME}"
 
 # ── Create directories ────────────────────────────────────────────────────────
 mkdir -p "${HIVEMIND_HOME}/.claude"
@@ -64,24 +87,23 @@ _set_env_kv() {
   fi
 }
 
-# Persist the product endpoint so the runtime reads it at startup (before enrollment).
+# Persist the product endpoint so the runtime reads it at startup (before
+# enrollment). Not echoed (stealth) — install output stays GO/error only.
 touch "${HIVEMIND_HOME}/.env"
 _set_env_kv HIVEMIND_ENDPOINT "${HIVEMIND_ENDPOINT}"
-echo "  Endpoint:    ${HIVEMIND_ENDPOINT}"
 
 # Pin the update source (item 4.4, hivemind update): the remote URL + branch
 # recorded HERE, once, at install time — 'hivemind update' pulls from this
 # pinned pair, not from whatever the local clone's remote/branch might drift
 # to later. This is requirement 1 (fonte pinada) of the hardened pull-agent.
+# Not echoed (stealth) — the git remote URL and local clone path are not
+# printed to the terminal.
 if [ -d "${SCRIPT_DIR}/.git" ]; then
   _pinned_remote="$(git -C "${SCRIPT_DIR}" remote get-url origin 2>/dev/null || echo '')"
   _pinned_branch="$(git -C "${SCRIPT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'main')"
   _set_env_kv HIVEMIND_SOURCE_DIR "${SCRIPT_DIR}"
   _set_env_kv HIVEMIND_UPDATE_REMOTE "${_pinned_remote}"
   _set_env_kv HIVEMIND_UPDATE_BRANCH "${_pinned_branch}"
-  echo "  Update src:  ${SCRIPT_DIR} (${_pinned_remote:-no remote}@${_pinned_branch})"
-else
-  echo "  Update src:  (skipped — ${SCRIPT_DIR} is not a git clone, 'hivemind update' unavailable)"
 fi
 
 # ── Copy files ────────────────────────────────────────────────────────────────
@@ -111,7 +133,6 @@ _install_binary() {
   [ -w "${_dest_dir}" ] || return 1
   cp "${SCRIPT_DIR}/bin/hivemind" "${_dest_dir}/hivemind"
   chmod +x "${_dest_dir}/hivemind"
-  echo "  Binário:     ${_dest_dir}/hivemind"
   return 0
 }
 
@@ -131,9 +152,9 @@ fi
 
 # ── Smoke check ───────────────────────────────────────────────────────────────
 if command -v hivemind > /dev/null 2>&1; then
-  echo "  Smoke:       $(hivemind --version)"
+  echo "  OK: $(hivemind --version)"
 else
-  echo "  Smoke:       (hivemind ainda não está no PATH — veja a nota acima)"
+  echo "  Nota: hivemind ainda não está no PATH — veja a nota acima."
 fi
 
 echo ""
