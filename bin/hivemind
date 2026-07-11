@@ -605,7 +605,7 @@ cmd_open() {
 
   exec env \
     CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" \
-    FOS_SLUG="${_project_slug}" \
+    ENGRAM_SLUG="${_project_slug}" \
     HIVEMIND_HOME="${HIVEMIND_HOME}" \
     claude "$@"
 }
