@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # hivemind — HiveMind thin CLI.
 #
-# Standalone product client — zero lab deps, talks only to the engram backend.
+# Analogous to silken-runtime but standalone — zero lab deps.
 # Runs in the user's project directory; slug = arg or basename(cwd).
 #
 # Usage:
@@ -605,7 +605,7 @@ cmd_open() {
 
   exec env \
     CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" \
-    ENGRAM_SLUG="${_project_slug}" \
+    FOS_SLUG="${_project_slug}" \
     HIVEMIND_HOME="${HIVEMIND_HOME}" \
     claude "$@"
 }
