@@ -406,20 +406,60 @@ _verify_commit_integrity() {
 # binary to PATH (that's handled separately, see _update_installed_binary) and
 # does NOT run install.sh's dependency/PATH checks or smoke test (those are
 # first-install concerns, not update concerns).
+#
+# Two-tier copy (code-review fix, post-5.1/5.2/5.3 — replaces a cherry-pick
+# allowlist that was a BLOCKER): (1) GIT-MANAGED paths — CLAUDE.md, settings.json,
+# commands/, runtime/ — the NEW version from HIVEMIND_SOURCE_DIR always wins;
+# (2) RUNTIME-WRITTEN state — everything Claude Code / the enrollment flow
+# writes into $HIVEMIND_HOME at runtime (NOT sourced from git: .env,
+# .claude/.claude.json [mcpServers.engram, item 5.1], .claude/.credentials.json
+# [item 5.0], plus whatever Claude Code writes next — history.jsonl, sessions/,
+# projects/, shell-snapshots/, caches, none of it enumerable up front) — the
+# LIVE state always wins. A fixed allowlist (the previous version of this
+# function only preserved .env + .credentials.json) silently drops every other
+# runtime-written file on the first 'hivemind update' — this is exactly what
+# broke the item 5.1 MCP fix (.claude.json is written by the ENROLLMENT
+# handler at runtime, not by git, so it was never in the allowlist and got
+# wiped by the staging mv). Inverting the pattern to "preserve everything,
+# except what git explicitly owns" closes that class of regression instead of
+# cherry-picking the next file that turns out to matter.
 _stage_build() {
   local _target="$1"
   mkdir -p "${_target}/.claude" "${_target}/runtime" || return 1
-  cp "${HIVEMIND_SOURCE_DIR}/CLAUDE.md" "${_target}/CLAUDE.md" || return 1
+
+  # ── Tier 1: git-managed — NEW version wins ────────────────────────────────
+  # CLAUDE.md lands under .claude/ — mirrors install.sh's item 5.2 fix
+  # (load-bearing: forgetting this side regresses the pull-agent silently).
+  cp "${HIVEMIND_SOURCE_DIR}/CLAUDE.md" "${_target}/.claude/CLAUDE.md" || return 1
   cp "${HIVEMIND_SOURCE_DIR}/.claude/settings.json" "${_target}/.claude/settings.json" || return 1
+  # Product slash-commands (item 5.3) — same mirror requirement as above.
+  mkdir -p "${_target}/.claude/commands" || return 1
+  cp -r "${HIVEMIND_SOURCE_DIR}/.claude/commands/." "${_target}/.claude/commands/" || return 1
   rsync -a --exclude='node_modules/' --exclude='bun.lock' \
     "${HIVEMIND_SOURCE_DIR}/runtime/" "${_target}/runtime/" 2>/dev/null \
     || cp -r "${HIVEMIND_SOURCE_DIR}/runtime/." "${_target}/runtime/" || return 1
   (cd "${_target}/runtime" && bun install --silent 2>/dev/null || bun install) || return 1
+
+  # ── Tier 2: runtime-written — LIVE state wins ─────────────────────────────
   # Preserve the LIVE .env (cert paths, endpoint, update pinning) — the staged
   # build must boot with the same identity/config as the current one, not a
   # fresh/empty one.
   if [ -f "${HIVEMIND_HOME}/.env" ]; then
     cp "${HIVEMIND_HOME}/.env" "${_target}/.env" || return 1
+  fi
+  # Merge the ENTIRE live .claude/ dir over the staged one, EXCLUDING exactly
+  # the 3 git-managed paths already placed above (anchored to the transfer
+  # root with a leading '/' so a same-named file/dir nested deeper — e.g. under
+  # sessions/ or projects/ — is never accidentally excluded). No --delete: this
+  # only ADDS/overwrites from live into staging, it never removes a
+  # freshly-placed git file. Covers .claude.json (item 5.1) + .credentials.json
+  # (item 5.0) + anything else Claude Code writes there, present or future.
+  if [ -d "${HIVEMIND_HOME}/.claude" ]; then
+    rsync -a \
+      --exclude='/CLAUDE.md' \
+      --exclude='/settings.json' \
+      --exclude='/commands/' \
+      "${HIVEMIND_HOME}/.claude/" "${_target}/.claude/" || return 1
   fi
   return 0
 }
@@ -603,11 +643,40 @@ cmd_open() {
   _maybe_auto_update
   _start_proxy
 
+  # F0 auth fail-safe (item 5.0) — the isolated CONFIG_DIR may have no
+  # credential at all (install.sh only seeds it best-effort from the user's
+  # personal ~/.claude, and a brand-new CONFIG_DIR on a machine with no prior
+  # personal login has nothing to seed from). Missing credential triggers a
+  # login flow INSIDE the same isolated CONFIG_DIR, so the resulting auth
+  # state stays apartada from the user's personal Claude Code account.
+  # Confirmed live (G3, Claude Code CLI v2.1.207): `claude auth login`
+  # authenticates-AND-EXITS (prints an OAuth URL, waits for the pasted
+  # callback code, writes the credential, then returns) — it does NOT enter an
+  # interactive session, so it is safe to run here and fall through to the
+  # normal `exec claude` below afterwards. Fail-safe, not fail-closed: if the
+  # login is skipped/cancelled/times out, we still proceed to `exec` (the
+  # interactive session will show its own auth prompt if needed) — never abort
+  # the whole command over auth. NOTE (P2, out of scope for this pass): this
+  # only covers ABSENCE, not an EXPIRED-but-present credential — see
+  # docs/wip/hivemind-runtime-refinement-and-provisioning.md item 5.0 OPEN.
+  if [ ! -f "${HIVEMIND_HOME}/.claude/.credentials.json" ]; then
+    echo ""
+    echo "Nenhuma credencial encontrada no runtime isolado do HiveMind — fazendo login..."
+    env CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" claude auth login || true
+  fi
+
+  # --setting-sources user (item 5.2, F2 isolation): the isolated CONFIG_DIR
+  # already redirects commands/skills/MCP/global-CLAUDE.md (CLAUDE_CONFIG_DIR
+  # above), but without this flag the user's PROJECT ./CLAUDE.md (walk-up from
+  # cwd) still leaks into context — measured (P3/P4, CLI v2.1.207). This flag
+  # is the scalpel that suppresses project-scoped settings/CLAUDE.md/.mcp.json
+  # while keeping the product's user-scoped config intact — intentional, not
+  # a side effect (re-measure if the embedded CLI version changes).
   exec env \
     CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" \
     ENGRAM_SLUG="${_project_slug}" \
     HIVEMIND_HOME="${HIVEMIND_HOME}" \
-    claude "$@"
+    claude --setting-sources user "$@"
 }
 
 # ── Entry point ───────────────────────────────────────────────────────────────

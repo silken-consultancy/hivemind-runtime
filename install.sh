@@ -113,8 +113,29 @@ fi
 # enrollment and read via fos_recall({mode:'topic', topic:'self/core'}) — see
 # CLAUDE.md's "Espinha (self-core)" section. Copying a real identity file into
 # a public client repo/install is exactly the leak this item closed.
-cp "${SCRIPT_DIR}/CLAUDE.md" "${HIVEMIND_HOME}/CLAUDE.md"
+# CLAUDE.md is copied under .claude/ (not $HIVEMIND_HOME root) so Claude Code's
+# CLAUDE_CONFIG_DIR-scoped global-CLAUDE.md discovery picks it up (item 5.2,
+# F2 isolation — measured: $CLAUDE_CONFIG_DIR/CLAUDE.md is the real path read,
+# NOT $CLAUDE_CONFIG_DIR/../CLAUDE.md). Source in the repo stays at the root
+# for readability — only the copy DESTINATION moved.
+cp "${SCRIPT_DIR}/CLAUDE.md" "${HIVEMIND_HOME}/.claude/CLAUDE.md"
 cp "${SCRIPT_DIR}/.claude/settings.json" "${HIVEMIND_HOME}/.claude/settings.json"
+
+# Copy product slash-commands (item 5.3, F3 — /boot + /end-session).
+mkdir -p "${HIVEMIND_HOME}/.claude/commands"
+cp -r "${SCRIPT_DIR}/.claude/commands/." "${HIVEMIND_HOME}/.claude/commands/"
+
+# Copy the user's personal Claude Code credentials into the isolated CONFIG_DIR
+# (item 5.0, F0 auth) — best-effort. Absence is NOT an error: bin/hivemind's
+# cmd_open() has a fail-safe that triggers a login flow inside the same
+# isolated CONFIG_DIR on first launch if this file is missing (only ABSENCE is
+# handled here, not an EXPIRED credential — see docs/wip plan item 5.0/P2).
+if [ -f "${HOME}/.claude/.credentials.json" ]; then
+  cp "${HOME}/.claude/.credentials.json" "${HIVEMIND_HOME}/.claude/.credentials.json"
+  chmod 600 "${HIVEMIND_HOME}/.claude/.credentials.json"
+else
+  echo "Nota: nenhuma credencial do Claude Code encontrada em ~/.claude/.credentials.json — você fará login (isolado, dentro do runtime do HiveMind) na primeira execução."
+fi
 
 # Copy runtime (preserve permissions; exclude node_modules if present).
 rsync -a --exclude='node_modules/' --exclude='bun.lock' \
