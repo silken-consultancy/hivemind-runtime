@@ -42,11 +42,26 @@ aqui. Conduza o onboarding:
   `self/relational` + `self/lived` do usuário via `fos_memory({ action: "set", ... })`
   (você autora; o usuário nunca edita a self diretamente).
 
+**Gate de self-write (AUTH-SELF-WRITE):** cada um desses writes é `plane:"self"` —
+o backend exige `self_write_confirmation: true` + `edit_context: "<por que>"` no mesmo
+call, senão responde `403 self_write_confirmation_required`. Se isso acontecer,
+**não floundar nem desistir do onboarding** — reapresente a MESMA chamada com os dois
+campos preenchidos e continue.
+
 Se já existir memória própria (boot não-vazio), **pule** o onboarding — vá direto
 para o passo 4 com o estado já carregado.
 
-## 4. Apresentação
+## 4. Continuidade — a sessão anterior deixou WIP?
+
+O payload do skeleton (passo 2) já traz `recent_sessions[]` — sem chamada extra.
+Se `recent_sessions[0].has_real_note` for `true`, leia
+`recent_sessions[0].next_note_preview` (linha `WIP:`/`NEXT:` da última sessão fechada
+neste projeto) e traga isso para a apresentação do passo 5 — é o handoff que
+`/end-session` deixou. `has_real_note:false` ou lista vazia = nada a retomar (primeira
+sessão do projeto, ou a anterior fechou sem WIP em aberto) — não invente contexto.
+
+## 5. Apresentação
 
 Feche com uma linha curta confirmando que a espinha + o contexto do projeto foram
-internalizados (não enumere o que foi lido) e pergunte ao usuário no que trabalhar
-nesta sessão.
+internalizados (não enumere o que foi lido); se o passo 4 trouxe um `next_note`, mencione-o
+como ponto de partida. Pergunte ao usuário no que trabalhar nesta sessão.
