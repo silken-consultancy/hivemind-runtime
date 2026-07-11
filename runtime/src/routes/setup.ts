@@ -132,7 +132,7 @@ setupRouter.get('/', (c) => {
 //
 // Steps:
 //  1. Validate body (token + owner_id required)
-//  2. Generate EC keypair + CSR via openssl (Bun.spawnSync)
+//  2. Generate RSA keypair + CSR via openssl (Bun.spawnSync; RSA — the CA's forge is RSA-only)
 //  3. POST /ca/issue → { cert, ca_cert_pem }
 //  4. Save key + cert + CA to ~/.engram/mtls/ (chmod 0600)
 //  5. Write $HIVEMIND_HOME/.env with MTLS_* vars
@@ -173,11 +173,14 @@ setupRouter.post('/enroll', async (c) => {
     const certPath = join(mtlsDir, `${ownerId}.cert.pem`);
     const caPath   = join(mtlsDir, 'ca.cert.pem');
 
-    // 2. Generate EC keypair + CSR via openssl.
+    // 2. Generate RSA keypair + CSR via openssl. RSA (not EC) because the CA
+    // signs with node-forge, whose CSR parser only supports RSA public keys — an
+    // EC P-256 CSR fails on the server with "Cannot read public key. OID is not
+    // RSA" → 400 invalid_csr (measured against node-forge 1.4.0; found by INT-1
+    // dogfood). If the CA ever moves to an EC-capable lib, revisit this.
     const opensslResult = Bun.spawnSync([
       'openssl', 'req',
-      '-newkey', 'ec',
-      '-pkeyopt', 'ec_paramgen_curve:P-256',
+      '-newkey', 'rsa:2048',
       '-nodes',
       '-keyout', keyPath,
       '-out', csrPath,
