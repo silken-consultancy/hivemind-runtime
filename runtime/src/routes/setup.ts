@@ -136,7 +136,10 @@ setupRouter.get('/', (c) => {
 //  3. POST /ca/issue → { cert, ca_cert_pem }
 //  4. Save key + cert + CA to ~/.engram/mtls/ (chmod 0600)
 //  5. Write $HIVEMIND_HOME/.env with MTLS_* vars
-//  6. Write ~/.claude/mcp.json (try) or ~/.mcp.json (fallback)
+//  6. Merge-write $HIVEMIND_HOME/.claude/.claude.json (mcpServers.engram) — the
+//     only path Claude Code actually reads for user-scope MCP discovery
+//     (measured, CLI v2.1.207; ~/.claude/mcp.json and ~/.mcp.json are dead
+//     paths, never read — item 5.1/F1 fix)
 //  7. Return { ok: true, owner_id }
 
 setupRouter.post('/enroll', async (c) => {
@@ -265,27 +268,52 @@ setupRouter.post('/enroll', async (c) => {
     const envFile = join(hivemindHome, '.env');
     writeFileSync(envFile, envContent, { mode: 0o600 });
 
-    // 6. Write MCP config for Claude Code.
-    //    Try ~/.claude/mcp.json first (Claude Code standard path),
-    //    fallback to ~/.mcp.json (older versions / alternative path).
-    const mcpConfig = JSON.stringify({
-      mcpServers: {
-        engram: {
-          type: 'http',
-          url: `http://127.0.0.1:${proxyPort}/v1/mcp`,
-        },
-      },
-    }, null, 2);
-
-    const claudeDir = join(homedir(), '.claude');
-    const claudeMcpPath = join(claudeDir, 'mcp.json');
-    const fallbackMcpPath = join(homedir(), '.mcp.json');
-
-    if (existsSync(claudeDir)) {
-      writeFileSync(claudeMcpPath, mcpConfig, { mode: 0o644 });
-    } else {
-      writeFileSync(fallbackMcpPath, mcpConfig, { mode: 0o644 });
+    // 6. Merge-write $HIVEMIND_HOME/.claude/.claude.json — the only path
+    // Claude Code v2.1.207 actually reads for user-scope MCP server discovery
+    // (measured; ~/.claude/mcp.json and ~/.mcp.json below are DEAD paths,
+    // never read by this CLI version — this is the item 5.1/F1 contract fix).
+    // MERGE-SAFE: read→parse (try/catch, corrupted/absent → {}) →spread→
+    // overwrite only mcpServers.engram, so any OTHER top-level key or other
+    // mcpServers.* entry that already exists survives (P1 pitfall — tested:
+    // running enrollment twice, and against a pre-existing .claude.json with
+    // an arbitrary extra key + another mcpServers.* entry, both survive).
+    const claudeConfigPath = join(hivemindHome, '.claude', '.claude.json');
+    let existingConfig: Record<string, unknown> = {};
+    if (existsSync(claudeConfigPath)) {
+      try {
+        const parsed: unknown = JSON.parse(await Bun.file(claudeConfigPath).text());
+        // Guard (code-review hardening): a syntactically-valid JSON document
+        // that isn't a plain object — top-level `null`, a number, a string, or
+        // an array — must ALSO fall back to {}, not just a parse failure. The
+        // parse itself would succeed for e.g. `null`, and `existingConfig`
+        // would be typed as `Record<string, unknown>` at compile time but
+        // actually hold `null`/an array at runtime — `existingConfig.mcpServers`
+        // below would then throw (`null.mcpServers`) instead of self-healing,
+        // turning a corrupted file into a 500 instead of the declared contract
+        // ("corrompido → {}, nunca aborta o enrollment").
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          existingConfig = {};
+        } else {
+          existingConfig = parsed as Record<string, unknown>;
+        }
+      } catch {
+        existingConfig = {};
+      }
     }
+    const mergedConfig = {
+      ...existingConfig,
+      mcpServers: {
+        ...(existingConfig.mcpServers as Record<string, unknown> | undefined),
+        engram: { type: 'http', url: `http://127.0.0.1:${proxyPort}/v1/mcp` },
+      },
+    };
+    mkdirSync(join(hivemindHome, '.claude'), { recursive: true });
+    // mode 0600 (not 0644): the merge preserves pre-existing Claude Code keys
+    // (e.g. oauthAccount) and rewrites the whole file — don't widen the
+    // permissions of that account metadata. The URL itself is localhost (no
+    // secret), but matching the 600 posture already used for .env/.credentials
+    // is the correct default for a file that may carry other people's secrets.
+    writeFileSync(claudeConfigPath, JSON.stringify(mergedConfig, null, 2), { mode: 0o600 });
 
     // Mark enrollment done for /setup/status poll.
     enrollmentDone = true;

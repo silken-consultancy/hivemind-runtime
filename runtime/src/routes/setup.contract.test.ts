@@ -10,7 +10,7 @@
 // homedir() into an ephemeral tmp dir BEFORE importing setup.ts, and mock
 // globalThis.fetch to intercept the /ca/issue call instead of a real network call.
 import { test, expect, beforeAll, afterAll, mock } from 'bun:test';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -105,6 +105,74 @@ test('POST /enroll destructures the REAL server response shape and persists cert
   // old `cert_pem` field (which the server never actually returned).
   expect(readFileSync(certPath, 'utf8')).toBe(FAKE_CLIENT_CERT_PEM);
   expect(readFileSync(caPath, 'utf8')).toBe(FAKE_CA_CERT_PEM);
+});
+
+test('POST /enroll writes $HIVEMIND_HOME/.claude/.claude.json merge-safely (item 5.1/F1, P1)', async () => {
+  const ownerId = 'contract-test-owner-p1';
+  const claudeDir = join(process.env.HIVEMIND_HOME!, '.claude');
+  const claudeConfigPath = join(claudeDir, '.claude.json');
+
+  // Pre-existing .claude.json with an arbitrary top-level key + another
+  // mcpServers.* entry — both must survive the merge (P1 pitfall).
+  mkdirSync(claudeDir, { recursive: true });
+  writeFileSync(
+    claudeConfigPath,
+    JSON.stringify({
+      someArbitraryKey: 'keep-me',
+      mcpServers: { otherServer: { type: 'stdio', command: 'some-other-mcp' } },
+    }),
+  );
+
+  const enroll = () =>
+    setupRouter.request('/enroll', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'p1-token', owner_id: ownerId }),
+    });
+
+  // Run 1.
+  const res1 = await enroll();
+  expect((await res1.json() as { ok: boolean }).ok).toBe(true);
+  const configAfterRun1 = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
+  expect(configAfterRun1.someArbitraryKey).toBe('keep-me');
+  expect(configAfterRun1.mcpServers.otherServer).toEqual({ type: 'stdio', command: 'some-other-mcp' });
+  expect(configAfterRun1.mcpServers.engram).toEqual({ type: 'http', url: 'http://127.0.0.1:7779/v1/mcp' });
+
+  // Run 2 (idempotency — re-running enrollment must not clobber the survivors).
+  const res2 = await enroll();
+  expect((await res2.json() as { ok: boolean }).ok).toBe(true);
+  const configAfterRun2 = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
+  expect(configAfterRun2).toEqual(configAfterRun1);
+
+  // File mode: 0600, not 0644 (code-review hardening — the merge preserves
+  // pre-existing Claude Code account metadata and rewrites the whole file).
+  expect(statSync(claudeConfigPath).mode & 0o777).toBe(0o600);
+});
+
+test('POST /enroll self-heals a top-level `null` .claude.json instead of throwing (code-review hardening)', async () => {
+  const ownerId = 'contract-test-owner-null-guard';
+  const claudeDir = join(process.env.HIVEMIND_HOME!, '.claude');
+  const claudeConfigPath = join(claudeDir, '.claude.json');
+
+  // A syntactically-valid JSON document that is NOT a plain object: parses
+  // fine (no try/catch trip), but `null.mcpServers` would throw if not
+  // guarded — this must self-heal to {} per the declared contract
+  // ("corrompido → {}, nunca aborta o enrollment"), not 500.
+  mkdirSync(claudeDir, { recursive: true });
+  writeFileSync(claudeConfigPath, 'null');
+
+  const res = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: 'null-guard-token', owner_id: ownerId }),
+  });
+
+  expect(res.status).toBe(200);
+  const data = (await res.json()) as { ok: boolean };
+  expect(data.ok).toBe(true);
+
+  const config = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
+  expect(config.mcpServers.engram).toEqual({ type: 'http', url: 'http://127.0.0.1:7779/v1/mcp' });
 });
 
 test('POST /enroll fails cleanly (502) if the CA response is missing cert or ca_cert_pem', async () => {
