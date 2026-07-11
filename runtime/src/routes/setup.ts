@@ -77,6 +77,8 @@ setupRouter.get('/', (c) => {
     <input type="password" id="token" placeholder="Cole o token enviado pelo seu admin" autocomplete="off">
     <label for="owner">ID do Usuário</label>
     <input type="text" id="owner" placeholder="ex: beta-joao" autocomplete="off">
+    <label for="apikey">API Key</label>
+    <input type="password" id="apikey" placeholder="Cole a API Key de config→api_key" autocomplete="off">
     <button id="btn" onclick="enroll()">Configurar mTLS</button>
     <div id="log"></div>
   </div>
@@ -84,9 +86,10 @@ setupRouter.get('/', (c) => {
     async function enroll() {
       const token = document.getElementById('token').value.trim();
       const owner = document.getElementById('owner').value.trim();
+      const apiKey = document.getElementById('apikey').value.trim();
       const log = document.getElementById('log');
       const btn = document.getElementById('btn');
-      if (!token || !owner) { step('Token e ID do Usuário são obrigatórios.', 'err'); return; }
+      if (!token || !owner || !apiKey) { step('Token, ID do Usuário e API Key são obrigatórios.', 'err'); return; }
       btn.disabled = true;
       log.innerHTML = '';
       step('Enviando pedido de inscrição...', '');
@@ -94,7 +97,7 @@ setupRouter.get('/', (c) => {
         const res = await fetch('/setup/enroll', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token, owner_id: owner })
+          body: JSON.stringify({ token, owner_id: owner, api_key: apiKey })
         });
         const data = await res.json();
         if (data.ok) {
@@ -131,33 +134,42 @@ setupRouter.get('/', (c) => {
 // ── POST /setup/enroll — enrollment handler ────────────────────────────────────
 //
 // Steps:
-//  1. Validate body (token + owner_id required)
+//  1. Validate body (token + owner_id + api_key required)
 //  2. Generate RSA keypair + CSR via openssl (Bun.spawnSync; RSA — the CA's forge is RSA-only)
 //  3. POST /ca/issue → { cert, ca_cert_pem }
 //  4. Save key + cert + CA to ~/.engram/mtls/ (chmod 0600)
-//  5. Write $HIVEMIND_HOME/.env with MTLS_* vars
-//  6. Merge-write $HIVEMIND_HOME/.claude/.claude.json (mcpServers.engram) — the
-//     only path Claude Code actually reads for user-scope MCP discovery
-//     (measured, CLI v2.1.207; ~/.claude/mcp.json and ~/.mcp.json are dead
-//     paths, never read — item 5.1/F1 fix)
+//  5. Write $HIVEMIND_HOME/.env with MTLS_* vars + FOS_API_KEY
+//  6. Merge-write $HIVEMIND_HOME/.claude/.claude.json (mcpServers.engram, incl.
+//     headers['x-fos-key']) — the only path Claude Code actually reads for
+//     user-scope MCP discovery (measured, CLI v2.1.207; ~/.claude/mcp.json and
+//     ~/.mcp.json are dead paths, never read — item 5.1/F1 fix)
 //  7. Return { ok: true, owner_id }
 
 setupRouter.post('/enroll', async (c) => {
-  let body: { token?: string; owner_id?: string };
+  let body: { token?: string; owner_id?: string; api_key?: string };
   try {
     body = await c.req.json();
   } catch {
     return c.json({ ok: false, message: 'Corpo JSON inválido' }, 400);
   }
 
-  const { token, owner_id: ownerId } = body;
-  if (!token || !ownerId) {
-    return c.json({ ok: false, message: 'Token e ID do usuário são obrigatórios' }, 400);
+  const { token, owner_id: ownerId, api_key: apiKey } = body;
+  if (!token || !ownerId || !apiKey) {
+    return c.json({ ok: false, message: 'Token, ID do usuário e API Key são obrigatórios' }, 400);
   }
 
   // Sanitize owner_id: only alphanumeric, dash, underscore (CN-safe).
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(ownerId)) {
     return c.json({ ok: false, message: 'O ID do usuário deve conter apenas letras, números, hífen ou underscore (máx. 64 caracteres)' }, 400);
+  }
+
+  // Validate api_key: length bounds + no newlines (would corrupt env.ts's
+  // line-by-line parser, split('\n') + indexOf('=')). Deliberately NOT the
+  // CN-safe regex used for owner_id above — the real charset of an engram API
+  // Key is unknown/wider (may contain base64 chars like +, /, =).
+  const trimmedApiKey = apiKey.trim();
+  if (trimmedApiKey.length < 8 || trimmedApiKey.length > 512 || /[\n\r]/.test(trimmedApiKey)) {
+    return c.json({ ok: false, message: 'A API Key deve ter entre 8 e 512 caracteres e não pode conter quebras de linha' }, 400);
   }
 
   const hivemindHome = process.env.HIVEMIND_HOME ?? join(homedir(), '.hivemind');
@@ -251,7 +263,10 @@ setupRouter.post('/enroll', async (c) => {
     // Clean up CSR (not needed after enrollment).
     try { unlinkSync(csrPath); } catch { /* best-effort */ }
 
-    // 5. Write $HIVEMIND_HOME/.env with MTLS_* vars.
+    // 5. Write $HIVEMIND_HOME/.env with MTLS_* vars + FOS_API_KEY (item 6.1,
+    // auth cert+chave — consumed by bin/hivemind's `set -a; . .env; set +a`,
+    // which exports it into the `exec env ... claude` environment so the
+    // MCP entry's `headers['x-fos-key']: '${FOS_API_KEY}'` can resolve it).
     const proxyPort = process.env.MTLS_PROXY_PORT ?? '7779';
     const envContent = [
       `# HiveMind mTLS config — written by hivemind setup on ${new Date().toISOString()}`,
@@ -262,6 +277,7 @@ setupRouter.post('/enroll', async (c) => {
       `MTLS_PROXY_PORT=${proxyPort}`,
       `HIVEMIND_ENDPOINT=${ENDPOINT}`,
       `HIVEMIND_OWNER=${ownerId}`,
+      `FOS_API_KEY=${trimmedApiKey}`,
       '',
     ].join('\n');
 
@@ -300,11 +316,30 @@ setupRouter.post('/enroll', async (c) => {
         existingConfig = {};
       }
     }
+    // headers['x-fos-key'] (item 6.1, auth cert+chave): the literal string
+    // '${FOS_API_KEY}' is written here, relying on the Claude Code CLI's http
+    // transport expanding ${VAR} from the process env at connect time (the
+    // same env bin/hivemind already exports via `set -a; . .env; set +a`
+    // before `exec env ... claude`). OPEN-cfg-A RESOLVED LIVE this pass (CLI
+    // v2.1.207, matching the version pin): a probe MCP http server + a
+    // `.claude.json` with `headers: {"x-test-var": "${TESTVAR}"}` under an
+    // isolated CLAUDE_CONFIG_DIR showed the literal value `${TESTVAR}` DOES
+    // get expanded from the process env — the upstream request arrived with
+    // the header already substituted, not the template string. G-cfg1 (real
+    // enrollment against the real engram MCP endpoint) is still the
+    // end-to-end confirmation, but the CLI-level expansion mechanism itself is
+    // no longer an open question. Fallback (literal trimmedApiKey value
+    // instead of the template) is therefore NOT expected to be needed, but is
+    // documented here in case G-cfg1 surfaces an unrelated 401.
     const mergedConfig = {
       ...existingConfig,
       mcpServers: {
         ...(existingConfig.mcpServers as Record<string, unknown> | undefined),
-        engram: { type: 'http', url: `http://127.0.0.1:${proxyPort}/v1/mcp` },
+        engram: {
+          type: 'http',
+          url: `http://127.0.0.1:${proxyPort}/v1/mcp`,
+          headers: { 'x-fos-key': '${FOS_API_KEY}' },
+        },
       },
     };
     mkdirSync(join(hivemindHome, '.claude'), { recursive: true });
