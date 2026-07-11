@@ -75,7 +75,8 @@ test('POST /enroll sends the REAL server request shape: { tenant, enrollment_tok
   expect(data.owner_id).toBe(OWNER_ID);
 
   // Contract fix under test: NOT { token, csr_pem } (the old/never-real shape).
-  expect(capturedUrl).toBe(`https://${process.env.HIVEMIND_ENDPOINT}/ca/issue`);
+  // Enrollment goes over 443/LE — the host WITHOUT the :4443 MCP port (see ENROLL_HOST in setup.ts).
+  expect(capturedUrl).toBe(`https://${process.env.HIVEMIND_ENDPOINT!.split(':')[0]}/ca/issue`);
   expect(capturedBody).toEqual({
     tenant: OWNER_ID,
     enrollment_token: PLAINTEXT_TOKEN,

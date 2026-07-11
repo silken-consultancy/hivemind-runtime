@@ -22,6 +22,18 @@ import { join } from 'node:path';
 // (written by install.sh --endpoint; preserved across enrollment).
 const ENDPOINT = process.env.HIVEMIND_ENDPOINT ?? 'hivemind.silken.ia.br:4443';
 
+// Enrollment (/ca/issue) goes over the public 443/Let's-Encrypt surface (Caddy →
+// auth-service), NOT the :4443 MCP mTLS port. Two reasons :4443 fails for enrollment:
+// (a) it's mutual-mTLS (requestCert) but the client has no cert yet at enrollment —
+// it's bootstrapping to GET one — so the server closes the socket; (b) even certless,
+// the :4443 server cert is signed by the product CA which the client doesn't have yet
+// → "self signed certificate in certificate chain". The 443/LE surface is certless AND
+// publicly trusted, so the bootstrap works without the product CA; the issued
+// ca_cert_pem is then pinned for the :4443 mTLS proxy. NOTE: cert RENEWAL is mutual-mTLS
+// and won't traverse Caddy/443 (client cert terminated there) — renewal needs a direct
+// :4443 path (future design; does not block initial enrollment).
+const ENROLL_HOST = ENDPOINT.split(':')[0];
+
 export const setupRouter = new Hono();
 
 // In-memory flag: true once enrollment completes in this server lifetime.
@@ -187,7 +199,7 @@ setupRouter.post('/enroll', async (c) => {
       return c.json({ ok: false, message: 'Arquivo CSR vazio após o openssl — verifique a instalação do openssl' }, 500);
     }
 
-    const caUrl = `https://${ENDPOINT}/ca/issue`;
+    const caUrl = `https://${ENROLL_HOST}/ca/issue`;
     let caRes: Response;
     try {
       // No client cert here — /ca/issue validates via enrollment token.
