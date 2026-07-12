@@ -620,6 +620,120 @@ _maybe_auto_update() {
   return 0
 }
 
+# ── Session spine (WS-0.3, P0.1) ──────────────────────────────────────────────
+# Opens a real fos_session BEFORE exec'ing claude — lab-faithful (mirrors
+# silken-runtime's own pre-exec session registration), but through the
+# product's MCP tool surface (fos_session/fos_registry over the local mTLS
+# proxy) instead of a local agent-runtime endpoint, which this product has
+# none of.
+
+# _resolve_device_id: stable device_id for this machine — analogous to
+# ~/.fos/device.id in the lab. Created once (first run), reused thereafter.
+_resolve_device_id() {
+  local _id_file="${HOME}/.engram/device-id"
+  if [ ! -f "${_id_file}" ]; then
+    mkdir -p "$(dirname "${_id_file}")"
+    if command -v uuidgen > /dev/null 2>&1; then
+      uuidgen > "${_id_file}"
+    elif [ -r /proc/sys/kernel/random/uuid ]; then
+      cat /proc/sys/kernel/random/uuid > "${_id_file}"
+    else
+      # Last-resort fallback (no uuidgen, no /proc — e.g. some minimal
+      # containers): not RFC4122, but stable across runs on THIS machine,
+      # which is all device_id needs to be.
+      echo "$(hostname)-$(date +%s)-$$" > "${_id_file}"
+    fi
+  fi
+  cat "${_id_file}"
+}
+
+# _mcp_call: POST a JSON-RPC tools/call to the local mTLS proxy; prints the
+# raw SSE "data:" payload line (prefix stripped), or nothing on any failure
+# (network, auth, malformed response). Never trips errexit — `|| true` is
+# unconditional on the pipeline regardless of which stage would otherwise
+# fail. The proxy forwards EVERY local path to the single fixed upstream it's
+# built for (mtls-proxy.ts: cfg.upstream, incoming path ignored) — /v1/mcp
+# here is for readability/parity with the direct (non-proxied) curl pattern
+# used elsewhere (ops/rls-scratch-test.sh), not a routing requirement.
+_mcp_call() {
+  local _tool="$1" _args_json="$2" _id="$3"
+  curl -s --max-time 5 \
+    -H "x-fos-key: ${FOS_API_KEY:-}" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":${_id},\"method\":\"tools/call\",\"params\":{\"name\":\"${_tool}\",\"arguments\":${_args_json}}}" \
+    "http://127.0.0.1:${PROXY_PORT}/v1/mcp" 2>/dev/null \
+    | grep "^data:" | head -1 | sed 's/^data: //' || true
+}
+
+# _mcp_result_field: extract one field from an MCP tool result. Two
+# JSON.parse hops — the outer JSON-RPC envelope, then result.content[0].text
+# (the tool's own JSON payload, per mcp.service.ts convention:
+# content:[{type:'text', text:JSON.stringify(result)}]). Uses bun — already a
+# hard dependency of this script (checked in _start_proxy) — no new
+# dependency introduced. Prints nothing on any parse failure.
+_mcp_result_field() {
+  local _envelope="$1" _field="$2"
+  [ -n "${_envelope}" ] || return 0
+  bun -e '
+    try {
+      const envelope = JSON.parse(process.argv[1]);
+      const inner = JSON.parse(envelope.result.content[0].text);
+      const v = inner[process.argv[2]];
+      if (v !== undefined && v !== null) console.log(v);
+    } catch {}
+  ' "${_envelope}" "${_field}" 2>/dev/null || true
+}
+
+# _open_session_spine: opens the fos_session for this launch and sets globals
+# ENGRAM_SESSION_ID / ENGRAM_DEVICE_ID (read by cmd_open's final exec).
+# $1 = project slug.
+#
+# BEST-EFFORT (deliberate divergence from silken-runtime, which hard-aborts
+# on an empty session_id): this is the shipped client — a flaky network or a
+# transient engram outage must not block the user from opening Claude at all.
+# A missing ENGRAM_SESSION_ID just degrades /boot (no next_note surfaced) and
+# /end-session (no real close — the watchdog reclaims the orphan) rather than
+# refusing to start.
+#
+# Auto-registration (dupla cobertura, plan item WS-0.3.3): the FIRST open in a
+# never-seen project directory hits slug_not_found (the registry only knows
+# slugs the provisioning flow or a prior 'hivemind' run already created) — on
+# that one error, upsert the slug then retry open once. Every other open is a
+# single round-trip, not an unconditional per-launch registry write.
+_open_session_spine() {
+  local _slug="$1"
+  ENGRAM_DEVICE_ID="$(_resolve_device_id)"
+  ENGRAM_SESSION_ID=""
+
+  if [ -z "${FOS_API_KEY:-}" ]; then
+    _vecho "[hivemind] FOS_API_KEY ausente — sem sessão nesta janela (enrollment incompleto?)"
+    return 0
+  fi
+
+  local _open_args _resp _err_field _session_id
+  _open_args="{\"action\":\"open\",\"slug\":\"${_slug}\",\"mode\":\"manual-cli\",\"device_id\":\"${ENGRAM_DEVICE_ID}\",\"pid\":$$}"
+  _resp="$(_mcp_call "fos_session" "${_open_args}" 1)"
+  _err_field="$(_mcp_result_field "${_resp}" "_err")"
+
+  if [ "${_err_field}" = "slug_not_found" ]; then
+    _vecho "[hivemind] slug '${_slug}' desconhecido no registry — auto-registrando..."
+    local _upsert_args
+    _upsert_args="{\"action\":\"upsert\",\"slug\":\"${_slug}\",\"name\":\"${_slug}\",\"mode\":\"self-managed\",\"kind\":\"product\",\"status\":\"active\",\"device_id\":\"${ENGRAM_DEVICE_ID}\",\"registry_upsert_confirmation\":true}"
+    _mcp_call "fos_registry" "${_upsert_args}" 2 > /dev/null
+    _resp="$(_mcp_call "fos_session" "${_open_args}" 3)"
+  fi
+
+  _session_id="$(_mcp_result_field "${_resp}" "session_id")"
+  if [ -z "${_session_id}" ]; then
+    _vecho "[hivemind] fos_session open não retornou session_id — seguindo sem espinha de sessão nesta janela"
+    return 0
+  fi
+
+  ENGRAM_SESSION_ID="${_session_id}"
+  _vecho "[hivemind] sessão aberta: ${ENGRAM_SESSION_ID} (slug=${_slug})"
+}
+
 # cmd_open: start proxy + exec claude.
 # $1 = slug (optional); remaining $@ passed to claude.
 cmd_open() {
@@ -642,6 +756,11 @@ cmd_open() {
 
   _maybe_auto_update
   _start_proxy
+
+  # Espinha de sessão (WS-0.3) — abre DEPOIS do proxy responder no health,
+  # ANTES do exec (silken-runtime mirror). Sets ENGRAM_SESSION_ID/
+  # ENGRAM_DEVICE_ID (globals, best-effort — see _open_session_spine).
+  _open_session_spine "${_project_slug}"
 
   # F0 auth fail-safe (item 5.0) — the isolated CONFIG_DIR may have no
   # credential at all (install.sh only seeds it best-effort from the user's
@@ -675,6 +794,8 @@ cmd_open() {
   exec env \
     CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" \
     ENGRAM_SLUG="${_project_slug}" \
+    ENGRAM_SESSION_ID="${ENGRAM_SESSION_ID}" \
+    ENGRAM_DEVICE_ID="${ENGRAM_DEVICE_ID}" \
     HIVEMIND_HOME="${HIVEMIND_HOME}" \
     claude --setting-sources user "$@"
 }
