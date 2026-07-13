@@ -1,17 +1,20 @@
 // routes/setup.ts — first-login mTLS enrollment popup.
 //
-// Companion to bin/fos-beta-enroll (B2, cross-repo — 4tuenyOS) which mints the
-// enrollment token server-side. Token contract (against POST /ca/issue on the
-// product endpoint, HIVEMIND_ENDPOINT — default hivemind.silken.ia.br:4443) —
-// contract CONFIRMED against the real ca.controller.ts (ENROLLMENT branch,
+// Enrollment is KEY-AS-BOOTSTRAP (Fase 4-rev, founder 2026-07-11): a per-user
+// api_key is provisioned admin-side BEFORE enrollment (see the manual
+// provisioning steps in the kernel memory); the popup submits it to /ca/issue,
+// which VALIDATES it and mints an mTLS cert. enrollment_token is RETIRED.
+// Contract CONFIRMED against the real ca.controller.ts (ENROLLMENT branch,
 // engram/apps/auth-service/src/ca/ca.controller.ts):
 //
-//   Request:  POST /ca/issue  body: { tenant: string, enrollment_token: string, csr: string, days?: number }
+//   Request:  POST /ca/issue  body: { csr: string, api_key: string, days?: number }
 //   Response: { cert: string, serial: string, token: string, ca_cert_pem: string }
 //
-// NOTE: /ca/issue does NOT require a client cert — it validates the enrollment
-// token directly (token is the authorization mechanism at enrollment time).
-// After enrollment, the issued cert is used for all subsequent mTLS connections.
+// NOTE: /ca/issue does NOT require a client cert — it validates the api_key
+// directly (the key IS the identity source: cert CN = the key's tenant, NOT the
+// client-typed owner_id nor the CSR CN). After enrollment, the issued cert is
+// used for all subsequent mTLS connections, and the SAME api_key is the x-fos-
+// key (Path B) for the MCP.
 
 import { Hono } from 'hono';
 import { existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync } from 'node:fs';
@@ -73,8 +76,6 @@ setupRouter.get('/', (c) => {
   <div class="card">
     <h1>HiveMind</h1>
     <p class="sub">Configure seu certificado pessoal para conectar à memória.</p>
-    <label for="token">Token de Inscrição</label>
-    <input type="password" id="token" placeholder="Cole o token enviado pelo seu admin" autocomplete="off">
     <label for="owner">ID do Usuário</label>
     <input type="text" id="owner" placeholder="ex: beta-joao" autocomplete="off">
     <label for="apikey">API Key</label>
@@ -84,12 +85,11 @@ setupRouter.get('/', (c) => {
   </div>
   <script>
     async function enroll() {
-      const token = document.getElementById('token').value.trim();
       const owner = document.getElementById('owner').value.trim();
       const apiKey = document.getElementById('apikey').value.trim();
       const log = document.getElementById('log');
       const btn = document.getElementById('btn');
-      if (!token || !owner || !apiKey) { step('Token, ID do Usuário e API Key são obrigatórios.', 'err'); return; }
+      if (!owner || !apiKey) { step('ID do Usuário e API Key são obrigatórios.', 'err'); return; }
       btn.disabled = true;
       log.innerHTML = '';
       step('Enviando pedido de inscrição...', '');
@@ -97,11 +97,11 @@ setupRouter.get('/', (c) => {
         const res = await fetch('/setup/enroll', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token, owner_id: owner, api_key: apiKey })
+          body: JSON.stringify({ owner_id: owner, api_key: apiKey })
         });
         const data = await res.json();
         if (data.ok) {
-          step('Par de chaves gerado (EC P-256)', 'ok');
+          step('Par de chaves gerado (RSA 2048)', 'ok');
           step('CSR enviado para a CA', 'ok');
           step('Certificado recebido e salvo', 'ok');
           step('Configuração do proxy gravada', 'ok');
@@ -134,9 +134,9 @@ setupRouter.get('/', (c) => {
 // ── POST /setup/enroll — enrollment handler ────────────────────────────────────
 //
 // Steps:
-//  1. Validate body (token + owner_id + api_key required)
+//  1. Validate body (owner_id + api_key required — enrollment_token RETIRED, key-as-bootstrap)
 //  2. Generate RSA keypair + CSR via openssl (Bun.spawnSync; RSA — the CA's forge is RSA-only)
-//  3. POST /ca/issue → { cert, ca_cert_pem }
+//  3. POST /ca/issue { csr, api_key } → { cert, ca_cert_pem } (api_key resolves tenant server-side)
 //  4. Save key + cert + CA to ~/.engram/mtls/ (chmod 0600)
 //  5. Write $HIVEMIND_HOME/.env with MTLS_* vars + FOS_API_KEY
 //  6. Merge-write $HIVEMIND_HOME/.claude/.claude.json (mcpServers.engram, incl.
@@ -146,16 +146,16 @@ setupRouter.get('/', (c) => {
 //  7. Return { ok: true, owner_id }
 
 setupRouter.post('/enroll', async (c) => {
-  let body: { token?: string; owner_id?: string; api_key?: string };
+  let body: { owner_id?: string; api_key?: string };
   try {
     body = await c.req.json();
   } catch {
     return c.json({ ok: false, message: 'Corpo JSON inválido' }, 400);
   }
 
-  const { token, owner_id: ownerId, api_key: apiKey } = body;
-  if (!token || !ownerId || !apiKey) {
-    return c.json({ ok: false, message: 'Token, ID do usuário e API Key são obrigatórios' }, 400);
+  const { owner_id: ownerId, api_key: apiKey } = body;
+  if (!ownerId || !apiKey) {
+    return c.json({ ok: false, message: 'ID do usuário e API Key são obrigatórios' }, 400);
   }
 
   // Sanitize owner_id: only alphanumeric, dash, underscore (CN-safe).
@@ -220,13 +220,15 @@ setupRouter.post('/enroll', async (c) => {
     const caUrl = `https://${ENROLL_HOST}/ca/issue`;
     let caRes: Response;
     try {
-      // No client cert here — /ca/issue validates via enrollment token.
-      // Body shape matches the real server contract (issueBodySchema in
-      // ca.controller.ts): { tenant, enrollment_token, csr }, NOT { token, csr_pem }.
+      // No client cert here — /ca/issue validates the pre-provisioned api_key
+      // (key-as-bootstrap, Fase 4-rev). Body shape matches issueBodySchema in
+      // ca.controller.ts: { csr, api_key }. The api_key RESOLVES the tenant
+      // server-side (cert CN = the key's tenant) — enrollment_token is RETIRED,
+      // no client-asserted tenant.
       caRes = await fetch(caUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenant: ownerId, enrollment_token: token, csr: csrPem }),
+        body: JSON.stringify({ csr: csrPem, api_key: apiKey }),
         signal: AbortSignal.timeout(30000),
       });
     } catch (fetchErr: unknown) {
