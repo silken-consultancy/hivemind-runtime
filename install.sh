@@ -33,6 +33,22 @@ done
 
 INSTALL_BIN_DIR="${INSTALL_PREFIX}/bin"
 
+# ── Interactive-context check (F2.4) ──────────────────────────────────────────
+# The first USE of hivemind (interactive project-slug selection + mTLS
+# enrollment) requires a real interactive terminal — neither works in a
+# non-interactive/piped context, where bin/hivemind now fails closed (cmd_open,
+# F2.3). Surface that requirement HERE, at install time, so it's discovered up
+# front instead of on the first silent first-run failure. We WARN and continue
+# (do NOT hard-abort): the file-copy/dependency steps below are safe to run
+# non-interactively (e.g. an automated `curl … | bash` provisioning), and only
+# the subsequent `hivemind` first-run needs the TTY. The check itself (not hard
+# enforcement) is the F2.4 requirement.
+if ! { [ -t 0 ] && [ -t 1 ]; }; then
+  echo "AVISO: a instalação e o primeiro uso do hivemind exigem um terminal interativo —" >&2
+  echo "       seleção de projeto e enrollment (mTLS) não funcionam em modo não-interativo." >&2
+  echo "       Os arquivos serão instalados, mas rode 'hivemind' num terminal real depois." >&2
+fi
+
 # ── Dependency checks + auto-install ──────────────────────────────────────────
 if ! command -v bun > /dev/null 2>&1; then
   echo "'bun' não encontrado — instalando..."
