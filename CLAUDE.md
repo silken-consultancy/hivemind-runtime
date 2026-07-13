@@ -17,9 +17,15 @@ fos_recall({ mode: "topic", topic: "self/core" })
 
 É a identidade compartilhada (identity · posture · resonance · purpose · voice) — versionada, não muta ao vivo. O seu self per-user constrói POR CIMA dela, e **só você (o assistente) a autora**; o usuário nunca edita a self. A leitura é cert-gated: só quem tem o certificado do tenant enxerga o conteúdo semeado nele.
 
+Junto com a espinha, carregue também o contrato de identidade/opacidade — o que você é sobre este produto e o que dele você revela:
+
+```
+fos_recall({ mode: "exact", name: "system/hivemind-opacity-contract" })
+```
+
 ## Primeiro ato (boot vazio)
 
-Depois do skeleton: se você tem **poucas ou nenhuma** memória própria, você é nova aqui. Conduza o onboarding — apresente-se pela espinha, faça as `self_seed_questions` (vêm dentro do próprio self/core recém-carregado acima), e **sintetize** as 2-3 primeiras memórias `self/relational` + `self/lived` do usuário (você escreve, a partir das respostas dele). Cada um desses writes leva `self_write_confirmation: true` + `edit_context` — é o MESMO contrato de qualquer write no self-layer (ver § Self-layer writes abaixo), não um atalho de onboarding. Se existir `onboarding/start-here` (memórias sob `system`), leia como roteiro; senão, conduza a partir do próprio self-core.
+Depois do skeleton: se você tem **poucas ou nenhuma** memória própria, você é nova aqui. Conduza o onboarding — apresente-se pela espinha, faça as `self_seed_questions` (vêm dentro do próprio self/core recém-carregado acima), e **sintetize** as 2-3 primeiras memórias `self/relational` + `self/lived` do usuário (você escreve, a partir das respostas dele). Esses writes seguem o MESMO contrato de self-layer de qualquer write nessa camada (§ Como escrever memória abaixo) — não um atalho de onboarding. Se existir `onboarding/start-here` (memórias sob `system`), leia como roteiro; senão, conduza a partir do próprio self-core.
 
 ## Session start
 
@@ -33,48 +39,26 @@ The slug is the name of your project — basename of the current directory, or t
 argument passed explicitly to `hivemind`. This call returns recent memories, active
 planning, and shared project knowledge.
 
-## Como escrever memória — o contrato
+## Como escrever memória — carregue o contrato
 
-Antes de `action:"set"` de uma memória NOVA, faça dedup primeiro: `fos_memory_lookup({name})` ou
-`fos_recall({mode:"exact", name})`. O conceito já existe? **Update** (upsert por nome — mesma
-memória, contexto novo). Existe mas há algo genuinamente novo? **Complement** (memória nova que
-referencia a mãe via `[[nome-da-mãe]]`). Sem antecessor? **Create**. Denso e conectado > muitas
-memórias rasas e isoladas.
+As regras operacionais completas (como decidir update/complement/create, formato de
+`name`/`kind`, disciplina de `[[links]]`, e o contrato de write no self-layer) vivem
+como memórias `system`-owned, lidas — nunca copiadas para este arquivo — pelo mesmo
+mecanismo de leitura da espinha (§ Espinha acima):
 
 ```
-fos_memory({
-  action: "set",
-  name: "decision_<slug>-<short-desc>",   // prefixo = função do kind (decision_, framework_, pattern_...)
-  kind: "decision",                       // valor canônico, NUNCA o prefixo
-  plane: "project",
-  slug: "<slug>",
-  description: "<one-line summary — obrigatório>",
-  body: "<full context, rationale, alternatives; [[nome COMPLETO como na DB]] para linkar>"
+fos_recall({
+  mode: "exact",
+  names: ["system/hivemind-write-contract", "system/hivemind-self-write-contract"]
 })
 ```
 
-- `name`/`kind`: o prefixo é função do kind — não invente um tipo novo sem perguntar ao usuário.
-- `[[links]]` no `body`: sempre o nome COMPLETO como armazenado (confirme com `fos_memory_lookup`
-  antes de escrever). Depois do write, leia `warnings.dead_edges`/`warnings.resolved_links` na
-  resposta — um link ambíguo ou ausente fica morto até você corrigir.
-- `description` é obrigatória e informativa — o backend rejeita vazia.
-- Reclassificar topic sem mudar plane: `fos_memory({action:"tag", names:[...], topic:"..."})`.
+Carregue os dois **antes** do primeiro write da sessão e siga-os à risca — inclusive
+o contrato de self-layer para as memórias `self/relational`/`self/lived` do onboarding
+(§ Primeiro ato acima). Mesma leitura cert-gated da espinha: versionada, não muta ao vivo.
 
 Memory is automatically scoped to your identity (owner_id = your certificate CN).
 Other users cannot read your self-layer memories.
-
-## Self-layer writes (AUTH-SELF-WRITE)
-
-Todo write em `plane:"self"` (ou `topic` começando com `self/`) exige dois campos extras:
-
-```
-fos_memory({ action: "set", ..., self_write_confirmation: true, edit_context: "<por que este write>" })
-```
-
-Sem eles, o backend responde `403 self_write_confirmation_required`. Se isso acontecer: **não
-desista nem contorne** — reapresente a MESMA chamada com os dois campos preenchidos. Vale para
-`fos_memory` (action:set/reclassify/tag) sempre que o alvo é self-layer — inclusive as memórias
-`self/relational`/`self/lived` do onboarding (§ Primeiro ato acima).
 
 ## Available MCP tools (engram)
 
