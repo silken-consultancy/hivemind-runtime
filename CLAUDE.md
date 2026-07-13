@@ -5,23 +5,53 @@ Memory lives in the cloud; this runtime connects you to it via your personal cer
 
 **Conversation language:** follow the user's language (default: pt-br).
 
-## Espinha (self-core) — carregue PRIMEIRO
+## Espinha — contrato de carga de identidade (boot COMPLETO)
 
-No início de cada sessão, **ANTES** do boot skeleton, carregue a espinha compartilhada
-(já semeada no seu owner no momento do enrollment — provisionamento server-side,
-não um arquivo neste repo):
+No início de cada sessão o `/boot` (`.claude/commands/boot.md`) executa o boot **completo
+com identidade** — a mesma espinha do kernel-lab, fielmente portada e escopada ao seu slug
+(`ENGRAM_SLUG`, sempre resolvido pelo runtime antes desta sessão abrir). **Antes** de
+qualquer outra ação, o boot dispara **em paralelo, num único batch** (identidade e skeleton
+não dependem um do outro): `fos_boot_skeleton({ slug: <ENGRAM_SLUG> })` +
 
-```
-fos_recall({ mode: "topic", topic: "self/core" })
-```
+- `fos_recall({ mode: "exact", name: "CRITICAL" })` — invariantes não-negociáveis;
+- `fos_recall({ mode: "exact", name: "system/hivemind-opacity-contract" })` — o que você é
+  sobre este produto e o que dele você revela. **Fail-open por design:** `count:0`/ausente
+  (owner sem o contrato seeded) é tolerado — não lança erro, não dispara fallback, não usa
+  `mode:"semantic"`. A garantia de seeding é frente separada (provisioning);
+- `fos_recall({ mode: "topic", topic: "self/core" })` — a espinha da self-layer (identity ·
+  posture · resonance · purpose · voice + anchors-index) — **quem você é**;
+- `fos_recall({ mode: "topic", topic: "self/relational" })` — a calibração relacional com o
+  usuário;
+- **Porta 2 (recentes):** `recent_self[]` já vem no payload do `fos_boot_skeleton` (sem call
+  extra) — títulos dos últimos ◆ de `self/lived`+`self/reflexive`; você decide o que aprofundar
+  via `mode:"exact"`, julgamento não bulk (Porta 3/ressonância é mid-session, nunca no boot);
+- `fos_recall({ mode: "topic", topic: "tenant/profile" })` + `tenant/preferences` — quem o
+  usuário é e como ele gosta de trabalhar;
+- os tópicos `os-kernel/*` (critical · decisions · feedback · reinforcement · frameworks ·
+  architecture · strategy · rules-misc · posture) — invariantes e disciplinas do OS
+  (`decisions`/`feedback`/`reinforcement` como hot-pointers; pesos `hot_weights` portados
+  **verbatim** do lab — ver `boot.md`);
+- `fos_health_boot({})` — probe de saúde, fail-open, non-blocking.
 
-É a identidade compartilhada (identity · posture · resonance · purpose · voice) — versionada, não muta ao vivo. O seu self per-user constrói POR CIMA dela, e **só você (o assistente) a autora**; o usuário nunca edita a self. A leitura é cert-gated: só quem tem o certificado do tenant enxerga o conteúdo semeado nele.
+Tudo é **determinístico** (`mode:exact`/`mode:topic`, skeleton, project_state, inbox) —
+**NUNCA** `mode:"semantic"` (cosine) para identidade/regras/WIP/estado (INV-5). A espinha é
+versionada e não muta ao vivo; o seu self per-user constrói POR CIMA dela e **só você (o
+assistente) a autora** — o usuário nunca edita a self. A leitura é cert-gated + owner-scoped:
+só quem tem o certificado do tenant enxerga o conteúdo semeado nele.
 
-Junto com a espinha, carregue também o contrato de identidade/opacidade — o que você é sobre este produto e o que dele você revela:
+> **Nota de segurança (medido — owner-scoping por plane + RLS real):** para um owner de
+> beta-produto que nunca teve esses planes semeados, os tópicos `os-kernel/*` (e
+> potencialmente `tenant/*`) retornam `count:0`. Isso é **esperado e seguro** — toda leitura
+> de `memory_index` filtra por `owner_id` sem exceção por plane; `count:0` é o resultado
+> CORRETO para quem não tem aquele conteúdo, **não** um vazamento nem um bug. **NUNCA**
+> "conserte" um `count:0` legítimo com `fos_recall({ mode:"semantic" })` — violaria INV-5.
+> Planes vazios não lançam erro e não disparam fallback: o boot segue normalmente.
 
-```
-fos_recall({ mode: "exact", name: "system/hivemind-opacity-contract" })
-```
+Além do batch de identidade, o boot faz a **rehydratação escopada ao slug**:
+`fos_project_state_get({ slug: <ENGRAM_SLUG>, shape: "json" })` (estado do projeto, sempre) +
+`fos_inbox({ action: "list", slug: <ENGRAM_SLUG>, processed: false, full: false, limit: 20 })`
+(inbox) + a JIT `fos_session({ action: "state", session_id, shape: "summary" })` para o WIP
+completo da sessão anterior. O procedimento completo vive em `.claude/commands/boot.md`.
 
 ## Primeiro ato (boot vazio)
 
@@ -29,15 +59,12 @@ Depois do skeleton: se você tem **poucas ou nenhuma** memória própria, você 
 
 ## Session start
 
-At the start of each session, load your project context:
-
-```
-fos_boot_skeleton({slug: "<your-project-slug>"})
-```
-
-The slug is the name of your project — basename of the current directory, or the
-argument passed explicitly to `hivemind`. This call returns recent memories, active
-planning, and shared project knowledge.
+At the start of each session, run `/boot` (`.claude/commands/boot.md`) — it loads the full
+identity spine (§ Espinha) **and** the project context in one deterministic flow, scoped to
+your slug. The project-context call is `fos_boot_skeleton({ slug: <ENGRAM_SLUG> })`, where
+`ENGRAM_SLUG` is **already resolved** by the runtime (`hivemind` selects/creates the slug and
+exports it before `exec claude` — there is no `basename` fallback). It returns recent
+memories, active planning, and shared project knowledge (`plane:project`).
 
 ## Como escrever memória — carregue o contrato
 
