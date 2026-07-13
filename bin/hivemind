@@ -2,10 +2,11 @@
 # hivemind — HiveMind thin CLI.
 #
 # Analogous to silken-runtime but standalone — zero lab deps.
-# Runs in the user's project directory; slug = arg or basename(cwd).
+# Runs in the user's project directory; slug = explicit arg or interactive
+# picker (fail-closed if non-interactive — no basename(cwd) fallback).
 #
 # Usage:
-#   hivemind [<slug>]     # start proxy + exec claude; slug = arg or basename(cwd)
+#   hivemind [<slug>]     # start proxy + exec claude; slug = arg or interactive picker
 #   hivemind start        # start proxy only (no claude)
 #   hivemind stop         # stop the proxy
 #   hivemind restart      # stop + start (best-effort; re-reads ~/.hivemind/.env)
@@ -68,9 +69,24 @@ _brand_header() {
   echo "$(_ok "HiveMind") — shared memory runtime"
 }
 
-# ── _has_cert: returns 0 if at least one *.cert.pem exists ───────────────────
+# ── _has_cert: returns 0 only if THIS owner's cert exists (owner-scoped) ─────
+# Aligned with _check_health / cmd_status (:301+), which validate exactly
+# "${CERT_DIR}/${HIVEMIND_OWNER}.cert.pem". A bare `ls *.cert.pem` glob (the
+# previous impl) accepted a cert belonging to ANY owner — so a machine that
+# already enrolled owner A would silently SKIP setup for owner B, then present
+# owner B a runtime authenticated as A. Owner-scoped here closes that: another
+# owner's cert present + this owner's cert absent → _has_cert fails → _setup_mode.
+# The glob is kept ONLY as the fallback for when HIVEMIND_OWNER is unset (no
+# owner to scope to yet — e.g. a partial/legacy .env), preserving prior
+# behavior in that one degenerate case.
 _has_cert() {
-  [ -d "${CERT_DIR}" ] && ls "${CERT_DIR}"/*.cert.pem > /dev/null 2>&1
+  [ -d "${CERT_DIR}" ] || return 1
+  local _owner="${HIVEMIND_OWNER:-}"
+  if [ -n "${_owner}" ]; then
+    [ -f "${CERT_DIR}/${_owner}.cert.pem" ]
+  else
+    ls "${CERT_DIR}"/*.cert.pem > /dev/null 2>&1
+  fi
 }
 
 # ── _check_health: single source of truth for runtime/proxy/cert/endpoint
@@ -265,7 +281,7 @@ cmd_version() {
 cmd_help() {
   echo "Usage: hivemind [<slug>] | start | stop | restart | status | health | update | --version"
   echo ""
-  echo "  hivemind [<slug>]   Start proxy + open Claude Code (slug = arg or basename of cwd)"
+  echo "  hivemind [<slug>]   Start proxy + open Claude Code (slug = arg, else interactive picker)"
   echo "  hivemind start      Start proxy only"
   echo "  hivemind stop       Stop the proxy"
   echo "  hivemind restart    Stop + start (best-effort)"
@@ -696,11 +712,16 @@ _mcp_result_field() {
 # /end-session (no real close — the watchdog reclaims the orphan) rather than
 # refusing to start.
 #
-# Auto-registration (dupla cobertura, plan item WS-0.3.3): the FIRST open in a
-# never-seen project directory hits slug_not_found (the registry only knows
-# slugs the provisioning flow or a prior 'hivemind' run already created) — on
-# that one error, upsert the slug then retry open once. Every other open is a
-# single round-trip, not an unconditional per-launch registry write.
+# NO auto-registration (WS-0.3.3 — REMOVED, F2.1). A prior version silently
+# upserted the slug into the registry on the first slug_not_found here (dupla
+# cobertura). That silently created a registry row for any typo'd/unknown slug
+# on the user's behalf — the exact behavior the explicit slug-selection work
+# (F2.2 picker) and explicit first-project bootstrap (F3.2, confirmed create)
+# replace. Slug existence is now settled BEFORE this function runs (cmd_open
+# resolves via arg / picker / confirmed bootstrap). If a slug still turns up
+# unknown here, we DEGRADE (best-effort, no session) — we do NOT create it.
+# This comment is a headstone, not an invitation: do not reintroduce the
+# auto-upsert.
 _open_session_spine() {
   local _slug="$1"
   ENGRAM_DEVICE_ID="$(_resolve_device_id)"
@@ -716,12 +737,13 @@ _open_session_spine() {
   _resp="$(_mcp_call "fos_session" "${_open_args}" 1)"
   _err_field="$(_mcp_result_field "${_resp}" "_err")"
 
+  # slug_not_found here is now a DEGRADE, not a trigger to auto-create (F2.1).
+  # The slug was resolved/created explicitly upstream (arg / picker / bootstrap);
+  # an unknown slug at this point means we simply open Claude with no session
+  # spine rather than silently minting a registry row.
   if [ "${_err_field}" = "slug_not_found" ]; then
-    _vecho "[hivemind] slug '${_slug}' desconhecido no registry — auto-registrando..."
-    local _upsert_args
-    _upsert_args="{\"action\":\"upsert\",\"slug\":\"${_slug}\",\"name\":\"${_slug}\",\"mode\":\"self-managed\",\"kind\":\"product\",\"status\":\"active\",\"device_id\":\"${ENGRAM_DEVICE_ID}\",\"registry_upsert_confirmation\":true}"
-    _mcp_call "fos_registry" "${_upsert_args}" 2 > /dev/null
-    _resp="$(_mcp_call "fos_session" "${_open_args}" 3)"
+    _vecho "[hivemind] slug '${_slug}' desconhecido no registry — seguindo sem espinha de sessão (sem auto-registro)"
+    return 0
   fi
 
   _session_id="$(_mcp_result_field "${_resp}" "session_id")"
@@ -732,6 +754,198 @@ _open_session_spine() {
 
   ENGRAM_SESSION_ID="${_session_id}"
   _vecho "[hivemind] sessão aberta: ${ENGRAM_SESSION_ID} (slug=${_slug})"
+}
+
+# ── Slug selection (F2.2 / F3) ────────────────────────────────────────────────
+# The registry is owner-scoped SERVER-SIDE (registry.service.ts: every read is
+# `WHERE owner_id = <owner>`), so `fos_registry(action:list)` already returns
+# ONLY this owner's slugs — the client never filters by owner and cannot see
+# another's. Response envelope: {items:[{slug,name,status,...}], count}.
+
+# _list_slugs: populate _SLUGS_RAW ("slug<TAB>name" lines, active only) for the
+# current owner. Returns 0 on a VALID registry response — the list may be EMPTY
+# (a genuine count:0 for an owner with no projects yet, the F3 bootstrap case).
+# Returns 1 on transport/parse failure (no API key, proxy/network down,
+# malformed payload). The caller MUST distinguish these two (F3.1): an EMPTY
+# list means "bootstrap first project", an UNREACHABLE registry means "abort,
+# don't guess" — collapsing them would silently offer to create a duplicate of
+# an existing project during a network blip.
+_list_slugs() {
+  _SLUGS_RAW=""
+  [ -n "${FOS_API_KEY:-}" ] || return 1
+  local _resp
+  _resp="$(_mcp_call "fos_registry" '{"action":"list"}' 1)"
+  [ -n "${_resp}" ] || return 1
+  local _out
+  # bun exits 3 on parse failure / missing items array → the `||` maps that
+  # (and any bun failure) to return 1. A valid empty array exits 0 with no
+  # output → _SLUGS_RAW="" + return 0 (the count:0 bootstrap signal).
+  _out="$(bun -e '
+    try {
+      const env = JSON.parse(process.argv[1]);
+      const inner = JSON.parse(env.result.content[0].text);
+      if (!inner || !Array.isArray(inner.items)) process.exit(3);
+      for (const it of inner.items) {
+        if (it.status && it.status !== "active") continue;
+        if (!it.slug) continue;
+        process.stdout.write(`${it.slug}\t${it.name || it.slug}\n`);
+      }
+    } catch { process.exit(3); }
+  ' "${_resp}" 2>/dev/null)" || return 1
+  _SLUGS_RAW="${_out}"
+  return 0
+}
+
+# _pick_project — render this owner's slugs and set _PICKED_SLUG. Mirrors
+# silken-runtime:_pick_project (fzf when available; numbered-read fallback;
+# same color scheme + Ctrl-C/Ctrl-D → 130). Input: _SLUGS_RAW (from
+# _list_slugs). NOTE (faithful adaptation, not a gap): silken-runtime also
+# greys out slugs with a live session ON THIS DEVICE — that relies on the lab
+# agent-runtime's /v1/sessions/active endpoint, which this product has no
+# equivalent of, so that one sub-feature is intentionally omitted here.
+_pick_project() {
+  _PICKED_SLUG=""
+  local -a slugs names
+  local _s _n
+  while IFS=$'\t' read -r _s _n; do
+    [ -n "${_s}" ] || continue
+    slugs+=("${_s}"); names+=("${_n:-$_s}")
+  done <<< "${_SLUGS_RAW}"
+
+  local n="${#slugs[@]}"
+  if [ "${n}" -eq 0 ]; then
+    return 1
+  fi
+
+  local C_HEAD C_NUM C_RSTL C_BLOCK
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_HEAD=$'\033[1;36m'; C_NUM=$'\033[1;33m'; C_BLOCK=$'\033[2;31m'; C_RSTL=$'\033[0m'
+  else
+    C_HEAD=""; C_NUM=""; C_BLOCK=""; C_RSTL=""
+  fi
+
+  printf '%s┌─ HIVEMIND ─────────────────────────────────────┐%s\n' "$C_HEAD" "$C_RSTL" >&2
+  printf '%s│  Selecione o projeto                           │%s\n' "$C_HEAD" "$C_RSTL" >&2
+  printf '%s├────────────────────────────────────────────────┤%s\n' "$C_HEAD" "$C_RSTL" >&2
+  local i
+  for ((i=0; i<n; i++)); do
+    printf '   %s%2d)%s  %s\n' "$C_NUM" "$((i+1))" "$C_RSTL" "${names[$i]}" >&2
+  done
+  printf '%s└────────────────────────────────────────────────┘%s\n' "$C_HEAD" "$C_RSTL" >&2
+
+  if command -v fzf > /dev/null 2>&1; then
+    local menu="" sel idx
+    for ((i=0; i<n; i++)); do
+      menu+="$((i+1))	${names[$i]}"$'\n'
+    done
+    sel=$(printf '%s' "$menu" | fzf --ansi --prompt='projeto> ' \
+      --header='Enter seleciona · Esc/Ctrl-C cancela' \
+      --with-nth=2.. --delimiter='\t') || return 130
+    idx=$(printf '%s' "$sel" | cut -f1)
+    [ -z "$idx" ] && return 130
+    _PICKED_SLUG="${slugs[$((idx-1))]}"
+  else
+    local choice
+    while :; do
+      printf '%s  → número [1-%d] (Ctrl-C cancela): %s' "$C_NUM" "$n" "$C_RSTL" >&2
+      if ! IFS= read -r choice; then
+        echo "" >&2; return 130
+      fi
+      case "$choice" in
+        ''|*[!0-9]*)
+          printf '%s  ✗ Entrada inválida.%s\n' "$C_BLOCK" "$C_RSTL" >&2; continue ;;
+      esac
+      if [ "$choice" -lt 1 ] || [ "$choice" -gt "$n" ]; then
+        printf '%s  ✗ Fora do intervalo.%s\n' "$C_BLOCK" "$C_RSTL" >&2; continue
+      fi
+      _PICKED_SLUG="${slugs[$((choice-1))]}"
+      break
+    done
+  fi
+  return 0
+}
+
+# _bootstrap_first_slug — owner has ZERO projects (F3.2). Creates the FIRST
+# project EXPLICITLY: the name is always asked/confirmed from the human, NEVER
+# derived from basename(cwd) or any other heuristic (decision 6e14806d, founder
+# 2026-07-13 — the fos-web Project Hub is read-only, there is nothing to
+# mirror; this is the first create surface, not a mirror). Sets _BOOTSTRAP_SLUG
+# on success; leaves it empty + returns non-zero on decline/empty input.
+# $1 = slug from an explicit `hivemind <slug>` arg ("" when none was given).
+#
+# ARCHITECTURAL NOTE (registered, not resolved here — Frente 2, out of scope):
+# creating a slug is a MUTATION. This is currently the ONLY slug-create surface
+# outside 4tuenyOS's agent-driven flow. If the Project Hub ever grows a create
+# button, it MUST converge on this SAME fos_registry(action:upsert) call — not
+# a second, divergent create path.
+_bootstrap_first_slug() {
+  local _arg_slug="${1:-}"
+  _BOOTSTRAP_SLUG=""
+  local _name _slug _reply
+
+  echo "" >&2
+  echo "Nenhum projeto encontrado para esta conta." >&2
+
+  if [ -n "${_arg_slug}" ]; then
+    # Name already came from the human (the explicit arg) — only confirm.
+    printf 'Criar "%s" como seu primeiro projeto? [y/N] ' "${_arg_slug}" >&2
+    IFS= read -r _reply || return 1
+    case "${_reply}" in
+      y|Y|yes|YES|s|S|sim|SIM)
+        # code-review FIX 1: the arg was used VERBATIM as the slug — a
+        # human-typed arg with spaces/symbols (e.g. `hivemind "Foo Bar"`)
+        # produced a malformed, non-path/URL-safe slug ("Foo Bar"). Run the
+        # SAME normalization as the no-arg path (:909) over the slug only —
+        # `_name` stays the arg verbatim (what the human actually typed/
+        # confirmed), only the SLUG is ASCII-folded/validated.
+        _name="${_arg_slug}"
+        _slug="$(printf '%s' "${_arg_slug}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed -e 's/^-*//' -e 's/-*$//')"
+        if [ -z "${_slug}" ]; then
+          echo "Argumento não produz um slug válido (use letras/números) — nada criado." >&2
+          return 1
+        fi
+        ;;
+      *) echo "Cancelado — nada criado." >&2; return 1 ;;
+    esac
+  else
+    # No arg — ask the name from scratch, WITHOUT pre-filling/suggesting.
+    printf 'Como você quer chamar seu primeiro projeto? ' >&2
+    IFS= read -r _name || return 1
+    _name="$(printf '%s' "${_name}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    if [ -z "${_name}" ]; then
+      echo "Nome vazio — nada criado." >&2
+      return 1
+    fi
+    # Derive a filesystem/URL-safe slug from the typed name (lowercase, runs of
+    # non-alnum → single '-', trimmed). Mechanical normalization of the human's
+    # own input — not a suggested default. Shown before create for transparency.
+    _slug="$(printf '%s' "${_name}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed -e 's/^-*//' -e 's/-*$//')"
+    if [ -z "${_slug}" ]; then
+      echo "Nome não produz um slug válido (use letras/números) — nada criado." >&2
+      return 1
+    fi
+    printf 'Criando projeto "%s" (slug: %s)...\n' "${_name}" "${_slug}" >&2
+  fi
+
+  # Build the upsert args with bun so name/slug are JSON-escaped safely (a name
+  # with a quote/backslash would otherwise corrupt hand-built JSON).
+  local _dev _upsert_args
+  _dev="$(_resolve_device_id)"
+  _upsert_args="$(bun -e '
+    const [slug, name, dev] = process.argv.slice(1);
+    process.stdout.write(JSON.stringify({
+      action: "upsert", slug, name,
+      mode: "self-managed", kind: "product", status: "active",
+      device_id: dev, registry_upsert_confirmation: true,
+    }));
+  ' "${_slug}" "${_name}" "${_dev}" 2>/dev/null)"
+  if [ -z "${_upsert_args}" ]; then
+    echo "Erro: falha ao montar a requisição de criação — nada criado." >&2
+    return 1
+  fi
+  _mcp_call "fos_registry" "${_upsert_args}" 1 > /dev/null
+  _BOOTSTRAP_SLUG="${_slug}"
+  return 0
 }
 
 # cmd_open: start proxy + exec claude.
@@ -746,16 +960,82 @@ cmd_open() {
     _brand_header
   fi
 
-  # Determine slug: arg > basename(cwd).
-  local _project_slug
-  if [ -n "${_slug}" ]; then
-    _project_slug="${_slug}"
-  else
-    _project_slug="$(basename "$(pwd)")"
-  fi
-
   _maybe_auto_update
   _start_proxy
+
+  # ── Resolve the project slug (F2.2 / F2.3 / F3) ──────────────────────────
+  # The proxy is up now, so the owner-scoped registry is reachable for the
+  # picker/bootstrap. Order: explicit arg > interactive selection/bootstrap.
+  # There is deliberately NO basename(cwd) fallback (F2.3, founder-accepted
+  # fail-closed): silently opening a wrong slug is worse than a clear abort.
+  local _project_slug=""
+  if [ -n "${_slug}" ]; then
+    # Explicit arg — NEVER show the picker. If this owner has no projects yet,
+    # offer to create THIS slug as the first one (F3.2, confirmed). Otherwise
+    # open it as-is (an unknown slug just degrades the session spine; it is
+    # never auto-created — F2.1).
+    _project_slug="${_slug}"
+    if [ -t 0 ] && [ -t 1 ] && _list_slugs && [ -z "${_SLUGS_RAW}" ]; then
+      # code-review FIX 2: a declined/cancelled/invalid bootstrap here used to
+      # be swallowed (`|| true`) and fall through to opening "${_project_slug}"
+      # (the raw arg) anyway — the user said "don't create" and the
+      # slug-ghost opened regardless (no registry row, degraded session).
+      # Explicit decline now aborts explicitly, matching the no-arg bootstrap
+      # path's behavior (:977-979) and decision 6e14806d's no-silent-creation
+      # discipline. On CONFIRM, _BOOTSTRAP_SLUG is the slugified value (FIX 1)
+      # — it may differ from the raw arg, so it replaces _project_slug.
+      if _bootstrap_first_slug "${_project_slug}"; then
+        _project_slug="${_BOOTSTRAP_SLUG}"
+      else
+        echo "Criação cancelada — nenhum projeto aberto." >&2
+        exit 1
+      fi
+    fi
+  elif [ -t 0 ] && [ -t 1 ]; then
+    # No arg + interactive terminal: select an existing project, or bootstrap
+    # the very first one.
+    if _list_slugs; then
+      if [ -z "${_SLUGS_RAW}" ]; then
+        # count:0 — a genuine empty registry for this owner → bootstrap (F3.2).
+        if _bootstrap_first_slug ""; then
+          _project_slug="${_BOOTSTRAP_SLUG}"
+        else
+          echo "Nenhum projeto criado — encerrando." >&2
+          exit 1
+        fi
+      else
+        # count>0 — normal interactive selection (F3.1).
+        local _rc=0
+        _pick_project || _rc=$?
+        if [ "${_rc}" -eq 130 ]; then
+          echo "Seleção cancelada." >&2
+          exit 130
+        elif [ "${_rc}" -ne 0 ] || [ -z "${_PICKED_SLUG}" ]; then
+          echo "Erro: falha ao selecionar o projeto." >&2
+          exit 1
+        fi
+        _project_slug="${_PICKED_SLUG}"
+      fi
+    else
+      # Registry UNREACHABLE — distinct from empty (F3.1). Do NOT guess or
+      # bootstrap: creating during a network blip could duplicate an existing
+      # project.
+      echo "Erro: não foi possível consultar o registry (rede/proxy indisponível?) —" >&2
+      echo "      não é seguro selecionar ou criar um projeto às cegas. Verifique 'hivemind status'." >&2
+      exit 1
+    fi
+  else
+    # No arg + non-interactive: fail closed (F2.3, founder-accepted). No
+    # basename(cwd) fallback — automation must pass an explicit slug.
+    echo "Erro: nenhum slug informado e a entrada não é um terminal interativo." >&2
+    echo "      Rode 'hivemind <slug>' explicitamente em contexto não-interativo." >&2
+    exit 1
+  fi
+
+  if [ -z "${_project_slug}" ]; then
+    echo "Erro: nenhum projeto resolvido — encerrando." >&2
+    exit 1
+  fi
 
   # Espinha de sessão (WS-0.3) — abre DEPOIS do proxy responder no health,
   # ANTES do exec (silken-runtime mirror). Sets ENGRAM_SESSION_ID/
