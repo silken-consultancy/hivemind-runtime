@@ -64,9 +64,15 @@ _vecho() {
 }
 
 # ── _brand_header: quiet-by-default output still shows this once ───────────
+# F6.1 — minimal ASCII identity block: small, simple geometry (a single glyph
+# + two lines), NOT a logo/illustration — studio is out of scope here (glyph
+# is a placeholder for studio to revise later). Shows the resolved endpoint
+# (HIVEMIND_ENDPOINT, defaulting to the product's own domain) so a lab<->
+# product swap via .env is visible at every startup, not just in the .env file.
 _brand_header() {
   echo ""
-  echo "$(_ok "HiveMind") — shared memory runtime"
+  echo "  $(_ok "◆") HiveMind — shared memory runtime"
+  echo "  $(_dim "→ ${HIVEMIND_ENDPOINT:-hivemind.silken.ia.br:4443}")"
 }
 
 # ── _has_cert: returns 0 only if THIS owner's cert exists (owner-scoped) ─────
@@ -441,16 +447,26 @@ _verify_commit_integrity() {
 # cherry-picking the next file that turns out to matter.
 _stage_build() {
   local _target="$1"
-  mkdir -p "${_target}/.claude" "${_target}/runtime" || return 1
+  mkdir -p "${_target}/.claude" "${_target}/.claude/hooks" "${_target}/bin" "${_target}/runtime" || return 1
 
   # ── Tier 1: git-managed — NEW version wins ────────────────────────────────
   # CLAUDE.md lands under .claude/ — mirrors install.sh's item 5.2 fix
   # (load-bearing: forgetting this side regresses the pull-agent silently).
   cp "${HIVEMIND_SOURCE_DIR}/CLAUDE.md" "${_target}/.claude/CLAUDE.md" || return 1
-  cp "${HIVEMIND_SOURCE_DIR}/.claude/settings.json" "${_target}/.claude/settings.json" || return 1
+  # settings.json is TEMPLATED (F5.3), same as install.sh — __HIVEMIND_HOME__
+  # resolves against the LIVE HIVEMIND_HOME (this update targets the same
+  # install, not a fresh one), not the staging dir itself.
+  sed "s|__HIVEMIND_HOME__|${HIVEMIND_HOME}|g" \
+    "${HIVEMIND_SOURCE_DIR}/.claude/settings.json" > "${_target}/.claude/settings.json" || return 1
   # Product slash-commands (item 5.3) — same mirror requirement as above.
   mkdir -p "${_target}/.claude/commands" || return 1
   cp -r "${HIVEMIND_SOURCE_DIR}/.claude/commands/." "${_target}/.claude/commands/" || return 1
+  # Status-CLI (F5.1) + quota-capture hook (F5.2) — referenced by the
+  # templated settings.json above; must ship alongside it on every update.
+  cp "${HIVEMIND_SOURCE_DIR}/bin/hivemind-statusline.py" "${_target}/bin/hivemind-statusline.py" || return 1
+  chmod +x "${_target}/bin/hivemind-statusline.py" || return 1
+  cp "${HIVEMIND_SOURCE_DIR}/.claude/hooks/user-prompt-submit.capture-quota.js" \
+    "${_target}/.claude/hooks/user-prompt-submit.capture-quota.js" || return 1
   rsync -a --exclude='node_modules/' --exclude='bun.lock' \
     "${HIVEMIND_SOURCE_DIR}/runtime/" "${_target}/runtime/" 2>/dev/null \
     || cp -r "${HIVEMIND_SOURCE_DIR}/runtime/." "${_target}/runtime/" || return 1
@@ -464,17 +480,20 @@ _stage_build() {
     cp "${HIVEMIND_HOME}/.env" "${_target}/.env" || return 1
   fi
   # Merge the ENTIRE live .claude/ dir over the staged one, EXCLUDING exactly
-  # the 3 git-managed paths already placed above (anchored to the transfer
+  # the 4 git-managed paths already placed above (anchored to the transfer
   # root with a leading '/' so a same-named file/dir nested deeper — e.g. under
   # sessions/ or projects/ — is never accidentally excluded). No --delete: this
   # only ADDS/overwrites from live into staging, it never removes a
   # freshly-placed git file. Covers .claude.json (item 5.1) + .credentials.json
   # (item 5.0) + anything else Claude Code writes there, present or future.
+  # /hooks/ added at F5.2 (quota-capture hook is git-managed like
+  # CLAUDE.md/settings.json/commands/, not runtime-written).
   if [ -d "${HIVEMIND_HOME}/.claude" ]; then
     rsync -a \
       --exclude='/CLAUDE.md' \
       --exclude='/settings.json' \
       --exclude='/commands/' \
+      --exclude='/hooks/' \
       "${HIVEMIND_HOME}/.claude/" "${_target}/.claude/" || return 1
   fi
   return 0

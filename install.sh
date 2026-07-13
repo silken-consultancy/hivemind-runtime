@@ -135,11 +135,30 @@ fi
 # NOT $CLAUDE_CONFIG_DIR/../CLAUDE.md). Source in the repo stays at the root
 # for readability — only the copy DESTINATION moved.
 cp "${SCRIPT_DIR}/CLAUDE.md" "${HIVEMIND_HOME}/.claude/CLAUDE.md"
-cp "${SCRIPT_DIR}/.claude/settings.json" "${HIVEMIND_HOME}/.claude/settings.json"
+
+# settings.json is TEMPLATED, not copied literally (F5.3): it ships with a
+# __HIVEMIND_HOME__ placeholder in statusLine.command / hooks.UserPromptSubmit
+# (the absolute path Claude Code's config schema requires — no relative/env-var
+# expansion is done by the harness itself). HIVEMIND_HOME is only known here,
+# at install time, so the substitution happens now, via sed, same idempotent
+# pattern as _set_env_kv above — ADDITIVE to the existing copy step, not the
+# rejected --profile mechanism.
+sed "s|__HIVEMIND_HOME__|${HIVEMIND_HOME}|g" \
+  "${SCRIPT_DIR}/.claude/settings.json" > "${HIVEMIND_HOME}/.claude/settings.json"
 
 # Copy product slash-commands (item 5.3, F3 — /boot + /end-session).
 mkdir -p "${HIVEMIND_HOME}/.claude/commands"
 cp -r "${SCRIPT_DIR}/.claude/commands/." "${HIVEMIND_HOME}/.claude/commands/"
+
+# Copy the status-CLI (F5) + quota-capture hook (F5) referenced by the
+# templated settings.json above — same __HIVEMIND_HOME__-resolved absolute
+# paths point here.
+mkdir -p "${HIVEMIND_HOME}/bin"
+cp "${SCRIPT_DIR}/bin/hivemind-statusline.py" "${HIVEMIND_HOME}/bin/hivemind-statusline.py"
+chmod +x "${HIVEMIND_HOME}/bin/hivemind-statusline.py"
+mkdir -p "${HIVEMIND_HOME}/.claude/hooks"
+cp "${SCRIPT_DIR}/.claude/hooks/user-prompt-submit.capture-quota.js" \
+  "${HIVEMIND_HOME}/.claude/hooks/user-prompt-submit.capture-quota.js"
 
 # Copy the user's personal Claude Code credentials into the isolated CONFIG_DIR
 # (item 5.0, F0 auth) — best-effort. Absence is NOT an error: bin/hivemind's
