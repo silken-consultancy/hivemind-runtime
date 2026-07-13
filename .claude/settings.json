@@ -153,6 +153,22 @@
     ],
     "defaultMode": "bypassPermissions"
   },
-  "hooks": {},
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node __HIVEMIND_HOME__/.claude/hooks/user-prompt-submit.capture-quota.js"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "python3 __HIVEMIND_HOME__/bin/hivemind-statusline.py",
+    "padding": 0
+  },
   "skipDangerousModePermissionPrompt": true
 }
