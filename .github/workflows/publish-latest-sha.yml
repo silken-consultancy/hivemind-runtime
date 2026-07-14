@@ -1,0 +1,205 @@
+# publish-latest-sha.yml — publica o manifesto de auto-update do cliente
+#
+# PROPÓSITO: `bin/hivemind` (_verify_commit_integrity, _maybe_auto_update) já
+# consome `https://<HIVEMIND_ENDPOINT host>/hivemind/LATEST_SHA` como fallback
+# de confiança quando não há assinatura GPG configurada (ver bin/hivemind
+# linhas ~401-423). Hoje essa rota é 404 no host de produto — este workflow
+# publica o manifesto A CADA merge em `main` (decisão #2 do founder: publica
+# sem curadoria, sem gate manual). ZERO mudança de código no cliente (B5).
+#
+# DUAL-TARGET (REWORK, 2026-07-13, founder-aprovado): publica em DOIS hosts —
+# PRODUTO e o edge do LAB. Motivo: o cliente de dogfood do lab (notebook)
+# aponta `HIVEMIND_ENDPOINT=kernel.silken.ia.br:4443`, e
+# `_verify_commit_integrity` busca o manifesto em
+# `https://kernel.silken.ia.br/hivemind/LATEST_SHA` (porta 443, o edge do
+# lab) — não no host de produto. Mesma base (HEAD de `main`) publica os dois,
+# então os manifestos batem por construção; não há dois "estados verdade"
+# divergentes, só dois destinos do mesmo valor. AMBOS OBRIGATÓRIOS: se
+# qualquer um falhar, o workflow fica vermelho (manifesto stale em qualquer
+# ponta = clientes daquela ponta ficam fail-closed sem update).
+#
+# GATE B4 (decidido): usuário SSH RESTRITO com forced-command — não root, nos
+# DOIS hosts. Este repositório é PÚBLICO; um vazamento de qualquer uma das
+# duas chaves privadas com um usuário forced-command só permite escrever o
+# arquivo do manifesto daquele host (via stdin), nada além disso. Blast-radius
+# mínimo por desenho, replicado nos dois lados. Ver runbook:
+# docs/ops/fase-b-manifest-runbook.md (§ PRODUTO + § LAB — criação dos dois
+# usuários + scripts receptores, ainda NÃO aplicado em nenhum dos dois hosts).
+#
+# TRANSPORTE: o sha vai por STDIN (não como argumento de comando) — com
+# forced-command, o argumento de comando do `ssh` é ignorado/substituído pelo
+# host (vira apenas SSH_ORIGINAL_COMMAND, não executa nada), então passar o
+# dado por stdin evita qualquer preocupação de quoting/injeção no lado do
+# cliente E o receptor em cada host valida o formato (40 hex chars) antes de
+# escrever — defesa em profundidade mesmo com a chave escopada.
+#
+# GH SECRETS NECESSÁRIOS (o founder cria — ver runbook):
+#   PRODUTO:
+#     PROD_MANIFEST_SSH_HOST   IP/hostname do host de produto
+#     PROD_MANIFEST_SSH_USER   usuário SSH restrito (forced-command), NÃO root
+#     PROD_MANIFEST_SSH_KEY    chave privada ED25519 dedicada, escopo único
+#   LAB (NOVO, REWORK):
+#     LAB_MANIFEST_SSH_HOST    IP/hostname do edge do lab
+#     LAB_MANIFEST_SSH_USER    usuário SSH restrito (forced-command), NÃO root
+#     LAB_MANIFEST_SSH_KEY     chave privada ED25519 dedicada, escopo único
+#   Nenhuma das 6 chaves é reusada entre si nem com a chave de deploy do
+#   backend (GHA_VPS_SSH_KEY / PROD_GHA_VPS_SSH_KEY) — escopos diferentes,
+#   blast-radius não deve se somar entre eles.
+#
+# PITFALL CONHECIDO (falha silenciosa de publish): se um job falhar, o
+# manifesto daquele host fica STALE e todo cliente que checar integridade sem
+# assinatura GPG passa a falhar-fechado (_verify_commit_integrity retorna 1)
+# e para de receber atualização — sem barulho nenhum no lado do cliente
+# (fail-closed é o comportamento correto ali, mas silencioso). Este workflow
+# torna a falha BARULHENTA do lado do publisher: annotation `::error::` + job
+# vermelho no GitHub (e-mail/notificação padrão do GitHub para quem tem watch
+# no repo), por host — dá pra saber QUAL lado ficou stale.
+# DÉBITO EXPLÍCITO: não há canal de alerta ativo (Slack/Discord/PagerDuty) —
+# nenhum secret de webhook foi fornecido a este builder. Ver runbook § débito.
+
+name: publish-latest-sha
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: publish-latest-sha # cobre produto+lab (renomeado pós dual-target)
+  cancel-in-progress: false # preserva ordem FIFO das publicações
+
+jobs:
+  # ── Validação compartilhada (roda uma vez, os dois publishers dependem dela) ──
+  validate-sha:
+    name: valida formato do sha
+    runs-on: ubuntu-latest
+    steps:
+      - name: Valida formato do sha (defensivo, antes de sair do runner)
+        run: |
+          set -euo pipefail
+          sha="${{ github.sha }}"
+          if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::github.sha inesperado (não é 40 hex chars): '${sha}'"
+            exit 1
+          fi
+          echo "sha validado: ${sha}"
+
+  # ── Publish PRODUTO ─────────────────────────────────────────────────────────
+  publish-prod:
+    name: publica LATEST_SHA — produto
+    needs: validate-sha
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Publica via SSH (produto, forced-command, sha por stdin)
+        env:
+          SSH_HOST: ${{ secrets.PROD_MANIFEST_SSH_HOST }}
+          SSH_USER: ${{ secrets.PROD_MANIFEST_SSH_USER }}
+          SSH_KEY: ${{ secrets.PROD_MANIFEST_SSH_KEY }}
+          SHA: ${{ github.sha }}
+        run: |
+          set +x
+          set -euo pipefail
+
+          if [ -z "${SSH_HOST}" ] || [ -z "${SSH_USER}" ] || [ -z "${SSH_KEY}" ]; then
+            echo "::error::secrets PROD_MANIFEST_SSH_HOST/USER/KEY ausentes ou vazios — não é possível publicar o manifesto de produto."
+            exit 1
+          fi
+
+          key_file="$(mktemp)"
+          printf '%s\n' "${SSH_KEY}" > "${key_file}"
+          chmod 600 "${key_file}"
+
+          # SHA trimmed, SEM newline final ao chegar no receptor — o receptor
+          # remoto (docs/ops/fase-b-manifest-runbook.md) também normaliza,
+          # mas já enviamos limpo aqui (defesa em profundidade).
+          trimmed_sha="$(printf '%s' "${SHA}" | tr -d '[:space:]')"
+
+          echo "==> Publicando ${trimmed_sha:0:12} no manifesto de PRODUTO..."
+          if ! printf '%s' "${trimmed_sha}" | ssh \
+              -i "${key_file}" \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -o BatchMode=yes \
+              "${SSH_USER}@${SSH_HOST}"; then
+            echo "::error::Publish do manifesto de PRODUTO FALHOU — clientes de produto sem assinatura GPG configurada vão falhar-fechado (_verify_commit_integrity) e parar de receber updates até isto ser corrigido. Manifesto de produto permanece STALE (${trimmed_sha:0:12} não confirmado)."
+            rm -f "${key_file}"
+            exit 1
+          fi
+
+          rm -f "${key_file}"
+          echo "==> Publicado (produto)."
+
+      - name: Nota de falha — produto
+        if: failure()
+        run: |
+          {
+            echo "## Publish do manifesto FALHOU — PRODUTO"
+            echo ""
+            echo "O manifesto \`LATEST_SHA\` em PRODUÇÃO pode estar STALE."
+            echo "Clientes de produto sem assinatura GPG configurada vão parar de"
+            echo "aplicar atualizações (fail-closed, \`_verify_commit_integrity\`)"
+            echo "até este job rodar com sucesso de novo."
+            echo ""
+            echo "Não há alerta fora do GitHub (Slack/Discord/PagerDuty) configurado —"
+            echo "débito explícito, ver \`docs/ops/fase-b-manifest-runbook.md\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  # ── Publish LAB (NOVO, REWORK) ──────────────────────────────────────────────
+  publish-lab:
+    name: publica LATEST_SHA — lab (edge kernel.silken.ia.br)
+    needs: validate-sha
+    runs-on: ubuntu-latest
+    environment: lab
+
+    steps:
+      - name: Publica via SSH (lab, forced-command, sha por stdin)
+        env:
+          SSH_HOST: ${{ secrets.LAB_MANIFEST_SSH_HOST }}
+          SSH_USER: ${{ secrets.LAB_MANIFEST_SSH_USER }}
+          SSH_KEY: ${{ secrets.LAB_MANIFEST_SSH_KEY }}
+          SHA: ${{ github.sha }}
+        run: |
+          set +x
+          set -euo pipefail
+
+          if [ -z "${SSH_HOST}" ] || [ -z "${SSH_USER}" ] || [ -z "${SSH_KEY}" ]; then
+            echo "::error::secrets LAB_MANIFEST_SSH_HOST/USER/KEY ausentes ou vazios — não é possível publicar o manifesto do lab."
+            exit 1
+          fi
+
+          key_file="$(mktemp)"
+          printf '%s\n' "${SSH_KEY}" > "${key_file}"
+          chmod 600 "${key_file}"
+
+          trimmed_sha="$(printf '%s' "${SHA}" | tr -d '[:space:]')"
+
+          echo "==> Publicando ${trimmed_sha:0:12} no manifesto do LAB..."
+          if ! printf '%s' "${trimmed_sha}" | ssh \
+              -i "${key_file}" \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -o BatchMode=yes \
+              "${SSH_USER}@${SSH_HOST}"; then
+            echo "::error::Publish do manifesto do LAB FALHOU — o cliente de dogfood do lab (HIVEMIND_ENDPOINT=kernel.silken.ia.br:4443) sem assinatura GPG configurada vai falhar-fechado (_verify_commit_integrity) e parar de receber updates até isto ser corrigido. Manifesto do lab permanece STALE (${trimmed_sha:0:12} não confirmado)."
+            rm -f "${key_file}"
+            exit 1
+          fi
+
+          rm -f "${key_file}"
+          echo "==> Publicado (lab)."
+
+      - name: Nota de falha — lab
+        if: failure()
+        run: |
+          {
+            echo "## Publish do manifesto FALHOU — LAB"
+            echo ""
+            echo "O manifesto \`LATEST_SHA\` no edge do LAB (kernel.silken.ia.br)"
+            echo "pode estar STALE. O cliente de dogfood do lab vai parar de aplicar"
+            echo "atualizações (fail-closed, \`_verify_commit_integrity\`) até este"
+            echo "job rodar com sucesso de novo."
+            echo ""
+            echo "Não há alerta fora do GitHub (Slack/Discord/PagerDuty) configurado —"
+            echo "débito explícito, ver \`docs/ops/fase-b-manifest-runbook.md\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
