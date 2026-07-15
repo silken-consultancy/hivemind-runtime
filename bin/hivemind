@@ -5,6 +5,12 @@
 # Runs in the user's project directory; slug = explicit arg or interactive
 # picker (fail-closed if non-interactive — no basename(cwd) fallback).
 #
+# Cross-platform note: this file is the ONLY Unix-specific layer — the
+# daemon it spawns (runtime/src/server.ts) is plain portable TS/Bun. See
+# docs/ARCHITECTURE.md for the 4 Unix-specific primitives named here
+# (detach, pidfile+signals, $HOME paths, bash-as-CLI) and how a future
+# native-Windows port would replace this file without touching the daemon.
+#
 # Usage:
 #   hivemind [<slug>]     # start proxy + exec claude; slug = arg or interactive picker
 #   hivemind start        # start proxy only (no claude)
@@ -13,6 +19,7 @@
 #   hivemind status       # proxy health + cert validity (human-readable)
 #   hivemind health       # same checks as status, script-friendly exit code (0/1/2)
 #   hivemind update       # pull-agent: staged+verified+atomic update, auto-rollback
+#   hivemind resume <slug>  # explicit crash recovery: close a dead-holder session, then open
 #   hivemind --version    # print version and exit
 #   hivemind --verbose [...]  # show startup/debug logs (default: quiet, GO/NO-GO only)
 
@@ -306,8 +313,21 @@ _reap_stale_runtime() {
 # of burning the full 15s timeout. Returns 0 on success, 1 otherwise.
 _spawn_runtime() {
   local _pid
-  bun run "${RUNTIME_BIN}" >> "${RUNTIME_LOG}" 2>&1 &
+  # nohup + disown: the daemon must survive the terminal that launched it
+  # closing (Fase 1, DR-1.1) — nohup makes the child IGNORE SIGHUP (portable
+  # POSIX, unlike setsid which is absent on base macOS); disown drops the job
+  # from bash's job table so the shell itself never signals the child when
+  # this script exits. Neither alone is enough: nohup without disown can
+  # still be waited on by a stray `wait` under `set -euo pipefail`. Redirect
+  # stdin from /dev/null — nohup does not do this itself, and a detached
+  # process with no terminal reading stdin can otherwise block/misbehave.
+  # HIVEMIND_DEVICE_ID is exported into the daemon's env here so later
+  # reconcile/event-emission (Fase 2/4) can tag its own device without a
+  # second, divergent notion of "device" inside the daemon process.
+  HIVEMIND_DEVICE_ID="$(_resolve_device_id)" \
+    nohup bun run "${RUNTIME_BIN}" >> "${RUNTIME_LOG}" 2>&1 < /dev/null &
   _pid=$!
+  disown
 
   local _tries=0
   until curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; do
@@ -387,18 +407,19 @@ cmd_version() {
 }
 
 cmd_help() {
-  echo "Usage: hivemind [<slug>] | start | stop | restart | status | health | update | --version"
+  echo "Usage: hivemind [<slug>] | start | stop | restart | status | health | update | resume <slug> | --version"
   echo ""
-  echo "  hivemind [<slug>]   Start proxy + open Claude Code (slug = arg, else interactive picker)"
-  echo "  hivemind start      Start proxy only"
-  echo "  hivemind stop       Stop the proxy"
-  echo "  hivemind restart    Stop + start (best-effort)"
-  echo "  hivemind status     Show proxy health and certificate validity (human-readable)"
-  echo "  hivemind health     Same checks as status; exit 0=ok 1=degraded 2=down"
-  echo "  hivemind update     Pull-agent: staged + verified + atomic update, auto-rollback"
-  echo "  hivemind --version  Print version"
+  echo "  hivemind [<slug>]     Start proxy + open Claude Code (slug = arg, else interactive picker)"
+  echo "  hivemind start        Start proxy only"
+  echo "  hivemind stop         Stop the proxy"
+  echo "  hivemind restart      Stop + start (best-effort)"
+  echo "  hivemind status       Show proxy health and certificate validity (human-readable)"
+  echo "  hivemind health       Same checks as status; exit 0=ok 1=degraded 2=down"
+  echo "  hivemind update       Pull-agent: staged + verified + atomic update, auto-rollback"
+  echo "  hivemind resume <slug>  Explicit crash recovery: close a dead-holder session for <slug>, then open"
+  echo "  hivemind --version    Print version"
   echo ""
-  echo "  --verbose           Show startup/debug logs (default: quiet, GO/NO-GO + errors only)"
+  echo "  --verbose             Show startup/debug logs (default: quiet, GO/NO-GO + errors only)"
 }
 
 cmd_status() {
@@ -460,6 +481,22 @@ cmd_stop() {
     if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
       if _pid_is_hivemind_runtime "${_pid}"; then
         kill "${_pid}"
+        # DR-3.2: wait (bounded) for the daemon to actually exit, escalating
+        # to SIGKILL if it doesn't — mirrors _reap_stale_runtime's own
+        # wait+escalate (:286-293) and the lab precedent
+        # (bin/fos-agent-runtime:90-116). Without this, `cmd_stop` used to
+        # return the instant the signal was SENT, not once the process was
+        # actually gone — cmd_update's mid-swap cmd_stop (:700) could then
+        # race on to the mv/rename of $HIVEMIND_HOME while the old process
+        # was still up, holding open files/ports.
+        local _t=0
+        while kill -0 "${_pid}" 2>/dev/null && [ "${_t}" -lt 10 ]; do
+          sleep 1; _t=$((_t + 1))
+        done
+        if kill -0 "${_pid}" 2>/dev/null; then
+          _vecho "[hivemind] runtime still alive after 10s — escalating to SIGKILL (pid=${_pid})"
+          kill -9 "${_pid}" 2>/dev/null || true
+        fi
         rm -f "${RUNTIME_PID_FILE}"
         echo "[hivemind] runtime stopped"
       else
@@ -766,22 +803,113 @@ _maybe_auto_update() {
 
 # _resolve_device_id: stable device_id for this machine — analogous to
 # ~/.fos/device.id in the lab. Created once (first run), reused thereafter.
+#
+# Fase 6 (docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md):
+#
+# DR-6.1 — `~/.engram/device-id` lives OUTSIDE ${HIVEMIND_HOME} (see the
+# ~/.engram-vs-~/.hivemind isolation note at :25-28). Measured: `cmd_update`
+# only mv/rm's inside ${HIVEMIND_HOME}[.staging|.last-good], and install.sh
+# only writes inside ${HIVEMIND_HOME}/{.claude,runtime,bin} — neither ever
+# touches ~/.engram. device_id (and its cert binding below) already survive
+# both `hivemind update` and a full reinstall as a side effect of that
+# isolation; this comment makes the invariant explicit instead of leaving it
+# an accident nobody wrote down.
+#
+# DR-6.2 — the write is atomic (tmp+rename via _atomic_write, not a bare
+# redirect a crash/SIGKILL mid-write could truncate) and self-healing: an
+# absent OR empty/corrupted file both regenerate rather than sticking as a
+# permanently-broken device_id.
+#
+# DR-6.3 — every caller here (_spawn_runtime, _open_session_spine,
+# _bootstrap_first_slug) already runs AFTER cmd_open's/cmd_start's
+# `_has_cert || _setup_mode` gate at the top of each command — measured, not
+# assumed: `_setup_mode` always `exit 0`s (no fallthrough), so control only
+# reaches _start_proxy/_spawn_runtime once a cert exists. Combined with
+# _spawn_runtime resolving device_id INLINE on the same line that launches
+# the daemon (`HIVEMIND_DEVICE_ID="$(_resolve_device_id)" nohup ...`), the
+# daemon is never spawned before device-id exists on a fresh machine — no
+# separate reordering was needed once these two facts are put together.
+#
+# DR-6.4 — device_id is CROSS-CHECKED against the enrolled cert's SHA-256
+# fingerprint (~/.engram/device-id-cert-binding), never DERIVED from it — a
+# cert renewal on the SAME machine must not churn device_id (see the plan
+# for why derive-from was rejected). Mismatch (re-enrollment, or device-id
+# copied to a machine without its matching cert) regenerates device_id +
+# rebinds to the current cert, loudly logged — never silent.
 _resolve_device_id() {
   local _id_file="${HOME}/.engram/device-id"
-  if [ ! -f "${_id_file}" ]; then
-    mkdir -p "$(dirname "${_id_file}")"
-    if command -v uuidgen > /dev/null 2>&1; then
-      uuidgen > "${_id_file}"
-    elif [ -r /proc/sys/kernel/random/uuid ]; then
-      cat /proc/sys/kernel/random/uuid > "${_id_file}"
-    else
-      # Last-resort fallback (no uuidgen, no /proc — e.g. some minimal
-      # containers): not RFC4122, but stable across runs on THIS machine,
-      # which is all device_id needs to be.
-      echo "$(hostname)-$(date +%s)-$$" > "${_id_file}"
+  local _binding_file="${HOME}/.engram/device-id-cert-binding"
+
+  # DR-6.2: validate-on-read. `-s` is false for both "absent" and "present
+  # but empty/truncated" — one branch self-heals both cases.
+  [ -s "${_id_file}" ] || _regenerate_device_id "${_id_file}"
+
+  # DR-6.4: only meaningful once a cert actually exists — pre-enrollment
+  # callers (degenerate today, see DR-6.3 above) just skip this block;
+  # device_id is already durable from the step above, only unbound until
+  # enrollment completes (the binding is written the first time this runs
+  # with a cert present).
+  local _owner="${HIVEMIND_OWNER:-}"
+  local _cert_file="${CERT_DIR}/${_owner}.cert.pem"
+  if [ -n "${_owner}" ] && [ -f "${_cert_file}" ] && command -v openssl > /dev/null 2>&1; then
+    local _fp
+    _fp="$(_cert_fingerprint_sha256 "${_cert_file}")"
+    if [ -n "${_fp}" ]; then
+      if [ -s "${_binding_file}" ] && [ "$(cat "${_binding_file}")" != "${_fp}" ]; then
+        echo "[hivemind] device_id/cert binding MISMATCH — cert changed (re-enrollment) or device-id was copied from another machine. Regenerating device_id and rebinding to the current cert." >&2
+        _regenerate_device_id "${_id_file}"
+      fi
+      # First bind (no binding file yet) or just-regenerated above — write/
+      # refresh the binding against the CURRENT cert either way.
+      _atomic_write "${_binding_file}" "${_fp}"
     fi
   fi
+
   cat "${_id_file}"
+}
+
+# _regenerate_device_id: mint a fresh uuid and persist it atomically
+# (DR-6.2). Shared by first-creation and self-heal/rebind paths.
+_regenerate_device_id() {
+  local _id_file="$1" _uuid
+  mkdir -p "$(dirname "${_id_file}")"
+  if command -v uuidgen > /dev/null 2>&1; then
+    _uuid="$(uuidgen)"
+  elif [ -r /proc/sys/kernel/random/uuid ]; then
+    _uuid="$(cat /proc/sys/kernel/random/uuid)"
+  else
+    # Last-resort fallback (no uuidgen, no /proc — e.g. some minimal
+    # containers): not RFC4122, but stable across runs on THIS machine,
+    # which is all device_id needs to be.
+    _uuid="$(hostname)-$(date +%s)-$$"
+  fi
+  _atomic_write "${_id_file}" "${_uuid}"
+}
+
+# _atomic_write: write $2 (+ trailing newline) to $1 via tmp+rename (DR-6.2)
+# — a crash/SIGKILL mid-write leaves the ORIGINAL file untouched instead of
+# a truncated one. `.tmp.$$` keys the scratch file to this process so two
+# concurrent first-run writers (fresh machine, two `hivemind` windows at
+# once) never clobber each other's in-flight tmp file — the `mv` is still a
+# last-writer-wins race between the two, which is an accepted, named window
+# (both produce a valid value; only "which one survives" is unspecified),
+# not a corruption risk.
+_atomic_write() {
+  local _path="$1" _content="$2" _tmp
+  _tmp="${_path}.tmp.$$"
+  printf '%s\n' "${_content}" > "${_tmp}"
+  mv "${_tmp}" "${_path}"
+}
+
+# _cert_fingerprint_sha256: SHA-256 fingerprint of a cert (DR-6.4), colon-
+# separated hex after the `=`. `cut -d= -f2` rather than matching a literal
+# "SHA256 Fingerprint=" prefix: measured openssl on this box prints the
+# lowercase "sha256 Fingerprint=" label (casing is openssl-version-
+# dependent) — splitting on `=` sidesteps that instead of guessing a prefix
+# that might not match every build.
+_cert_fingerprint_sha256() {
+  local _cert="$1"
+  openssl x509 -in "${_cert}" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2
 }
 
 # _mcp_call: POST a JSON-RPC tools/call to the local mTLS proxy; prints the
@@ -917,13 +1045,78 @@ _list_slugs() {
   return 0
 }
 
+# ── Double-access lock (Fase 7, DR-7.A) ───────────────────────────────────────
+# Intentional feature, not a bug: a slug already held by a live session on
+# THIS device must never be opened a second time concurrently. The founder's
+# 3-case model (plan doc, Fase 7): (1) holder ALIVE → block, (2) holder
+# PAUSED-but-pid-alive → the daemon's own reconcile revives it automatically
+# (Fase 2, no lock involvement), (3) holder pid DEAD → block too, but point
+# at `hivemind resume <slug>` (DR-7.C) instead of reopening silently.
+
+# _fetch_lock_table: one fos_session(list_active) call, filtered to THIS
+# device only (never a slug/pid belonging to another machine — same filter
+# discipline as DR-2.3's reconcile). Sets _LOCK_TABLE as
+# "slug<TAB>session_id<TAB>pid" lines — the single source both cmd_open's
+# pre-open check and _pick_project's picker markers read from, so the two
+# never disagree about what is held. Best-effort: empty table on any
+# transport/parse failure — callers degrade to "nothing held" rather than
+# blocking the user over a network blip.
+_fetch_lock_table() {
+  _LOCK_TABLE=""
+  [ -n "${FOS_API_KEY:-}" ] || return 0
+  local _dev="$1" _resp
+  _resp="$(_mcp_call "fos_session" '{"action":"list_active"}' 1)"
+  [ -n "${_resp}" ] || return 0
+  _LOCK_TABLE="$(bun -e '
+    try {
+      const envelope = JSON.parse(process.argv[1]);
+      const inner = JSON.parse(envelope.result.content[0].text);
+      const dev = process.argv[2];
+      const items = Array.isArray(inner.items) ? inner.items : [];
+      for (const it of items) {
+        if (it.device_id !== dev) continue;
+        process.stdout.write(`${it.slug}\t${it.session_id}\t${it.pid ?? ""}\n`);
+      }
+    } catch {}
+  ' "${_resp}" "${_dev}" 2>/dev/null)"
+}
+
+# _lock_state_for_slug: look up $2=slug inside a _fetch_lock_table result
+# ($1). Local pid liveness is checked HERE, not baked into the table, since
+# it can legitimately change between the fetch and the check. Sets
+# _LOCK_STATE (""|alive|dead), _LOCK_SESSION_ID, _LOCK_PID.
+#
+# Ambiguous pid (empty — a session opened by something other than this CLI,
+# e.g. no pid on record) is classified "alive", NEVER "dead" — this is the
+# same guard DR-7.C's spec states explicitly ("never presume dead on an
+# ambiguous check"), applied here too so DR-7.A and DR-7.C never disagree
+# about what counts as dead.
+_lock_state_for_slug() {
+  _LOCK_STATE=""; _LOCK_SESSION_ID=""; _LOCK_PID=""
+  local _table="$1" _slug="$2" _s _sid _pid
+  while IFS=$'\t' read -r _s _sid _pid; do
+    [ "${_s}" = "${_slug}" ] || continue
+    _LOCK_SESSION_ID="${_sid}"
+    _LOCK_PID="${_pid}"
+    if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
+      _LOCK_STATE="alive"
+    elif [ -z "${_pid}" ]; then
+      _LOCK_STATE="alive"
+    else
+      _LOCK_STATE="dead"
+    fi
+    return 0
+  done <<< "${_table}"
+}
+
 # _pick_project — render this owner's slugs and set _PICKED_SLUG. Mirrors
 # silken-runtime:_pick_project (fzf when available; numbered-read fallback;
 # same color scheme + Ctrl-C/Ctrl-D → 130). Input: _SLUGS_RAW (from
-# _list_slugs). NOTE (faithful adaptation, not a gap): silken-runtime also
-# greys out slugs with a live session ON THIS DEVICE — that relies on the lab
-# agent-runtime's /v1/sessions/active endpoint, which this product has no
-# equivalent of, so that one sub-feature is intentionally omitted here.
+# _list_slugs). Also mirrors silken-runtime's greying-out of slugs with a
+# live session on this device (Fase 7, DR-7.A) — previously omitted here
+# because this product had no equivalent lock at all; DR-7.A adds it, and
+# distinguishes ALIVE (in use) from DEAD (crashed, points at `hivemind
+# resume`) where silken-runtime's picker does not.
 _pick_project() {
   _PICKED_SLUG=""
   local -a slugs names
@@ -938,6 +1131,22 @@ _pick_project() {
     return 1
   fi
 
+  # DR-7.A: one lock-table fetch for the whole picker (not per-slug) — marks
+  # ALIVE vs DEAD holders in the render below and keeps both out of the
+  # selectable menu. This is UX only — cmd_open re-checks the ACTUAL picked
+  # slug's lock state fresh, right before opening (TOCTOU-safe); a stale
+  # marker here can at worst show a slug as free that the fresh check then
+  # blocks, never the other way (silently opening a held slug).
+  local _dev_id
+  _dev_id="$(_resolve_device_id)"
+  _fetch_lock_table "${_dev_id}"
+  local -a states
+  local i
+  for ((i=0; i<n; i++)); do
+    _lock_state_for_slug "${_LOCK_TABLE}" "${slugs[$i]}"
+    states+=("${_LOCK_STATE}")
+  done
+
   local C_HEAD C_NUM C_RSTL C_BLOCK
   if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     C_HEAD=$'\033[1;36m'; C_NUM=$'\033[1;33m'; C_BLOCK=$'\033[2;31m'; C_RSTL=$'\033[0m'
@@ -948,17 +1157,36 @@ _pick_project() {
   printf '%s┌─ HIVEMIND ─────────────────────────────────────┐%s\n' "$C_HEAD" "$C_RSTL" >&2
   printf '%s│  Selecione o projeto                           │%s\n' "$C_HEAD" "$C_RSTL" >&2
   printf '%s├────────────────────────────────────────────────┤%s\n' "$C_HEAD" "$C_RSTL" >&2
-  local i
   for ((i=0; i<n; i++)); do
-    printf '   %s%2d)%s  %s\n' "$C_NUM" "$((i+1))" "$C_RSTL" "${names[$i]}" >&2
+    case "${states[$i]}" in
+      alive)
+        printf '   %s[EM USO]%s   %s  %s⬡ sessão viva%s\n' \
+          "$C_BLOCK" "$C_RSTL" "${names[$i]}" "$C_BLOCK" "$C_RSTL" >&2
+        ;;
+      dead)
+        printf '   %s[TRAVADO]%s  %s  %s⬡ crashou — rode: hivemind resume %s%s\n' \
+          "$C_BLOCK" "$C_RSTL" "${names[$i]}" "$C_BLOCK" "${slugs[$i]}" "$C_RSTL" >&2
+        ;;
+      *)
+        printf '   %s%2d)%s  %s\n' "$C_NUM" "$((i+1))" "$C_RSTL" "${names[$i]}" >&2
+        ;;
+    esac
   done
   printf '%s└────────────────────────────────────────────────┘%s\n' "$C_HEAD" "$C_RSTL" >&2
 
   if command -v fzf > /dev/null 2>&1; then
     local menu="" sel idx
     for ((i=0; i<n; i++)); do
+      # Blocked slugs (alive OR dead) never enter the selectable menu — they
+      # already surfaced as [EM USO]/[TRAVADO] in the static render above,
+      # same discipline as the numbered fallback below.
+      [ -z "${states[$i]}" ] || continue
       menu+="$((i+1))	${names[$i]}"$'\n'
     done
+    if [ -z "${menu}" ]; then
+      printf '%s  ✗ Nenhum projeto selecionável (todos em uso ou travados neste device).%s\n' "$C_BLOCK" "$C_RSTL" >&2
+      return 130
+    fi
     sel=$(printf '%s' "$menu" | fzf --ansi --prompt='projeto> ' \
       --header='Enter seleciona · Esc/Ctrl-C cancela' \
       --with-nth=2.. --delimiter='\t') || return 130
@@ -978,6 +1206,10 @@ _pick_project() {
       esac
       if [ "$choice" -lt 1 ] || [ "$choice" -gt "$n" ]; then
         printf '%s  ✗ Fora do intervalo.%s\n' "$C_BLOCK" "$C_RSTL" >&2; continue
+      fi
+      if [ -n "${states[$((choice-1))]}" ]; then
+        printf '%s  ✗ Projeto já está em uso ou travado neste device. Escolha outro.%s\n' "$C_BLOCK" "$C_RSTL" >&2
+        continue
       fi
       _PICKED_SLUG="${slugs[$((choice-1))]}"
       break
@@ -1158,10 +1390,54 @@ cmd_open() {
     exit 1
   fi
 
+  # ── Fase 7 (DR-7.A) — double-access lock, THE authoritative check ────────
+  # Runs BEFORE _open_session_spine/fos_session(action:'open') below, per
+  # DR-3.1's sequencing note in the plan — a lock checked AFTER open() can't
+  # prevent the double-open it exists to prevent. This is a FRESH fetch
+  # regardless of whether the slug came from an explicit arg, the picker, or
+  # bootstrap — the picker's own markers (_pick_project, above) are UX only;
+  # this is the one check that actually blocks. Pitfall (named in the plan):
+  # this NEVER closes/touches a held session it finds — it only detects and
+  # refuses, or points at `hivemind resume`. Closing a holder here to
+  # "resolve" the block would be exactly the bug this lock exists to prevent.
+  local _dev_id
+  _dev_id="$(_resolve_device_id)"
+  _fetch_lock_table "${_dev_id}"
+  _lock_state_for_slug "${_LOCK_TABLE}" "${_project_slug}"
+  case "${_LOCK_STATE}" in
+    alive)
+      echo "" >&2
+      echo "Erro: o projeto '${_project_slug}' já está em uso nesta máquina (sessão viva, pid=${_LOCK_PID})." >&2
+      echo "      Feche a outra janela do HiveMind para este projeto, ou escolha outro." >&2
+      exit 1
+      ;;
+    dead)
+      echo "" >&2
+      echo "Erro: o projeto '${_project_slug}' tem uma sessão anterior que parece ter travado (pid=${_LOCK_PID} não está mais rodando)." >&2
+      echo "      Rode 'hivemind resume ${_project_slug}' para recuperar e reabrir." >&2
+      exit 1
+      ;;
+  esac
+
   # Espinha de sessão (WS-0.3) — abre DEPOIS do proxy responder no health,
   # ANTES do exec (silken-runtime mirror). Sets ENGRAM_SESSION_ID/
   # ENGRAM_DEVICE_ID (globals, best-effort — see _open_session_spine).
   _open_session_spine "${_project_slug}"
+
+  # Fase 3 (DR-3.1) — adopt-before-exec: register this session's pid with
+  # the daemon so its pid-watcher + heartbeat (Fase 2, routes/sessions.ts)
+  # start tracking it. Must run AFTER _open_session_spine (needs a real
+  # ENGRAM_SESSION_ID) and BEFORE `exec` below replaces this script's process
+  # image — $$ only stays valid as the tracked pid across that exec because
+  # exec preserves the pid (same trick silken-runtime:376-377 relies on).
+  # Best-effort, same fail-soft spirit as _open_session_spine itself: a
+  # daemon hiccup here must never block the user from opening Claude.
+  if [ -n "${ENGRAM_SESSION_ID}" ]; then
+    curl -s -X POST --max-time 3 \
+      -H "Content-Type: application/json" \
+      -d "{\"session_id\":\"${ENGRAM_SESSION_ID}\",\"pid\":$$,\"slug\":\"${_project_slug}\"}" \
+      "http://127.0.0.1:${RUNTIME_PORT}/sessions/adopt" > /dev/null 2>&1 || true
+  fi
 
   # F0 auth fail-safe (item 5.0) — the isolated CONFIG_DIR may have no
   # credential at all (install.sh only seeds it best-effort from the user's
@@ -1201,6 +1477,81 @@ cmd_open() {
     claude --setting-sources user "$@"
 }
 
+# cmd_resume: DR-7.C — explicit crash recovery. NEVER auto-triggered; the
+# founder's model is recovery != unlock — the user names the command
+# themselves. $1 = slug (required, no picker here — recovery targets a
+# specific known-crashed slug, not a browse-and-pick flow).
+#
+# Re-confirms the holder is DEAD via the SAME liveness check as DR-7.A's lock
+# (_lock_state_for_slug) — the two must never disagree about what "dead"
+# means. If it now reads alive, this command refuses with the SAME block
+# message as cmd_open's lock — recovery is never a bypass of the lock, it is
+# a separate, explicit act that only proceeds against a confirmed-dead
+# holder.
+#
+# On confirmed-dead: close(force:true) the stale session (best-effort on the
+# network call itself, but the liveness GUARD above it is never best-effort —
+# an ambiguous pid check already reads "alive" per _lock_state_for_slug, so
+# this command already refuses rather than guesses), then falls through to
+# the normal cmd_open path for a FRESH open — same slug, same spine, same
+# adopt-before-exec, but a NEW session_id (this is crash-recovery-then-open,
+# not a resume of the old session's own state).
+cmd_resume() {
+  local _slug="${1:-}"
+  if [ -z "${_slug}" ]; then
+    echo "Erro: uso: hivemind resume <slug>" >&2
+    exit 1
+  fi
+
+  if ! _has_cert; then
+    echo "Erro: nenhum certificado encontrado — rode 'hivemind' (sem argumentos) primeiro para completar o enrollment." >&2
+    exit 1
+  fi
+  if [ -z "${FOS_API_KEY:-}" ]; then
+    echo "Erro: FOS_API_KEY ausente — enrollment incompleto?" >&2
+    exit 1
+  fi
+
+  _maybe_auto_update
+  _start_proxy
+
+  local _dev_id
+  _dev_id="$(_resolve_device_id)"
+  _fetch_lock_table "${_dev_id}"
+  _lock_state_for_slug "${_LOCK_TABLE}" "${_slug}"
+
+  case "${_LOCK_STATE}" in
+    "")
+      echo "[hivemind] nenhuma sessão travada encontrada para '${_slug}' nesta máquina — abrindo normalmente." >&2
+      ;;
+    alive)
+      echo "" >&2
+      echo "Erro: o projeto '${_slug}' já está em uso nesta máquina (sessão viva, pid=${_LOCK_PID})." >&2
+      echo "      Recuperação != destravar — feche a outra janela antes de tentar de novo." >&2
+      exit 1
+      ;;
+    dead)
+      echo "[hivemind] recuperando sessão travada de '${_slug}' (session_id=${_LOCK_SESSION_ID}, pid morto=${_LOCK_PID})..." >&2
+      local _close_args _resp _err_field
+      _close_args="{\"action\":\"close\",\"session_id\":\"${_LOCK_SESSION_ID}\",\"reason\":\"crash-recovery\",\"force\":true}"
+      _resp="$(_mcp_call "fos_session" "${_close_args}" 1)"
+      _err_field="$(_mcp_result_field "${_resp}" "_err")"
+      if [ -n "${_err_field}" ]; then
+        echo "Erro: falha ao fechar a sessão travada (${_err_field}) — nada aberto." >&2
+        exit 1
+      fi
+      echo "[hivemind] sessão travada liberada — abrindo '${_slug}'..." >&2
+      ;;
+  esac
+
+  # Hand off to the normal open path (explicit slug — cmd_open never shows
+  # the picker when a slug is given). cmd_open re-runs its own DR-7.A check
+  # on the way in; it will now read "" (the holder was just closed above), so
+  # this is a harmless, correct re-verification rather than a duplicate lock
+  # — deliberately one open path, not two divergent ones.
+  cmd_open "${_slug}"
+}
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 # Parse --verbose anywhere in argv; strip it before subcommand dispatch (it's
@@ -1222,6 +1573,7 @@ case "${1:-}" in
   status)         shift || true; cmd_status ;;
   health)         shift || true; cmd_health ;;
   update)         shift || true; cmd_update ;;
+  resume)         shift || true; cmd_resume "$@" ;;
   --version|-v)   cmd_version ;;
   --help|-h)      cmd_help ;;
   *)              cmd_open "$@" ;;

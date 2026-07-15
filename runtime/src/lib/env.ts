@@ -52,6 +52,26 @@ const schema = z.object({
   MTLS_KEY_PATH: z.string().optional(),
   MTLS_CA_PATH: z.string().optional(),
 
+  // Durable per-machine identity (bin/hivemind:_resolve_device_id, Fase 6,
+  // DR-6.3) — exported into the daemon's env by _spawn_runtime so reconcile
+  // (Fase 2) and lifecycle events (Fase 4) tag their own device without a
+  // second, divergent notion of "device" inside this process. Optional: a
+  // daemon started directly (`bun src/server.ts`, bypassing the bash
+  // wrapper) simply runs without it rather than failing to boot.
+  HIVEMIND_DEVICE_ID: z.string().optional(),
+
+  // Bearer for backend MCP calls over the direct mTLS upstream (Fase 2,
+  // DR-2.2, docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md) —
+  // heartbeat/pause/resume/list_active (backend-mcp-client.ts) all send this
+  // as the x-fos-key header. Written into $HIVEMIND_HOME/.env by setup.ts
+  // (enrollment) and exported into the daemon's environment by bin/hivemind's
+  // `set -a; . .env; set +a` — the same key the CLI's own `exec env` MCP
+  // entry resolves. Optional for the same reason HIVEMIND_DEVICE_ID is: a
+  // daemon started before enrollment (or directly, bypassing the wrapper)
+  // simply has nothing to call the backend with — backend-mcp-client.ts
+  // degrades every call to a no-op rather than failing to boot.
+  FOS_API_KEY: z.string().optional(),
+
   HOME: z.string().default('/root'),
 });
 
@@ -121,6 +141,39 @@ export function mtlsProxyConfig(): {
   return {
     port,
     upstream: upstream!,
+    certPath: expandPath(certPath),
+    keyPath:  expandPath(keyPath),
+    caPath:   expandPath(caPath),
+  };
+}
+
+// ─── mtlsCredentials ──────────────────────────────────────────────────────────
+// Cert/key/ca + upstream for DIRECT daemon→backend calls (backend-mcp-client.ts,
+// Fase 2) — deliberately NOT gated on MTLS_PROXY_PORT the way mtlsProxyConfig()
+// is. MTLS_PROXY_PORT is a precondition for the LOCAL PROXY LISTENER only; it
+// says nothing about whether this process can itself reach the backend over
+// mTLS. Fase-2 review (docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md)
+// measured live that reusing mtlsProxyConfig() here silently no-op'd every
+// daemon→backend call (heartbeat/reconcile/pause/resume) whenever
+// MTLS_PROXY_PORT was unset, even with a perfectly valid cert/key/ca/upstream
+// — the exact proxy-health coupling backend-mcp-client.ts's own header comment
+// says must not happen. Enrollment (setup.ts) always writes
+// MTLS_CERT_PATH/KEY_PATH/CA_PATH/MTLS_UPSTREAM together, so cert presence
+// alone is the correct, independent precondition for this path.
+export function mtlsCredentials(): {
+  upstream: string;
+  certPath: string;
+  keyPath: string;
+  caPath: string;
+} | null {
+  const certPath = env.MTLS_CERT_PATH;
+  const keyPath  = env.MTLS_KEY_PATH;
+  const caPath   = env.MTLS_CA_PATH;
+  if (!certPath || !keyPath || !caPath) return null;
+
+  return {
+    // MTLS_UPSTREAM is derived from HIVEMIND_ENDPOINT in loadEnv — always defined.
+    upstream: env.MTLS_UPSTREAM!,
     certPath: expandPath(certPath),
     keyPath:  expandPath(keyPath),
     caPath:   expandPath(caPath),
