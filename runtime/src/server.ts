@@ -69,5 +69,13 @@ async function shutdown(signal: string): Promise<void> {
 
 process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
 process.on('SIGINT',  () => { void shutdown('SIGINT'); });
+// SIGHUP = controlling terminal closed (abrupt Claude Code close). Without this
+// handler the runtime is left ORPHANED with the mTLS proxy port (7779) still
+// bound — the exact state that forced a manual `hivemind stop` before a reopen.
+// Route it through the same graceful shutdown so the proxy releases its port on
+// terminal close. (Default SIGHUP disposition terminates the process WITHOUT
+// running this cleanup; the runtime-side auto-heal in bin/hivemind:_start_proxy
+// is the belt-and-suspenders for any case where the signal never arrives.)
+process.on('SIGHUP',  () => { void shutdown('SIGHUP'); });
 
 export { app };
