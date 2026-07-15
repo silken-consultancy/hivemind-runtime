@@ -246,10 +246,109 @@ _setup_mode() {
   exit 0
 }
 
-# ── _start_proxy: ensure the runtime+proxy is running ─────────────────────────
+# ── _proxy_ok: is the local mTLS proxy LISTENER (7779) alive? ─────────────────
+# Semantics: LIVENESS of the local listener, NOT upstream (:4443) reachability.
+# We do NOT use -f here (unlike _check_health's :119 probe): -f fails on any
+# 4xx/5xx, so OFFLINE — when the proxy is healthy but its upstream is
+# unreachable and it answers 502 — a -f probe would false-negative and the
+# auto-heal would kill+restart a perfectly good runtime on every `hivemind`.
+# Instead: any HTTP status back (incl. 502/4xx/5xx) means "process alive,
+# listening" → OK; only connection-refused / timeout (curl writes http_code
+# 000, or exits non-zero without connecting) means the listener is dead → FAIL.
+# Gated on MTLS_PROXY_PORT: a dev setup without the proxy is a deliberate mode,
+# not a failure, so it reports OK (reuse then proceeds on healthz alone,
+# unchanged). --max-time 3 bounds a stuck/hung proxy; 3s mirrors :139.
+_proxy_ok() {
+  [ -n "${MTLS_PROXY_PORT:-}" ] || return 0
+  local _code
+  _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+    "http://127.0.0.1:${PROXY_PORT}/v1/mcp" 2>/dev/null) || return 1
+  [ "${_code}" != "000" ]
+}
+
+# ── _reap_stale_runtime: auto-heal what `hivemind stop` does by hand ──────────
+# Kills the runtime recorded in the pidfile ONLY when it is genuinely a
+# hivemind-runtime (via _pid_is_hivemind_runtime — the SAME guard cmd_stop
+# uses), then clears the pidfile. Fail-safe: a recycled/foreign PID is NEVER
+# killed (only the stale pidfile is cleared). Callers invoke this ONLY after
+# establishing the current runtime is unhealthy (healthz down, or 7777 up but
+# proxy 7779 broken), so it never touches a HEALTHY runtime.
+_reap_stale_runtime() {
+  [ -f "${RUNTIME_PID_FILE}" ] || return 0
+  local _pid
+  _pid=$(cat "${RUNTIME_PID_FILE}" 2>/dev/null || echo '')
+  if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
+    if _pid_is_hivemind_runtime "${_pid}"; then
+      _vecho "[hivemind] auto-heal: stopping stale/stuck runtime (pid=${_pid})"
+      kill "${_pid}" 2>/dev/null || true
+      # Wait (bounded) for the process to actually exit so it releases the port
+      # before we spawn a replacement — avoids racing it into EADDRINUSE.
+      local _t=0
+      while kill -0 "${_pid}" 2>/dev/null && [ "${_t}" -lt 5 ]; do
+        sleep 1; _t=$((_t + 1))
+      done
+      if kill -0 "${_pid}" 2>/dev/null; then
+        _vecho "[hivemind] auto-heal: escalating to SIGKILL (pid=${_pid})"
+        kill -9 "${_pid}" 2>/dev/null || true
+      fi
+    else
+      _vecho "[hivemind] pidfile pid=${_pid} is not a hivemind runtime (recycled) — clearing pidfile only, not killing"
+    fi
+  fi
+  rm -f "${RUNTIME_PID_FILE}"
+}
+
+# ── _spawn_runtime: launch a fresh runtime, wait for healthz, THEN write pidfile
+# The pidfile is written ONLY after healthz confirms the process is actually up
+# — never records the PID of a bun that died at startup (EADDRINUSE), which is
+# exactly what used to sabotage a later `hivemind stop`. An early exit (bun
+# dying on EADDRINUSE/crash) is detected via kill -0 and returns 1 FAST instead
+# of burning the full 15s timeout. Returns 0 on success, 1 otherwise.
+_spawn_runtime() {
+  local _pid
+  bun run "${RUNTIME_BIN}" >> "${RUNTIME_LOG}" 2>&1 &
+  _pid=$!
+
+  local _tries=0
+  until curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; do
+    # Bun exited during startup (EADDRINUSE / crash) — bail immediately rather
+    # than polling a dead PID for 15s.
+    if ! kill -0 "${_pid}" 2>/dev/null; then
+      _vecho "[hivemind] runtime exited during startup (pid=${_pid}) — see ${RUNTIME_LOG}"
+      return 1
+    fi
+    _tries=$((_tries + 1))
+    if [ "${_tries}" -ge 15 ]; then
+      _vecho "[hivemind] runtime did not answer healthz after 15s — killing pid=${_pid}"
+      kill "${_pid}" 2>/dev/null || true
+      return 1
+    fi
+    sleep 1
+  done
+
+  # Up and answering — NOW it is safe to record the pid.
+  echo "${_pid}" > "${RUNTIME_PID_FILE}"
+  return 0
+}
+
+# ── _start_proxy: ensure a HEALTHY runtime+proxy is running (idempotent) ──────
+# Reuse only a genuinely healthy runtime: healthz(7777) AND proxy(7779) both OK.
+# If 7777 answers but the proxy is broken (the orphaned/stuck runtime left by an
+# abrupt Claude close — the "hivemind won't reopen, needs a manual stop" bug),
+# auto-heal: reap OUR stale runtime + start fresh. EADDRINUSE (failure mode B)
+# is handled explicitly — reap the orphan holding the port + one retry — rather
+# than eating the 15s timeout, and the pidfile is never overwritten with a dead
+# PID.
 _start_proxy() {
+  # Fast path: an already-healthy runtime+proxy is reused untouched.
   if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; then
-    return 0
+    if _proxy_ok; then
+      return 0
+    fi
+    # 7777 up but proxy 7779 down/stuck → this runtime is unhealthy. Reap it
+    # (only if it is really ours) and fall through to a clean fresh start.
+    _vecho "[hivemind] runtime up on ${RUNTIME_PORT} but proxy ${PROXY_PORT} not responding — auto-healing"
+    _reap_stale_runtime
   fi
 
   if ! command -v bun > /dev/null 2>&1; then
@@ -262,19 +361,22 @@ _start_proxy() {
   fi
 
   mkdir -p "$(dirname "${RUNTIME_LOG}")"
-  bun run "${RUNTIME_BIN}" >> "${RUNTIME_LOG}" 2>&1 &
-  echo $! > "${RUNTIME_PID_FILE}"
+
+  # Before spawning, clear any stale runtime WE own that may still hold the port
+  # (failure mode B: EADDRINUSE from an orphan). Safe no-op when the pidfile is
+  # absent or points to a non-hivemind PID.
+  _reap_stale_runtime
 
   _vecho "[hivemind] starting runtime..."
-  _TRIES=0
-  until curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; do
-    _TRIES=$((_TRIES + 1))
-    if [ "${_TRIES}" -ge 15 ]; then
-      echo "Error: hivemind runtime did not start after 15s. Check: ${RUNTIME_LOG}" >&2
+  if ! _spawn_runtime; then
+    # One retry: an orphan may have raced us for the port. Reap + retry once.
+    _vecho "[hivemind] first start failed — reaping any port-holder and retrying once"
+    _reap_stale_runtime
+    if ! _spawn_runtime; then
+      echo "Error: hivemind runtime did not start (port ${RUNTIME_PORT} busy or startup crash). Check: ${RUNTIME_LOG}" >&2
       exit 1
     fi
-    sleep 1
-  done
+  fi
   _vecho "[hivemind] runtime up (pid=$(cat "${RUNTIME_PID_FILE}" 2>/dev/null || echo '?'))"
 }
 
