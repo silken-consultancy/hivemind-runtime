@@ -1,6 +1,4 @@
 // HiveMind — UserPromptSubmit hook: cota oficial de assinatura via API, fresca por mensagem.
-// Ported verbatim from the lab (4tuenyOS
-// kernel/hooks/user-prompt-submit.capture-quota.js) — no path adaptation.
 //
 // PORQUÊ: os percentuais de sessão/semana NÃO vêm em nenhum campo estruturado do
 // Claude Code nem nos headers do transcript — a única fonte além do texto do
@@ -17,7 +15,7 @@
 //     week_sonnet_pct, week_sonnet_reset, <- seven_day_sonnet.utilization
 //     total_cost_usd?, by_model? }        <- preservados de um scrape /usage anterior
 //
-// CUIDADOS (verificados 2026-06-10, herdados do lab):
+// CUIDADOS (verificados 2026-06-10):
 //   - Rate-limit: o endpoint dá 429 sob polling agressivo (issue #31637, "not planned").
 //     Disparamos em UserPromptSubmit (1×/mensagem) + throttle FOS_QUOTA_REFRESH_SEC (60s).
 //   - Não-bloqueante: o fetch roda em processo DETACHED; o turno nunca espera a rede.
@@ -35,7 +33,7 @@
 //     dentro de uma sessão hivemind com CLAUDE_CONFIG_DIR isolado. Isso é
 //     seguro-por-design: a cota de assinatura é escopada à CONTA Anthropic, não
 //     à sessão/config-dir, então compartilhar esse único arquivo de cache entre
-//     o lab e o produto (mesma conta) é inofensivo — e a statusline (que lê o
+//     instalações na mesma conta é inofensivo — e a statusline (que lê o
 //     mesmo path hardcoded) sempre concorda com o que este hook escreve.
 //
 // Env:

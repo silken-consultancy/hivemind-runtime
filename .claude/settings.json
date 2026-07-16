@@ -145,7 +145,6 @@
     "deny": [
       "Bash(rm -rf /*)",
       "Bash(rm -rf ~/*)",
-      "Bash(rm -rf /home/user/*)",
       "Bash(git push --force *)",
       "Bash(git reset --hard *)",
       "Read(**/.env)",

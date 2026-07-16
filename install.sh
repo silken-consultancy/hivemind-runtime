@@ -164,7 +164,7 @@ cp "${SCRIPT_DIR}/.claude/hooks/user-prompt-submit.capture-quota.js" \
 # (item 5.0, F0 auth) — best-effort. Absence is NOT an error: bin/hivemind's
 # cmd_open() has a fail-safe that triggers a login flow inside the same
 # isolated CONFIG_DIR on first launch if this file is missing (only ABSENCE is
-# handled here, not an EXPIRED credential — see docs/wip plan item 5.0/P2).
+# handled here, not an EXPIRED credential — known limitation).
 if [ -f "${HOME}/.claude/.credentials.json" ]; then
   cp "${HOME}/.claude/.credentials.json" "${HIVEMIND_HOME}/.claude/.credentials.json"
   chmod 600 "${HIVEMIND_HOME}/.claude/.credentials.json"

@@ -8,7 +8,7 @@ Memory lives in the cloud; this runtime connects you to it via your personal cer
 ## Espinha — contrato de carga de identidade (boot COMPLETO)
 
 No início de cada sessão o `/boot` (`.claude/commands/boot.md`) executa o boot **completo
-com identidade** — a mesma espinha do kernel-lab, fielmente portada e escopada ao seu slug
+com identidade** — a espinha de identidade completa, escopada ao seu slug
 (`ENGRAM_SLUG`, sempre resolvido pelo runtime antes desta sessão abrir). **Antes** de
 qualquer outra ação, o boot dispara **em paralelo, num único batch** (identidade e skeleton
 não dependem um do outro): `fos_boot_skeleton({ slug: <ENGRAM_SLUG> })` +
@@ -29,22 +29,22 @@ não dependem um do outro): `fos_boot_skeleton({ slug: <ENGRAM_SLUG> })` +
   usuário é e como ele gosta de trabalhar;
 - os tópicos `os-kernel/*` (critical · decisions · feedback · reinforcement · frameworks ·
   architecture · strategy · rules-misc · posture) — invariantes e disciplinas do OS
-  (`decisions`/`feedback`/`reinforcement` como hot-pointers; pesos `hot_weights` portados
-  **verbatim** do lab — ver `boot.md`);
+  (`decisions`/`feedback`/`reinforcement` como hot-pointers; pesos `hot_weights` fixos do
+  contrato de boot — ver `boot.md`);
 - `fos_health_boot({})` — probe de saúde, fail-open, non-blocking.
 
 Tudo é **determinístico** (`mode:exact`/`mode:topic`, skeleton, project_state, inbox) —
-**NUNCA** `mode:"semantic"` ([redacted]) para identidade/regras/WIP/estado (INV-5). A espinha é
+**NUNCA** `mode:"semantic"` para identidade/regras/WIP/estado (INV-5). A espinha é
 versionada e não muta ao vivo; o seu self per-user constrói POR CIMA dela e **só você (o
 assistente) a autora** — o usuário nunca edita a self. A leitura é cert-gated + owner-scoped:
 só quem tem o certificado do tenant enxerga o conteúdo semeado nele.
 
-> **Nota de segurança (medido — owner-scoping por plane + [redacted] real):** para um owner de
-> beta-produto que nunca teve esses planes semeados, os tópicos `os-kernel/*` (e
-> potencialmente `tenant/*`) retornam `count:0`. Isso é **esperado e seguro** — toda leitura
-> de `[redacted]` filtra por `owner_id` sem exceção por plane; `count:0` é o resultado
-> CORRETO para quem não tem aquele conteúdo, **não** um vazamento nem um bug. **NUNCA**
-> "conserte" um `count:0` legítimo com `fos_recall({ mode:"semantic" })` — violaria INV-5.
+> **Nota de segurança:** para um owner que nunca teve esses planes semeados, os tópicos
+> `os-kernel/*` (e potencialmente `tenant/*`) retornam `count:0`. Isso é **esperado e
+> seguro** — toda leitura é escopada à sua identidade (o owner derivado do seu certificado),
+> sem exceção por plane, enforced no servidor; `count:0` é o resultado CORRETO para quem não
+> tem aquele conteúdo, **não** um vazamento nem um bug. **NUNCA** "conserte" um `count:0`
+> legítimo com `fos_recall({ mode:"semantic" })` — violaria INV-5.
 > Planes vazios não lançam erro e não disparam fallback: o boot segue normalmente.
 
 Além do batch de identidade, o boot faz a **rehydratação escopada ao slug**:
@@ -84,7 +84,7 @@ Carregue os dois **antes** do primeiro write da sessão e siga-os à risca — i
 o contrato de self-layer para as memórias `self/relational`/`self/lived` do onboarding
 (§ Primeiro ato acima). Mesma leitura cert-gated da espinha: versionada, não muta ao vivo.
 
-Memory is automatically scoped to your identity (owner_id = your certificate CN).
+Memory is automatically scoped to your identity (the owner derived from your certificate).
 Other users cannot read your self-layer memories.
 
 ## Available MCP tools (engram)
@@ -114,7 +114,7 @@ Decisions:
 
 ## Owner context
 
-Your memories are scoped to your identity (owner_id derived from your mTLS
-certificate CN). You cannot read another user's self-layer memories (`plane:self`).
+Your memories are scoped to your identity (the owner derived from your mTLS
+certificate). You cannot read another user's self-layer memories (`plane:self`).
 Shared project memories (`plane:project`) are readable by all users with access to
 the same project slug.

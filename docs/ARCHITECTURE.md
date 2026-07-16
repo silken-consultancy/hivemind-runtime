@@ -2,11 +2,8 @@
 
 Design-doc only. No functional code changes; this documents where the
 current implementation is Unix-specific and how a future native-Windows
-port would slot in, per
-`docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md` § Fase 5
-(DR-5.1/DR-5.2) in the `4tuenyOS` kernel repo. Not scheduled — see `OPEN-5`
-in that plan ("bash-now, document the seam, rewrite only when Windows is
-actually calendared").
+port would slot in. Not scheduled — bash-now, document the seam, rewrite
+only when Windows is actually calendared.
 
 ## Split: `bin/hivemind` (CLI) vs. `runtime/src/server.ts` (daemon)
 
@@ -33,8 +30,8 @@ spawns and supervises that daemon. A native Windows port would keep
    the stop timeout). Windows equivalent is `tasklist`/`taskkill`, with
    different signal semantics — there is no POSIX `SIGTERM`/graceful-vs-
    force distinction in the same shape; `taskkill /F` is closer to `-9`
-   than to `-TERM`. See DR-5.2 below for the daemon-side liveness check
-   specifically.
+   than to `-TERM`. See the section below for the daemon-side liveness
+   check specifically.
 
 3. **`$HOME`-relative paths** — `~/.engram/...` (cert material, device-id,
    cache/pid files) and `~/.hivemind/...` (`$HIVEMIND_HOME`, the install
@@ -52,7 +49,7 @@ spawns and supervises that daemon. A native Windows port would keep
    own detach/signal-equivalent logic directly instead of shelling out to
    `nohup`/`kill`).
 
-## DR-5.2 — `process.kill(pid, 0)` on native Windows
+## `process.kill(pid, 0)` on native Windows
 
 `runtime/src/lib/pid-watcher.ts` polls `process.kill(pid, 0)` every 2s to
 detect when the interactive Claude process (not a Unix child of the
@@ -65,10 +62,10 @@ since the daemon currently only ever runs under Linux/macOS/WSL.
 
 ## Non-goals of this document
 
-Per DR-5.1's pitfall: this is the seam **documented**, not **abstracted
+This is the seam **documented**, not **abstracted
 in code**. No `platform.ts`/strategy-pattern layer exists yet, and none
 should be added speculatively — building one now, with no Windows target
 scheduled, is effort against a need that doesn't exist. This doc exists
-so that Fase 1-4/6-7 work doesn't accidentally couple business logic to
+so that future work doesn't accidentally couple business logic to
 `kill`/`nohup` outside the 4 boundaries named above, keeping a future
 port a bounded, localized change instead of an archaeology project.

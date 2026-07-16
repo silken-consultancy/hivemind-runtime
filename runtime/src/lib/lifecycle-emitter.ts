@@ -1,37 +1,27 @@
 // lifecycle-emitter.ts — fire-and-forget observability events for daemon
-// reconcile/shutdown lifecycle (Fase 4, DR-4.1,
-// docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md).
+// reconcile/shutdown lifecycle.
 //
-// Lean port of services/agent-runtime/src/lib/backend-emitter.ts (92 lines) —
-// same queue cap (1000, drop-oldest) + exponential backoff. Transport is
-// corrected for this daemon: `fos_event_emit` over MCP via
-// backend-mcp-client.ts (Fase 2), NOT a raw `POST /v1/events` — this daemon
-// has no REST access to the backend, only the mTLS→MCP upstream (the same
-// transport correction DR-2.3 already made for close/pause/resume).
+// Bounded queue (cap 1000, drop-oldest) + exponential backoff. Transport is
+// `fos_event_emit` over MCP via
+// backend-mcp-client.ts — this daemon
+// has no other access to the backend, only the mTLS→MCP upstream.
 //
-// CORRECTED vs the plan's literal text (measured live, resolved with
-// team-lead 2026-07-15 — the architect is fixing DR-4.1's wording in
-// parallel): DR-4.1 as written said `kind_category:'lifecycle'` plus a raw
-// `kind` field in the emit body. Measured against the live EventEmitInput
-// contract (packages/contract/src/mcp/tools.ts:2363-2392, projetos/engram),
-// both are invalid: kind_category is a closed 7-value zod enum
-// (tool_call|maintenance|memory|cortex|code|heartbeat|domain) with no
-// 'lifecycle' member, and there is no raw `kind` input at all — the service
-// always computes `kind = kind_detail ? \`${kind_category}.${kind_detail}\`
-// : kind_category` server-side (session-infra-core.service.ts:190-193). A
-// call built exactly as the plan described would be rejected by the
-// backend's own validation. Using kind_category:'domain' instead — the
-// documented entity-lifecycle catch-all (tools.ts:2356) — with kind_detail
-// carrying the event names DR-4.1 wanted; composes server-side to e.g.
+// Per the live `fos_event_emit` contract (measured 2026-07-15):
+// kind_category is a closed enum with no
+// 'lifecycle' member, and there is no raw `kind` input at all — the server
+// always derives the full kind as `${kind_category}.${kind_detail}` (or just
+// `kind_category` when no detail is given). We use kind_category:'domain' —
+// the documented entity-lifecycle catch-all — with kind_detail
+// carrying the event names; the server composes e.g.
 // `domain.hivemind_runtime.daemon_started`.
 //
 // `slug` is omitted entirely (not passed as `null`) — daemon lifecycle isn't
-// scoped to a project slug (the "OS-level event" case the schema's own
-// description names), and the schema type is `z.string().optional()`, not
+// scoped to a project slug (the "OS-level event" case the tool's own
+// description names), and the field is optional, not
 // nullable — passing a literal `null` would itself fail validation.
 //
-// device_id = the durable HIVEMIND_DEVICE_ID (Fase 6/DR-6.3), never
-// os.hostname() (unlike the lab's backend-emitter.ts:26) — one device
+// device_id = the durable HIVEMIND_DEVICE_ID, never
+// os.hostname() — one device
 // identity shared across reconcile, heartbeat, and events in this daemon.
 
 import { callMcpTool } from './backend-mcp-client.ts';
@@ -47,7 +37,6 @@ interface QueuedEvent {
 interface EventEmitResult {
   ok: boolean;
   event_id?: string;
-  lamport?: string;
   error?: string;
 }
 

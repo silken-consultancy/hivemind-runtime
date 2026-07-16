@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-HiveMind statusline — thin-CLI edition (ported from the lab's
-silken-statusline.py, 4tuenyOS `bin/silken-statusline.py`).
+HiveMind statusline — thin-CLI edition.
 
 CLI is the primary UI; this strip — fixed under the Claude Code chat — is its
-most-seen surface. Ported quase-verbatim: same design contract, same palette,
-same segment order. The only real adaptation is identity — the product has a
-single role (there is no messenger/orchestrator/project-agent distinction
-here), so the segment collapses to "slug only", read from `ENGRAM_SLUG` (the
-env var `cmd_open` in bin/hivemind always sets before `exec claude`) instead
-of the lab's `FOS_SLUG`/`FOS_PROJECT_SLUG`/`FOS_ROLE` trio.
+most-seen surface. The identity segment is "slug only", read from
+`ENGRAM_SLUG` (the env var `cmd_open` in bin/hivemind always sets before
+`exec claude`).
 
-Design contract (unchanged from the lab):
+Design contract:
   - ONE line. The harness renders the command's stdout inline — no agent table.
   - Reading order = importance: WHERE am I (slug) -> WHAT (model) -> git ->
     context budget -> quota -> ambient signal -> time.
@@ -114,9 +110,7 @@ def git_cached(cwd: str, ttl: float = 3.0) -> str:
 
 # ── HiveMind identity (env-only, instant) ────────────────────────────────────
 def slug_identity() -> str:
-    """`slug` segment. Single-role product — no messenger/orchestrator/
-    project-agent distinction to qualify it (unlike the lab's fos_identity,
-    which also renders FOS_ROLE). ENGRAM_SLUG is always set by cmd_open
+    """`slug` segment. ENGRAM_SLUG is always set by cmd_open
     before `exec claude` (bin/hivemind), so absence here means "not inside
     a hivemind session" — a silent empty segment, not an error."""
     slug = os.environ.get("ENGRAM_SLUG") or ""
@@ -130,11 +124,10 @@ def fos_signal() -> str:
     """
     One compact pill from local daemon cache if present, else silent.
     Surfaces only what is actionable: open/critical blockers and active sessions.
-    No network. Absent cache => no segment (not a noisy '[FOS?]'). The cache
-    paths are the same as the lab's (~/.fos/...) — this is a fail-soft read of
-    whatever local daemon state happens to exist on the machine; on a
-    product-only install (no lab daemon), this stays silently empty forever,
-    which is the correct behavior, not a bug to fix.
+    No network. Absent cache => no segment (not a noisy '[FOS?]'). This is a
+    fail-soft read of whatever local daemon state happens to exist on the
+    machine (~/.fos/...); on an install with no such daemon, this stays
+    silently empty forever, which is the correct behavior, not a bug to fix.
     """
     cache = Path.home() / ".fos" / ".cache" / "state.json"
     try:
@@ -306,7 +299,7 @@ def main() -> None:
         parts.append(qta)
 
     # 6. ambient signal — blockers / sessions / health, only when present
-    # (fail-soft: silently empty on a product-only install with no local
+    # (fail-soft: silently empty on an install with no local
     # ~/.fos daemon cache).
     sig = fos_signal()
     if sig:

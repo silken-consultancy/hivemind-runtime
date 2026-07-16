@@ -1,21 +1,20 @@
-// sessions.ts — daemon-side session pid registry (Fase 2,
-// docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md, DR-2.1/2.2/2.3/2.4/2.5)
-// + reconcile observability events (Fase 4, DR-4.1 — see lifecycle-emitter.ts
-// for the corrected kind_category mapping).
+// sessions.ts — daemon-side session pid registry
+// + reconcile observability events (see lifecycle-emitter.ts
+// for the kind_category mapping).
 //
-// POST /sessions/adopt — bin/hivemind (Fase 3, DR-3.1) calls this once, after
+// POST /sessions/adopt — bin/hivemind calls this once, after
 //   _open_session_spine has already opened the session in the backend and
 //   BEFORE `exec claude` replaces the script's process image — the pid it
 //   sends ($$ in bash) only stays valid across that exec because exec
 //   preserves the pid. Starts the pid-watcher + heartbeat for the session.
 // GET  /sessions — diagnostic listing, incl. heartbeat_active (DR-2.5).
 //
-// REVIVE-ON-RETURN (the model this whole file implements, not a variant of
-// the lab's): the daemon never decides on its own that a session is dead. A
+// REVIVE-ON-RETURN (the model this whole file implements):
+// the daemon never decides on its own that a session is dead. A
 // pid dying — whether mid-session (pid-watcher onExit) or found dead during
 // reconcileOnStartup — only ever PAUSES the session in the backend, never
-// closes it. Only the backend's WatchdogService (a conservative, generous
-// timeout — see the plan's STATE section) closes a session nobody ever came
+// closes it. Only the backend's own watchdog (a conservative, generous
+// timeout) closes a session nobody ever came
 // back to. Sessions are tracked in a module-level Map (source of truth
 // in-process); the JSON mirror (session-store.ts) is a boot-degrade fallback
 // only, consulted in reconcileOnStartup() when the backend itself is
@@ -226,7 +225,6 @@ export async function reconcileOnStartup(): Promise<void> {
     if (!deviceId) {
       // Fail-safe: without a device_id there is nothing to filter list_active
       // by, and reconciling unfiltered risks a cross-device false revive
-      // (STATE, docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md)
       // — skip entirely rather than guess.
       console.warn('[sessions] reconcileOnStartup: HIVEMIND_DEVICE_ID unset — skipping (would risk cross-device revive)');
       return;
@@ -284,7 +282,7 @@ export async function reconcileOnStartup(): Promise<void> {
 // SIGHUP is a logged no-op (Fase 1, DR-1.2) and never reaches here.
 //
 // PAUSE every still-pid-alive tracked session in the backend (not a
-// silent local-only persist, as the lab does) — the backend must actually
+// silent local-only persist) — the backend must actually
 // reflect "no daemon locally active for this right now" via paused_at, so
 // any read of list_active/state shows it correctly rather than looking
 // like a normally-active session with zero daemon behind it. A pid that

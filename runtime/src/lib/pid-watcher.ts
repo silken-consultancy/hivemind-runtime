@@ -1,9 +1,5 @@
 // pid-watcher.ts — monitors an external pid (not a Unix child of this process).
 //
-// Verbatim port of services/agent-runtime/src/lib/pid-watcher.ts (Fase 2,
-// DR-2.2, docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md) — no
-// behavior change, the polling mechanics are identical.
-//
 // Design rationale: the interactive Claude process is not a Unix child of
 // this daemon — bin/hivemind's cmd_open `exec`s claude in the terminal, so
 // child.on('exit') does not apply. Instead, poll process.kill(pid, 0) every

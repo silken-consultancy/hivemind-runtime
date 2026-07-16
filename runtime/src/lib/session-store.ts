@@ -1,20 +1,18 @@
 // session-store.ts — persistent mirror of the in-memory session store.
 //
-// Port of services/agent-runtime/src/lib/session-store.ts (Fase 2, DR-2.2,
-// docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md). Mechanics
-// are unchanged — only the path moves under ~/.engram (this product's own
-// hidden dir, isolated from the lab's ~/.fos, same isolation bin/hivemind
+// The store lives under ~/.engram (this product's own
+// hidden dir, same isolation bin/hivemind
 // already keeps for pid/log/cert files).
 //
-// MODEL DIFFERENCE vs the lab (load-bearing, not cosmetic): under
-// revive-on-return (DR-2.3), this file is NEVER the primary source that
+// MODEL (load-bearing, not cosmetic): under
+// revive-on-return, this file is NEVER the primary source that
 // decides whether a session survives a daemon restart — the backend
 // (`fos_session(action:list_active)`) is. This JSON is only a boot-degrade
 // fallback for the rare case the backend is unreachable at startup, plus a
 // best-effort snapshot written on every adopt/shutdown so that fallback has
 // something recent to read.
 //
-// Design invariants (unchanged from the lab):
+// Design invariants:
 //   - The JSON file is NEVER the source of truth — it is a snapshot of the Map.
 //   - Writes are atomic (tmp + rename) to avoid corrupt reads after a crash mid-write.
 //   - load() is best-effort: never throws, returns [] on any error.

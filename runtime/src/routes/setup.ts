@@ -1,11 +1,10 @@
 // routes/setup.ts — first-login mTLS enrollment popup.
 //
-// Enrollment is KEY-AS-BOOTSTRAP (Fase 4-rev, founder 2026-07-11): a per-user
-// api_key is provisioned admin-side BEFORE enrollment (see the manual
-// provisioning steps in the kernel memory); the popup submits it to /ca/issue,
+// Enrollment is KEY-AS-BOOTSTRAP: a per-user
+// api_key is provisioned admin-side BEFORE enrollment; the popup submits it to
+// /ca/issue,
 // which VALIDATES it and mints an mTLS cert. enrollment_token is RETIRED.
-// Contract CONFIRMED against the real ca.controller.ts (ENROLLMENT branch,
-// engram/apps/auth-service/src/ca/ca.controller.ts):
+// Contract CONFIRMED against the real enrollment endpoint:
 //
 //   Request:  POST /ca/issue  body: { csr: string, api_key: string, days?: number }
 //   Response: { cert: string, serial: string, token: string, ca_cert_pem: string }
@@ -173,7 +172,7 @@ setupRouter.post('/enroll', async (c) => {
   }
 
   const hivemindHome = process.env.HIVEMIND_HOME ?? join(homedir(), '.hivemind');
-  // Isolated from the lab's own ~/.fos/mtls — see bin/hivemind's CERT_DIR
+  // See bin/hivemind's CERT_DIR
   // (must stay in sync; this is where the CLI reads the cert from).
   const mtlsDir = join(homedir(), '.engram', 'mtls');
 
@@ -221,8 +220,8 @@ setupRouter.post('/enroll', async (c) => {
     let caRes: Response;
     try {
       // No client cert here — /ca/issue validates the pre-provisioned api_key
-      // (key-as-bootstrap, Fase 4-rev). Body shape matches issueBodySchema in
-      // ca.controller.ts: { csr, api_key }. The api_key RESOLVES the tenant
+      // (key-as-bootstrap). Body shape per the enrollment
+      // contract: { csr, api_key }. The api_key RESOLVES the tenant
       // server-side (cert CN = the key's tenant) — enrollment_token is RETIRED,
       // no client-asserted tenant.
       caRes = await fetch(caUrl, {

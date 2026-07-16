@@ -1,6 +1,6 @@
-// setup.contract.test.ts — proves the /ca/issue contract fix (P0, hivemind-runtime
-// refinement plan, item 1.3): client request body + response destructure match the
-// REAL server (engram apps/auth-service/src/ca/ca.controller.ts ENROLLMENT branch),
+// setup.contract.test.ts — proves the /ca/issue contract fix:
+// client request body + response destructure match the
+// REAL server's enrollment contract,
 // not the old/never-existed { token, csr_pem } / { cert_pem, ca_cert_pem } shape.
 //
 // SANDBOX SAFETY: setup.ts derives the mTLS material path from `homedir()` (node:os),

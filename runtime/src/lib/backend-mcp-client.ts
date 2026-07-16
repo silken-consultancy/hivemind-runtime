@@ -1,8 +1,7 @@
 // backend-mcp-client.ts — direct mTLS JSON-RPC client to the engram backend.
 //
-// New in Fase 2 (DR-2.2, docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md).
 // Every piece of daemon-initiated backend traffic (heartbeat, pause/resume,
-// list_active reconcile — this phase; lifecycle events — Fase 4) goes
+// list_active reconcile, lifecycle events) goes
 // through this single helper.
 //
 // Deliberately targets the upstream DIRECTLY via mTLS (mtlsCredentials()'s
@@ -98,7 +97,7 @@ export async function callMcpTool<T = unknown>(
       console.warn(`[backend-mcp-client] ${tool}: tool error:`, envelope.error);
       return undefined;
     }
-    // Per mcp.service.ts convention: content:[{type:'text', text:JSON.stringify(result)}]
+    // Per the MCP tool-result convention: content:[{type:'text', text:JSON.stringify(result)}]
     // — a second JSON.parse hop unwraps the tool's own payload.
     const innerText = envelope.result?.content?.[0]?.text;
     if (typeof innerText !== 'string') return undefined;

@@ -29,10 +29,9 @@ HIVEMIND_VERSION="0.1.0"
 HIVEMIND_HOME="${HIVEMIND_HOME:-$HOME/.hivemind}"
 RUNTIME_PORT="${AR_PORT:-7777}"
 PROXY_PORT="${MTLS_PROXY_PORT:-7779}"
-# Product state lives under ~/.engram — a dedicated, hidden dir, fully
-# isolated from the lab's own ~/.fos (which the lab's own agent-runtime/CLI
-# uses). Zero shared footprint: a machine with both the lab and this product
-# installed must never collide on cert material or cache/pid files.
+# Product state lives under ~/.engram — a dedicated, hidden dir with zero
+# shared footprint: other tooling on the same machine must never collide
+# with this product on cert material or cache/pid files.
 RUNTIME_LOG="${HOME}/.engram/cache/hivemind-runtime.log"
 RUNTIME_PID_FILE="${HOME}/.engram/cache/hivemind-runtime.pid"
 # Leftover-session pidfile from an interrupted --setup-only run (see _setup_mode
@@ -483,8 +482,7 @@ cmd_stop() {
         kill "${_pid}"
         # DR-3.2: wait (bounded) for the daemon to actually exit, escalating
         # to SIGKILL if it doesn't — mirrors _reap_stale_runtime's own
-        # wait+escalate (:286-293) and the lab precedent
-        # (bin/fos-agent-runtime:90-116). Without this, `cmd_stop` used to
+        # wait+escalate (:286-293). Without this, `cmd_stop` used to
         # return the instant the signal was SENT, not once the process was
         # actually gone — cmd_update's mid-swap cmd_stop (:700) could then
         # race on to the mv/rename of $HIVEMIND_HOME while the old process
@@ -533,9 +531,9 @@ cmd_restart() {
 
 # ── Update mechanism (item 4.4) ───────────────────────────────────────────────
 # Pull-agent for the thin client: bin/hivemind + runtime/src/* ONLY — prompts/
-# seeds are never touched here (they live server-side since the Fase 1 stub).
-# Hardened per OPEN-6 (silent auto-pull): pinned source, integrity check,
-# staged+atomic swap, last-known-good rollback. See docs/wip plan, item 13.
+# seeds are never touched here (they live server-side).
+# Hardened (silent auto-pull): pinned source, integrity check,
+# staged+atomic swap, last-known-good rollback.
 
 # _verify_commit_integrity: 0 = trusted, 1 = refuse to apply.
 # Two paths, either sufficient: (a) valid GPG signature via `git verify-commit`
@@ -795,16 +793,14 @@ _maybe_auto_update() {
 }
 
 # ── Session spine (WS-0.3, P0.1) ──────────────────────────────────────────────
-# Opens a real fos_session BEFORE exec'ing claude — lab-faithful (mirrors
-# silken-runtime's own pre-exec session registration), but through the
+# Opens a real fos_session BEFORE exec'ing claude, through the
 # product's MCP tool surface (fos_session/fos_registry over the local mTLS
-# proxy) instead of a local agent-runtime endpoint, which this product has
-# none of.
+# proxy).
 
-# _resolve_device_id: stable device_id for this machine — analogous to
-# ~/.fos/device.id in the lab. Created once (first run), reused thereafter.
+# _resolve_device_id: stable device_id for this machine.
+# Created once (first run), reused thereafter.
 #
-# Fase 6 (docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md):
+# Fase 6:
 #
 # DR-6.1 — `~/.engram/device-id` lives OUTSIDE ${HIVEMIND_HOME} (see the
 # ~/.engram-vs-~/.hivemind isolation note at :25-28). Measured: `cmd_update`
@@ -918,8 +914,8 @@ _cert_fingerprint_sha256() {
 # unconditional on the pipeline regardless of which stage would otherwise
 # fail. The proxy forwards EVERY local path to the single fixed upstream it's
 # built for (mtls-proxy.ts: cfg.upstream, incoming path ignored) — /v1/mcp
-# here is for readability/parity with the direct (non-proxied) curl pattern
-# used elsewhere (ops/rls-scratch-test.sh), not a routing requirement.
+# here is for readability/parity with the upstream URL shape, not a routing
+# requirement.
 _mcp_call() {
   local _tool="$1" _args_json="$2" _id="$3"
   curl -s --max-time 5 \
@@ -933,7 +929,7 @@ _mcp_call() {
 
 # _mcp_result_field: extract one field from an MCP tool result. Two
 # JSON.parse hops — the outer JSON-RPC envelope, then result.content[0].text
-# (the tool's own JSON payload, per mcp.service.ts convention:
+# (the tool's own JSON payload, per the MCP tool-result convention:
 # content:[{type:'text', text:JSON.stringify(result)}]). Uses bun — already a
 # hard dependency of this script (checked in _start_proxy) — no new
 # dependency introduced. Prints nothing on any parse failure.
@@ -1006,8 +1002,8 @@ _open_session_spine() {
 }
 
 # ── Slug selection (F2.2 / F3) ────────────────────────────────────────────────
-# The registry is owner-scoped SERVER-SIDE (registry.service.ts: every read is
-# `[redacted]`), so `fos_registry(action:list)` already returns
+# The registry is owner-scoped SERVER-SIDE (every read is scoped to the owner
+# derived from your certificate), so `fos_registry(action:list)` already returns
 # ONLY this owner's slugs — the client never filters by owner and cannot see
 # another's. Response envelope: {items:[{slug,name,status,...}], count}.
 
@@ -1226,9 +1222,9 @@ _pick_project() {
 # on success; leaves it empty + returns non-zero on decline/empty input.
 # $1 = slug from an explicit `hivemind <slug>` arg ("" when none was given).
 #
-# ARCHITECTURAL NOTE (registered, not resolved here — Frente 2, out of scope):
-# creating a slug is a MUTATION. This is currently the ONLY slug-create surface
-# outside 4tuenyOS's agent-driven flow. If the Project Hub ever grows a create
+# ARCHITECTURAL NOTE (registered, not resolved here — out of scope):
+# creating a slug is a MUTATION. This is currently the ONLY client-side
+# slug-create surface. If the Project Hub ever grows a create
 # button, it MUST converge on this SAME fos_registry(action:upsert) call — not
 # a second, divergent create path.
 _bootstrap_first_slug() {
@@ -1453,8 +1449,8 @@ cmd_open() {
   # login is skipped/cancelled/times out, we still proceed to `exec` (the
   # interactive session will show its own auth prompt if needed) — never abort
   # the whole command over auth. NOTE (P2, out of scope for this pass): this
-  # only covers ABSENCE, not an EXPIRED-but-present credential — see
-  # docs/wip/hivemind-runtime-refinement-and-provisioning.md item 5.0 OPEN.
+  # only covers ABSENCE, not an EXPIRED-but-present credential — known
+  # limitation.
   if [ ! -f "${HIVEMIND_HOME}/.claude/.credentials.json" ]; then
     echo ""
     echo "Nenhuma credencial encontrada no runtime isolado do HiveMind — fazendo login..."

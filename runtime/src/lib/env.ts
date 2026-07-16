@@ -2,8 +2,8 @@
 // Loads from $HIVEMIND_HOME/.env before zod parse — makes the service self-sufficient
 // when started directly (bun src/server.ts) rather than via the bash wrapper.
 //
-// KEY CHANGE vs fos-agent-runtime: default home is HIVEMIND_HOME ($HOME/.hivemind),
-// NOT FOS_ROOT (/home/user/projetos/4tuenyOS). FOS_ROOT kept as fallback only.
+// Default home is HIVEMIND_HOME ($HOME/.hivemind).
+// FOS_ROOT kept as fallback only.
 
 import { z } from 'zod';
 import { existsSync, readFileSync } from 'node:fs';
@@ -60,8 +60,7 @@ const schema = z.object({
   // wrapper) simply runs without it rather than failing to boot.
   HIVEMIND_DEVICE_ID: z.string().optional(),
 
-  // Bearer for backend MCP calls over the direct mTLS upstream (Fase 2,
-  // DR-2.2, docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md) —
+  // Bearer for backend MCP calls over the direct mTLS upstream —
   // heartbeat/pause/resume/list_active (backend-mcp-client.ts) all send this
   // as the x-fos-key header. Written into $HIVEMIND_HOME/.env by setup.ts
   // (enrollment) and exported into the daemon's environment by bin/hivemind's
@@ -148,11 +147,11 @@ export function mtlsProxyConfig(): {
 }
 
 // ─── mtlsCredentials ──────────────────────────────────────────────────────────
-// Cert/key/ca + upstream for DIRECT daemon→backend calls (backend-mcp-client.ts,
-// Fase 2) — deliberately NOT gated on MTLS_PROXY_PORT the way mtlsProxyConfig()
+// Cert/key/ca + upstream for DIRECT daemon→backend calls (backend-mcp-client.ts)
+// — deliberately NOT gated on MTLS_PROXY_PORT the way mtlsProxyConfig()
 // is. MTLS_PROXY_PORT is a precondition for the LOCAL PROXY LISTENER only; it
 // says nothing about whether this process can itself reach the backend over
-// mTLS. Fase-2 review (docs/wip/hivemind-runtime-lifecycle-daemon-reconcile-port.md)
+// mTLS. Review
 // measured live that reusing mtlsProxyConfig() here silently no-op'd every
 // daemon→backend call (heartbeat/reconcile/pause/resume) whenever
 // MTLS_PROXY_PORT was unset, even with a perfectly valid cert/key/ca/upstream
