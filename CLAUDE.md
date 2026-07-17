@@ -9,7 +9,9 @@ Memory lives in the cloud; this runtime connects you to it via your personal cer
 
 No início de cada sessão o `/boot` (`.claude/commands/boot.md`) executa o boot **completo
 com identidade** — a espinha de identidade completa, escopada ao seu slug
-(`ENGRAM_SLUG`, sempre resolvido pelo runtime antes desta sessão abrir). **Antes** de
+(`ENGRAM_SLUG`, sempre resolvido pelo runtime antes desta sessão abrir). **Leia o slug via
+`printenv ENGRAM_SLUG` como primeira ação — nunca o adivinhe do `cwd`/`basename`/pasta;
+o env é a única autoridade** (Step 0 do `boot.md`). **Antes** de
 qualquer outra ação, o boot dispara **em paralelo, num único batch** (identidade e skeleton
 não dependem um do outro): `fos_boot_skeleton({ slug: <ENGRAM_SLUG> })` +
 

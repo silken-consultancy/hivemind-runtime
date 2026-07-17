@@ -16,8 +16,10 @@ anterior).
 
 `ENGRAM_SLUG` está **sempre resolvido** antes desta sessão abrir — o runtime
 (`hivemind`) seleciona/cria o slug e o exporta ao ambiente ANTES do `exec claude`.
-Não há detecção de regime aqui (sem Step 0), nem lente-agente por diretório `agents/`
-(sem Step 2): o boot roda sempre o caminho completo, com o slug já dado.
+Não há Step 0 de **regime** aqui (só há um regime — sem os três ramos do lab), nem
+lente-agente por diretório `agents/` (sem Step 2). **MAS há um Step 0 de leitura-do-env,
+obrigatório** (abaixo): o slug vem do env `ENGRAM_SLUG`, nunca de adivinhação — lê-se o
+env como primeira ação e roda-se sempre o caminho completo, escopado a esse slug.
 
 ## Pre-flight: load MCP tools
 
@@ -34,6 +36,28 @@ Não pule este passo — sem os schemas os tools não estão disponíveis.
 passos abaixo são determinísticos (`fos_recall` só em `mode:exact`/`mode:topic`,
 skeleton, project_state, inbox). Qualquer uso de `mode:"semantic"` no `/boot` é violação
 de INV-5.
+
+## Step 0 — Ler o slug do env (DETERMINÍSTICO — primeira ação)
+
+Antes de qualquer tool-call, leia o env explicitamente como **primeira ação**:
+
+```
+printenv ENGRAM_SLUG ENGRAM_SESSION_ID
+```
+
+O valor de `ENGRAM_SLUG` é **O slug** — use-o em TODAS as calls `{ slug: ... }` abaixo
+(`fos_boot_skeleton`, `fos_project_state_get`, `fos_inbox`). É o `<ENGRAM_SLUG>` dos
+blocos seguintes.
+
+- **NUNCA infira o slug do diretório de trabalho, do `cwd`, do `basename` da pasta, do
+  nome do repositório, da conversa, ou de qualquer heurística — `ENGRAM_SLUG` do env é a
+  ÚNICA autoridade.** O runtime (`hivemind`) já resolveu o slug (arg explícito ou seleção
+  no picker) e o exportou; sua tarefa é LER esse valor, não redescobri-lo.
+- **Fail-closed:** se `ENGRAM_SLUG` estiver **vazio ou ausente**, **PARE e reporte um
+  erro** — não fabrique um slug a partir do nome da pasta. O runtime SEMPRE resolve e
+  exporta o slug antes do `exec claude`; ausência = **bug do runtime a reportar**, não
+  algo a contornar adivinhando. (Uma pasta-pai como `projetos` — o container de todos os
+  projetos — virar "slug" é exatamente o sintoma desse furo, nunca um resultado válido.)
 
 ## 1. Layer 1 + memórias de identidade (DETERMINÍSTICO — paralelo)
 
@@ -250,9 +274,12 @@ Termine perguntando no que trabalhar nesta sessão.
 - **Tudo determinístico:** skeleton + `fos_recall({ mode:"exact"|"topic" })` +
   `fos_project_state_get` + `fos_inbox` + `fos_session({action:"state"})`. **NUNCA**
   `fos_recall({ mode:"semantic" })` para identidade, regras, WIP ou estado — INV-5.
-- **Sem Step 0 (regime) e sem Step 2 (lente-agente):** `ENGRAM_SLUG` está sempre resolvido
-  antes do boot (o runtime seleciona o slug antes do `exec claude`); e o produto não ship a
-  um diretório `agents/`. O boot roda sempre o caminho completo, escopado ao slug.
+- **Sem Step 0 de REGIME (só há um regime) e sem Step 2 (lente-agente):** o produto não
+  tem os três ramos de regime do lab nem um diretório `agents/`. **MAS o Step 0 de
+  leitura-do-env é obrigatório** — o slug vem SEMPRE de `printenv ENGRAM_SLUG` (o runtime
+  seleciona e exporta o slug antes do `exec claude`), NUNCA de `cwd`/`basename`/adivinhação;
+  ausência de `ENGRAM_SLUG` = erro a reportar, não a contornar. O boot roda sempre o
+  caminho completo, escopado a esse slug.
 - **Planes vazios são normais:** `os-kernel/*` (e potencialmente `tenant/*`) com `count:0`
   para um owner que nunca os teve semeados é o comportamento CORRETO (owner-scoping enforced
   no servidor) —
