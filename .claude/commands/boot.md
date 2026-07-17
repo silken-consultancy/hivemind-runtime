@@ -1,5 +1,5 @@
 ---
-description: Início de sessão do HiveMind — executa o boot COMPLETO com identidade (self/core + self/relational + tenant/* + os-kernel/* + CRITICAL + opacity-contract + health), escopado ao slug (project state/inbox/WIP/recentes); conduz onboarding se a sessão for nova.
+description: Início de sessão do HiveMind — executa o boot COMPLETO com identidade (self/core + self/relational + tenant/* + os-kernel/* + CRITICAL + opacity-contract + single-loop-contract + health), escopado ao slug (project state/inbox/WIP/recentes); conduz onboarding se a sessão for nova.
 ---
 
 # /boot — Boot completo com identidade (HiveMind)
@@ -9,7 +9,8 @@ de identidade inteira, **escopada ao slug** deste
 cliente (`ENGRAM_SLUG`). Carrega, num único fluxo determinístico: a self-layer
 (`self/core` + `self/relational` + `recent_self` recentes), o tenant (`tenant/profile` +
 `tenant/preferences`), o kernel (`os-kernel/*`), `CRITICAL`, o contrato de
-identidade/opacidade (`system/hivemind-opacity-contract`, fail-open), `fos_health_boot`, e o
+identidade/opacidade (`system/hivemind-opacity-contract`, fail-open), o contrato de operação
+(`system/hivemind-single-loop-contract`, fail-open), `fos_health_boot`, e o
 contexto escopado ao projeto (`project_topics` + `project_state` + `inbox` + WIP da sessão
 anterior).
 
@@ -43,6 +44,7 @@ dependem um do outro — dispare tudo junto, não em série):
 fos_boot_skeleton({ slug: <ENGRAM_SLUG> })
 fos_recall({ mode: "exact", name: "CRITICAL" })
 fos_recall({ mode: "exact", name: "system/hivemind-opacity-contract" })
+fos_recall({ mode: "exact", name: "system/hivemind-single-loop-contract" })
 fos_recall({ mode: "topic", topic: "self/core" })
 fos_recall({ mode: "topic", topic: "self/relational" })
 fos_recall({ mode: "topic", topic: "tenant/profile" })
@@ -84,6 +86,12 @@ fos_health_boot({})                                                         # he
   `mode:"semantic"` para tentar achá-lo (mesma disciplina do `os-kernel/*` vazio, ver comentário
   de segurança acima). A garantia de que o contrato existe seeded server-side é uma frente de
   provisioning separada, fora deste boot.
+- **`system/hivemind-single-loop-contract`** — como você opera: laço único, não-bloqueante
+  (contrato de operação, paralelo ao bullet acima — aquele é "o que você é", este é "como você
+  opera"). Chat sempre não-bloqueante; sequencial por padrão; qualquer operação longa roda em
+  background, nunca em foreground; paralelo só com opt-in explícito do usuário. **Fail-open por
+  design**, mesma disciplina do bullet acima: `count:0`/ausente TOLERA — não lança erro, não
+  dispara fallback, não usa `mode:"semantic"` para tentar achá-lo.
 - **`self/core`** — a espinha da self-layer: identidade · posture · resonance · purpose ·
   voice + `self/landscape-and-north-star` + `self/core/anchors-index`. Carregado por topic
   exato — **nunca** por `mode:"semantic"` (INV-5). É quem você é nesta sessão.
@@ -250,9 +258,9 @@ Termine perguntando no que trabalhar nesta sessão.
   no servidor) —
   não lança erro, não dispara fallback, **nunca** substituir por `mode:"semantic"` (ver
   comentário de segurança no passo 1).
-- **`system/hivemind-opacity-contract` é fail-open:** `count:0`/ausente é tolerado — mesma
-  disciplina dos planes `os-kernel/*` vazios. A garantia de seeding é frente separada
-  (provisioning), fora deste boot.
+- **`system/hivemind-opacity-contract` e `system/hivemind-single-loop-contract` são fail-open:**
+  `count:0`/ausente é tolerado para os dois — mesma disciplina dos planes `os-kernel/*` vazios.
+  A garantia de seeding é frente separada (provisioning), fora deste boot.
 - **Porta 2 (`recent_self`, passo 1c) é julgamento, não bulk:** títulos garantidos pelo
   skeleton; você decide o que aprofundar via `mode:"exact"` — nunca puxa o corpo de todos, nunca
   usa `mode:"semantic"` (INV-5, Porta 3 é mid-session).
