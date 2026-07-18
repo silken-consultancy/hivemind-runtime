@@ -219,7 +219,7 @@ _setup_mode() {
     echo "(Could not auto-open browser — open manually: ${_SETUP_URL})"
   fi
 
-  echo "Fill in your Enrollment Token and Owner ID, then click 'Configure mTLS'."
+  echo "Fill in your API Key and Owner ID, then click 'Configure mTLS'."
   echo "Waiting for enrollment to complete (timeout: 5 min)..."
 
   # Poll /setup/status until done (timeout 300s / 5 min).
@@ -690,8 +690,8 @@ cmd_update() {
     return 0
   fi
 
-  if ! git -C "${HIVEMIND_SOURCE_DIR}" merge --ff-only "origin/${_branch}" > /dev/null 2>&1; then
-    echo "Error: local clone diverged from ${_branch} (not fast-forward) — resolve manually." >&2
+  if ! git -C "${HIVEMIND_SOURCE_DIR}" reset --hard "origin/${_branch}" > /dev/null 2>&1; then
+    echo "Error: could not reset clone to origin/${_branch} — resolve manually." >&2
     exit 1
   fi
 

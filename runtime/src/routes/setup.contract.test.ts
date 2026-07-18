@@ -26,7 +26,6 @@ process.env.HIVEMIND_ENDPOINT = 'ca-test.invalid:4443';
 
 const FAKE_CA_CERT_PEM = '-----BEGIN CERTIFICATE-----\nFAKE-CA-CERT\n-----END CERTIFICATE-----\n';
 const FAKE_CLIENT_CERT_PEM = '-----BEGIN CERTIFICATE-----\nFAKE-CLIENT-CERT\n-----END CERTIFICATE-----\n';
-const PLAINTEXT_TOKEN = 'plaintext-enrollment-token-xyz';
 const OWNER_ID = 'contract-test-owner';
 const API_KEY = 'test-api-key-1234567890';
 
@@ -64,24 +63,25 @@ afterAll(() => {
   rmSync(testHome, { recursive: true, force: true });
 });
 
-test('POST /enroll sends the REAL server request shape: { tenant, enrollment_token, csr }', async () => {
+test('POST /enroll sends the REAL server request shape: { csr, api_key }', async () => {
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: PLAINTEXT_TOKEN, owner_id: OWNER_ID, api_key: API_KEY }),
+    body: JSON.stringify({ owner_id: OWNER_ID, api_key: API_KEY }),
   });
 
   const data = (await res.json()) as { ok: boolean; owner_id?: string; message?: string };
   expect(data.ok).toBe(true);
   expect(data.owner_id).toBe(OWNER_ID);
 
-  // Contract fix under test: NOT { token, csr_pem } (the old/never-real shape).
+  // Contract under test: key-as-bootstrap. enrollment_token is RETIRED — the
+  // api_key resolves the tenant server-side (cert CN = the key's tenant), so the
+  // body carries NO `tenant` and NO `enrollment_token`, only { csr, api_key }.
   // Enrollment goes over 443/LE — the host WITHOUT the :4443 MCP port (see ENROLL_HOST in setup.ts).
   expect(capturedUrl).toBe(`https://${process.env.HIVEMIND_ENDPOINT!.split(':')[0]}/ca/issue`);
   expect(capturedBody).toEqual({
-    tenant: OWNER_ID,
-    enrollment_token: PLAINTEXT_TOKEN,
     csr: expect.any(String),
+    api_key: API_KEY,
   });
   expect((capturedBody as { csr: string }).csr).toContain('BEGIN CERTIFICATE REQUEST');
 });
