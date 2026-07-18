@@ -162,6 +162,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node __HIVEMIND_HOME__/.claude/hooks/post-tool-use.dispatch-nudge.js"
+          }
+        ]
+      }
     ]
   },
   "statusLine": {
