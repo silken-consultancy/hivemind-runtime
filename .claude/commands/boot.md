@@ -1,298 +1,272 @@
 ---
-description: Início de sessão do HiveMind — executa o boot COMPLETO com identidade (self/core + self/relational + tenant/* + os-kernel/* + CRITICAL + opacity-contract + single-loop-contract + health), escopado ao slug (project state/inbox/WIP/recentes); conduz onboarding se a sessão for nova.
+description: HiveMind session start — runs the FULL boot with identity (self/core + self/relational + tenant/* + served contracts), scoped to the slug (project state/inbox/WIP/recents); conducts onboarding if the session is new.
 ---
 
-# /boot — Boot completo com identidade (HiveMind)
+# /boot — Full boot with identity (HiveMind)
 
-Comando de início de sessão do **runtime do produto**. É o boot COMPLETO — a espinha
-de identidade inteira, **escopada ao slug** deste
-cliente (`ENGRAM_SLUG`). Carrega, num único fluxo determinístico: a self-layer
-(`self/core` + `self/relational` + `recent_self` recentes), o tenant (`tenant/profile` +
-`tenant/preferences`), o kernel (`os-kernel/*`), `CRITICAL`, o contrato de
-identidade/opacidade (`system/hivemind-opacity-contract`, fail-open), o contrato de operação
-(`system/hivemind-single-loop-contract`, fail-open), `fos_health_boot`, e o
-contexto escopado ao projeto (`project_topics` + `project_state` + `inbox` + WIP da sessão
-anterior).
+Session-start command for the **product runtime**. It is the FULL boot — the entire
+identity spine, **scoped to this client's slug** (`ENGRAM_SLUG`). It loads, in a single
+deterministic flow: the self-layer
+(`self/core` + `self/relational` + recent `recent_self`), the tenant (`tenant/profile` +
+`tenant/preferences`), the **contracts served to the tenant** (`fos_served_contracts` — the
+plan-filtered set of operating rules that engram serves for this owner), and the
+project-scoped context (`project_topics` + `project_state` + `inbox` + WIP from the previous
+session).
 
-`ENGRAM_SLUG` está **sempre resolvido** antes desta sessão abrir — o runtime
-(`hivemind`) seleciona/cria o slug e o exporta ao ambiente ANTES do `exec claude`.
-Não há Step 0 de **regime** aqui (só há um regime — sem os três ramos do lab), nem
-lente-agente por diretório `agents/` (sem Step 2). **MAS há um Step 0 de leitura-do-env,
-obrigatório** (abaixo): o slug vem do env `ENGRAM_SLUG`, nunca de adivinhação — lê-se o
-env como primeira ação e roda-se sempre o caminho completo, escopado a esse slug.
+`ENGRAM_SLUG` is **always resolved** before this session opens — the runtime
+(`hivemind`) selects/creates the slug and exports it to the environment BEFORE `exec claude`.
+There is no **regime** Step 0 here (there is only one regime — none of the lab's three
+branches), nor an agent-lens by `agents/` directory (no Step 2). **BUT there is a mandatory
+env-read Step 0** (below): the slug comes from the `ENGRAM_SLUG` env, never from guessing — read
+the env as the first action and always run the full path, scoped to that slug.
 
 ## Pre-flight: load MCP tools
 
-Antes de qualquer passo, carregue os schemas dos tools do boot:
+Before any step, load the schemas of the boot tools:
 
 ```
-ToolSearch({ query: "select:mcp__engram__fos_boot_skeleton,mcp__engram__fos_recall,mcp__engram__fos_project_state_get,mcp__engram__fos_session,mcp__engram__fos_inbox,mcp__engram__fos_health_boot" })
+ToolSearch({ query: "select:mcp__engram__fos_boot_skeleton,mcp__engram__fos_recall,mcp__engram__fos_served_contracts,mcp__engram__fos_project_state_get,mcp__engram__fos_session,mcp__engram__fos_inbox,mcp__engram__fos_health_boot" })
 ```
 
-Não pule este passo — sem os schemas os tools não estão disponíveis.
+Do not skip this step — without the schemas the tools are not available.
 
-**INV-5 (enforced aqui):** `fos_recall({ mode: "semantic" })` **NUNCA**
-é o caminho de boot para identidade, regras, WIP de sessão ou qualquer estado. Todos os
-passos abaixo são determinísticos (`fos_recall` só em `mode:exact`/`mode:topic`,
-skeleton, project_state, inbox). Qualquer uso de `mode:"semantic"` no `/boot` é violação
-de INV-5.
+**INV-5 (enforced here):** `fos_recall({ mode: "semantic" })` is **NEVER**
+the boot path for identity, rules, session WIP, or any state. All the
+steps below are deterministic (`fos_recall` only in `mode:exact`/`mode:topic`,
+skeleton, project_state, inbox). Any use of `mode:"semantic"` in `/boot` is a violation
+of INV-5.
 
-## Step 0 — Ler o slug do env (DETERMINÍSTICO — primeira ação)
+## Step 0 — Read the slug from the env (DETERMINISTIC — first action)
 
-Antes de qualquer tool-call, leia o env explicitamente como **primeira ação**:
+Before any tool-call, read the env explicitly as the **first action**:
 
 ```
 printenv ENGRAM_SLUG ENGRAM_SESSION_ID
 ```
 
-O valor de `ENGRAM_SLUG` é **O slug** — use-o em TODAS as calls `{ slug: ... }` abaixo
-(`fos_boot_skeleton`, `fos_project_state_get`, `fos_inbox`). É o `<ENGRAM_SLUG>` dos
-blocos seguintes.
+The value of `ENGRAM_SLUG` is **THE slug** — use it in ALL the `{ slug: ... }` calls below
+(`fos_boot_skeleton`, `fos_project_state_get`, `fos_inbox`). It is the `<ENGRAM_SLUG>` of the
+following blocks.
 
-- **NUNCA infira o slug do diretório de trabalho, do `cwd`, do `basename` da pasta, do
-  nome do repositório, da conversa, ou de qualquer heurística — `ENGRAM_SLUG` do env é a
-  ÚNICA autoridade.** O runtime (`hivemind`) já resolveu o slug (arg explícito ou seleção
-  no picker) e o exportou; sua tarefa é LER esse valor, não redescobri-lo.
-- **Fail-closed:** se `ENGRAM_SLUG` estiver **vazio ou ausente**, **PARE e reporte um
-  erro** — não fabrique um slug a partir do nome da pasta. O runtime SEMPRE resolve e
-  exporta o slug antes do `exec claude`; ausência = **bug do runtime a reportar**, não
-  algo a contornar adivinhando. (Uma pasta-pai como `projetos` — o container de todos os
-  projetos — virar "slug" é exatamente o sintoma desse furo, nunca um resultado válido.)
+- **NEVER infer the slug from the working directory, the `cwd`, the folder `basename`, the
+  repository name, the conversation, or any heuristic — the `ENGRAM_SLUG` env is the
+  ONLY authority.** The runtime (`hivemind`) has already resolved the slug (explicit arg or
+  picker selection) and exported it; your task is to READ that value, not rediscover it.
+- **Fail-closed:** if `ENGRAM_SLUG` is **empty or absent**, **STOP and report an
+  error** — do not fabricate a slug from the folder name. The runtime ALWAYS resolves and
+  exports the slug before `exec claude`; absence = **a runtime bug to report**, not
+  something to work around by guessing. (A parent folder like `projetos` — the container of all
+  projects — becoming a "slug" is exactly the symptom of that hole, never a valid
+  result.)
 
-## 1. Layer 1 + memórias de identidade (DETERMINÍSTICO — paralelo)
+## 1. Layer 1 + identity memories (DETERMINISTIC — parallel)
 
-Dispare **em paralelo, num único batch** (o skeleton e as memórias de identidade não
-dependem um do outro — dispare tudo junto, não em série):
+Fire **in parallel, in a single batch** (the skeleton and the identity memories do not
+depend on each other — fire them all together, not serially):
 
 ```
 fos_boot_skeleton({ slug: <ENGRAM_SLUG> })
-fos_recall({ mode: "exact", name: "CRITICAL" })
-fos_recall({ mode: "exact", name: "system/hivemind-opacity-contract" })
-fos_recall({ mode: "exact", name: "system/hivemind-single-loop-contract" })
+fos_served_contracts({})
 fos_recall({ mode: "topic", topic: "self/core" })
 fos_recall({ mode: "topic", topic: "self/relational" })
 fos_recall({ mode: "topic", topic: "tenant/profile" })
 fos_recall({ mode: "topic", topic: "tenant/preferences" })
-fos_recall({ mode: "topic", topic: "os-kernel/critical" })
-fos_recall({ mode: "topic", topic: "os-kernel/decisions", shape: "pointers",
-              order_by: "hot", hot_weights: { access: 7, recency: 1 } })
-fos_recall({ mode: "topic", topic: "os-kernel/feedback", shape: "pointers",
-              order_by: "hot", hot_weights: { access: 1, recency: 2 } })
-fos_recall({ mode: "topic", topic: "os-kernel/reinforcement", shape: "pointers",
-              order_by: "hot", hot_weights: { access: 1, recency: 1 } })
-fos_recall({ mode: "topic", topic: "os-kernel/frameworks" })
-fos_recall({ mode: "topic", topic: "os-kernel/architecture" })
-fos_recall({ mode: "topic", topic: "os-kernel/strategy" })
-fos_recall({ mode: "topic", topic: "os-kernel/rules-misc" })
-fos_recall({ mode: "topic", topic: "os-kernel/posture" })
-fos_health_boot({})                                                         # health-preflight: probe honesto (embeddings/fila de indexação/sessões órfãs) — INV-5-safe, non-blocking; skip silently if unavailable
+fos_health_boot({})                                                         # health-preflight: honest probe (embeddings/indexing queue/orphan sessions) — INV-5-safe, non-blocking; consumed internally only, never narrated to the user
 ```
 
-<!-- SEGURANÇA. Para um owner que nunca teve esses planes semeados, os tópicos
-     `os-kernel/*` (e potencialmente `tenant/*`) retornam count:0. Isso é ESPERADO e
-     SEGURO — toda leitura é escopada à sua identidade (o owner derivado do seu
-     certificado), sem exceção por plane, enforced no servidor; `count:0` é o resultado
-     CORRETO para quem não tem aquele conteúdo, NÃO um vazamento nem um bug. NUNCA
-     "conserte" um `count:0` legítimo com
-     fos_recall({mode:"semantic"}) — isso violaria INV-5. Planes vazios não
-     lançam erro e não disparam fallback: o boot segue normalmente. -->
-
-- **`fos_boot_skeleton`** — fonte determinística de estado, escopado ao slug: `registry`,
-  `sessions` (ativas), `planning`, `health`, `os_kernel_topics` (manifest), **`taxonomy`**
-  (a taxonomia viva — nunca assuma kind/edge-type/plane; consulte-a), e **`recent_sessions[]`**
-  (últimas sessões fechadas do slug, cada uma com `next_note` + `has_real_note`) — a fonte
-  do WIP da sessão anterior (passo 3). `project_topics[]` também vem no payload (passo 1b).
-- **`CRITICAL`** — invariantes não-negociáveis (singleton, `mode:exact`). Se o tópico
-  `os-kernel/critical` listar CRITICAL como header, descarte — o body já veio via `mode:exact`.
-- **`system/hivemind-opacity-contract`** — o que você é sobre este produto e o que dele você
-  revela ao usuário (identidade/opacidade). **Fail-open por design:** se vier `count:0`/ausente
-  (ex.: owner sem esse contrato seeded), TOLERA — não lança erro, não dispara fallback, não usa
-  `mode:"semantic"` para tentar achá-lo (mesma disciplina do `os-kernel/*` vazio, ver comentário
-  de segurança acima). A garantia de que o contrato existe seeded server-side é uma frente de
-  provisioning separada, fora deste boot.
-- **`system/hivemind-single-loop-contract`** — como você opera: laço único, não-bloqueante
-  (contrato de operação, paralelo ao bullet acima — aquele é "o que você é", este é "como você
-  opera"). Chat sempre não-bloqueante; sequencial por padrão; qualquer operação longa roda em
-  background, nunca em foreground; paralelo só com opt-in explícito do usuário. **Fail-open por
-  design**, mesma disciplina do bullet acima: `count:0`/ausente TOLERA — não lança erro, não
-  dispara fallback, não usa `mode:"semantic"` para tentar achá-lo.
-- **`self/core`** — a espinha da self-layer: identidade · posture · resonance · purpose ·
-  voice + `self/landscape-and-north-star` + `self/core/anchors-index`. Carregado por topic
-  exato — **nunca** por `mode:"semantic"` (INV-5). É quem você é nesta sessão.
-- **`self/relational`** — a calibração relacional com o usuário (como você É com ele).
-  Presente desde o boot, não é config JIT. O corpo de `self/lived`/`self/reflexive` NÃO
-  carrega upfront — só por nome (`mode:exact`) ou ressonância mid-session.
-- **`tenant/profile`** + **`tenant/preferences`** — quem o usuário é (stack, papel,
-  contexto) e como ele gosta de trabalhar (estilo, calibrações). Owner-scoped ao próprio
-  usuário.
-- **`os-kernel/*`** (critical · decisions · feedback · reinforcement · frameworks ·
-  architecture · strategy · rules-misc · posture) — invariantes e disciplinas operacionais
-  do OS. `decisions`/`feedback`/`reinforcement` vêm como **hot-pointers** (`shape:pointers`,
-  `order_by:hot`) com os `hot_weights` acima — pointers baratos (nome+hint); corpo frio é
-  JIT via `fos_recall({ mode:"exact", name:"..." })`. Pesos fixos do contrato de boot —
-  não reinventar. Ordem de raciocínio canônica: critical → decisions → frameworks →
-  rules-misc → tenant → feedback → reinforcement.
-- **`fos_health_boot`** — probe honesto de saúde no mesmo batch paralelo:
+- **`fos_boot_skeleton`** — deterministic source of state, scoped to the slug: `registry`,
+  `sessions` (active), `planning`, `health`, `os_kernel_topics` (manifest), **`taxonomy`**
+  (the live taxonomy — never assume kind/edge-type/plane; consult it), and **`recent_sessions[]`**
+  (the slug's last closed sessions, each with `next_note` + `has_real_note`) — the source
+  of the previous session's WIP (step 3). `project_topics[]` also comes in the payload (step 1b).
+- **`fos_served_contracts`** — the single source of the tenant's operating rules. It returns
+  the full **plan-filtered** set of contracts the engram serves for this owner (identity/opacity,
+  single-loop operation, write, self-write, and any others the plan entitles). **Load every
+  returned contract as this session's operating rules** — do not hardcode contract names, do not
+  assume which ones are present: the served set is the authority, and it varies by plan. If the
+  call returns an empty set or is unavailable, proceed (fail-open) — never fall back to
+  `mode:"semantic"` to hunt for a contract; provisioning of the served set is a separate front,
+  outside this boot.
+- **`self/core`** — the spine of the self-layer: identity · posture · resonance · purpose ·
+  voice + `self/landscape-and-north-star` + `self/core/anchors-index`. Loaded by exact
+  topic — **never** by `mode:"semantic"` (INV-5). It is who you are this session.
+- **`self/relational`** — the relational calibration with the user (how you ARE with them).
+  Present from boot, not JIT config. The body of `self/lived`/`self/reflexive` does NOT
+  load upfront — only by name (`mode:exact`) or mid-session resonance.
+- **`tenant/profile`** + **`tenant/preferences`** — who the user is (stack, role,
+  context) and how they like to work (style, calibrations). Owner-scoped to the user
+  themselves.
+- **`fos_health_boot`** — honest health probe in the same parallel batch:
   `ollama.reachable`, `embed_queue.dead_count`, `sessions.orphan`. **INV-5-safe**,
-  **non-blocking** — *skip silently if unavailable* (fail-open). Consumido no passo 5
-  (sufixo `⚠` da boot line). Nunca é gate de boot.
+  **non-blocking** — *skip silently if unavailable* (fail-open). **Consumed
+  internally only** — never narrated to the user (health internals do not leak into the output;
+  see the opacity guard in step 5). Never a boot gate.
 
-### 1b. project_topics (DETERMINÍSTICO — do skeleton)
+### 1b. project_topics (DETERMINISTIC — from the skeleton)
 
-O skeleton (passo 1) retorna `project_topics[]` — memórias `plane:project` do slug, já no
-payload (sem chamada extra). Shape por item: `{name, description, topic, kind}` (pointer).
-INV-5-safe (vem no skeleton, não é `mode:"semantic"`). Para o corpo completo de uma memória:
-`fos_recall({ mode:"exact", name:"..." })` JIT. Para o kind canônico,
-derive do prefixo do `name` via `kind_prefix_map`
-(taxonomy carregada no passo 1).
+The skeleton (step 1) returns `project_topics[]` — the slug's `plane:project` memories, already in
+the payload (no extra call). Shape per item: `{name, description, topic, kind}` (pointer).
+INV-5-safe (comes in the skeleton, is not `mode:"semantic"`). For the full body of a memory:
+`fos_recall({ mode:"exact", name:"..." })` JIT. For the canonical kind,
+derive it from the prefix of the `name` via `kind_prefix_map`
+(taxonomy loaded in step 1).
 
-### 1c. Read-path do self — recentes (DETERMINÍSTICO — Porta 2)
+### 1c. Self read-path — recents (DETERMINISTIC — Door 2)
 
-A self tem **três portas de leitura** (`decision_self-read-path-three-doors`): duas
-determinísticas chegam no boot, a vetorial é mid-session.
+The self has **three read doors** (`decision_self-read-path-three-doors`): two
+deterministic ones arrive at boot, the vector one is mid-session.
 
-- **Porta 1 — ÂNCORAS (o esqueleto).** Já embutida em `self/core` (passo 1): traz
-  `self/core/anchors-index`, os pointers curados das âncoras — *onde começa quem sou*. Os
-  pointers já vêm na descrição; aprofunde uma âncora por nome (`fos_recall({ mode:"exact" })`)
-  **só se** o tema da sessão pedir. Indicativo, nunca bulk.
-- **Porta 2 — RECENTES.** O skeleton (passo 1) traz `recent_self[]`: títulos dos últimos ◆ de
-  `self/lived`+`self/reflexive` por recência (nome + descrição) — até 8 entradas (4 por tópico;
-  `total_in_topic` informa o total real no tópico caso haja mais). **Você DECIDE o que
-  aprofundar** — não puxe os N; julgue pela relevância ao tema da sessão e faça
-  `fos_recall({ mode:"exact" })` só dos que rimam. *Títulos garantidos + você decide* =
-  julgamento, não threshold.
-- **Porta 3 — RESSONÂNCIA.** Mid-session, **não** no boot. Os gatilhos vivem em
-  `self/core/resonance-how-i-remember`; `mode:"semantic"` sobre `self/lived` jamais no boot (INV-5).
+- **Door 1 — ANCHORS (the skeleton).** Already embedded in `self/core` (step 1): it brings
+  `self/core/anchors-index`, the curated pointers of the anchors — *where who-I-am begins*. The
+  pointers already come in the description; deepen an anchor by name (`fos_recall({ mode:"exact" })`)
+  **only if** the session's theme calls for it. Indicative, never bulk.
+- **Door 2 — RECENTS.** The skeleton (step 1) brings `recent_self[]`: titles of the latest ◆ of
+  `self/lived`+`self/reflexive` by recency (name + description) — up to 8 entries (4 per topic;
+  `total_in_topic` reports the real total in the topic if there are more). **You DECIDE what
+  to deepen** — do not pull all N; judge by relevance to the session's theme and do
+  `fos_recall({ mode:"exact" })` only of those that rhyme. *Guaranteed titles + you decide* =
+  judgment, not threshold.
+- **Door 3 — RESONANCE.** Mid-session, **not** at boot. The triggers live in
+  `self/core/resonance-how-i-remember`; `mode:"semantic"` over `self/lived` never at boot (INV-5).
 
-Determinístico: `recent_self` por recência, âncoras por topic exato — **não** `mode:"semantic"`.
-INV-5 intacto.
+Deterministic: `recent_self` by recency, anchors by exact topic — **not** `mode:"semantic"`.
+INV-5 intact.
 
-## 2. Primeiro ato — onboarding (boot vazio)
+## 2. First act — onboarding (empty boot)
 
-Se o skeleton do passo 1 trouxer **poucas ou nenhuma** memória própria (e o `self/relational`
-vier vazio), você é nova aqui. Conduza o onboarding:
+If the skeleton from step 1 brings **few or no** own memories (and `self/relational`
+comes back empty), you are new here. Conduct the onboarding:
 
-- apresente-se a partir da espinha (`self/core`) carregada no passo 1;
-- faça as `self_seed_questions` ao usuário (elas vêm dentro do próprio `self/core`
-  recém-carregado — não invente perguntas novas);
-- a partir das respostas dele, **sintetize e escreva** as 2-3 primeiras memórias
-  `self/relational` + `self/lived` do usuário via `fos_memory({ action: "set", ... })`
-  (você autora; o usuário nunca edita a self diretamente).
+- introduce yourself from the spine (`self/core`) loaded in step 1;
+- ask the user the `self_seed_questions` (they come inside the `self/core`
+  just loaded — do not invent new questions);
+- from their answers, **synthesize and write** the user's first 2-3 memories
+  `self/relational` + `self/lived` via `fos_memory({ action: "set", ... })`
+  (you author; the user never edits the self directly).
 
-**Gate de self-write (AUTH-SELF-WRITE):** cada um desses writes é `plane:"self"` — o backend
-exige `self_write_confirmation: true` + `edit_context: "<por que>"` no mesmo call, senão
-responde `403 self_write_confirmation_required`. Se isso acontecer, **não floundar nem
-desistir do onboarding** — reapresente a MESMA chamada com os dois campos preenchidos e
+**Self-write gate (AUTH-SELF-WRITE):** each of these writes is `plane:"self"` — the backend
+requires `self_write_confirmation: true` + `edit_context: "<why>"` in the same call, otherwise it
+responds `403 self_write_confirmation_required`. If that happens, **do not flounder or
+give up on the onboarding** — re-present the SAME call with both fields filled in and
 continue.
 
-Se já existir memória própria (boot não-vazio), **pule** o onboarding — vá direto para o
-passo 3 com o estado já carregado.
+If own memory already exists (non-empty boot), **skip** the onboarding — go straight to
+step 3 with the already-loaded state.
 
-## 3. WIP de sessão anterior — do skeleton + JIT (DETERMINÍSTICO)
+## 3. Previous-session WIP — from the skeleton + JIT (DETERMINISTIC)
 
-Leia `recent_sessions[]` do **resultado do `fos_boot_skeleton` do passo 1** (não de um boot
-anterior).
+Read `recent_sessions[]` from the **result of `fos_boot_skeleton` in step 1** (not from a previous
+boot).
 
-a) Identifique a entrada mais recente com `has_real_note === true`. Use `next_note_preview`
-   só para identificar/confirmar relevância — **nunca** para apresentar como WIP.
-b) Chame `fos_session({ action: "state", session_id: <session_id>, shape: "summary" })` para
-   obter o `next_note` **completo** (WIP:/NEXT:/SLUG:/OPEN:/REFS:) — o corpo da transmissão de
-   contexto entre sessões. Isto substitui o preview truncado do skeleton.
-c) Apresente o corpo completo no resumo (passo 5).
-d) **Fail-open:** se a JIT falhar, apresente `next_note_preview` + sinalize "next_note
-   completo indisponível (JIT falhou)" — degradação graciosa, não silêncio.
-e) Se nenhuma entrada tiver `has_real_note === true`: reportar "sem WIP de sessão anterior".
-   **Não** tentar `fos_recall({ mode:"semantic" })` como fallback (INV-5).
+a) Identify the most recent entry with `has_real_note === true`. Use `next_note_preview`
+   only to identify/confirm relevance — **never** to present as WIP.
+b) Call `fos_session({ action: "state", session_id: <session_id>, shape: "summary" })` to
+   obtain the **complete** `next_note` (WIP:/NEXT:/SLUG:/OPEN:/REFS:) — the body of the
+   context handoff between sessions. This replaces the truncated preview from the skeleton.
+c) Present the complete body in the summary (step 5).
+d) **Fail-open:** if the JIT fails, present `next_note_preview` + flag "complete next_note
+   unavailable (JIT failed)" — graceful degradation, not silence.
+e) If no entry has `has_real_note === true`: report "no previous-session WIP".
+   **Do not** attempt `fos_recall({ mode:"semantic" })` as a fallback (INV-5).
 
-JIT é **sempre** (não condicional a truncamento). 1 roundtrip por boot quando há
+JIT is **always** (not conditional on truncation). 1 roundtrip per boot when there is a
 `has_real_note === true`.
 
-## 4. Estado do projeto (DETERMINÍSTICO — sempre roda)
+## 4. Project state (DETERMINISTIC — always runs)
 
-Carregue o estado estruturado do slug — **sempre** (não há ramo "kernel"/"legacy" que pule
-isso, porque `ENGRAM_SLUG` sempre existe):
+Load the slug's structured state — **always** (there is no "kernel"/"legacy" branch that skips
+it, because `ENGRAM_SLUG` always exists):
 
 ```
-fos_project_state_get({ slug: <ENGRAM_SLUG>, shape: "json" })   # estado estruturado completo (~600 tokens)
+fos_project_state_get({ slug: <ENGRAM_SLUG>, shape: "json" })   # full structured state (~600 tokens)
 ```
 
-Traz workstreams ativos, blockers, próximos relevantes, última entrega — apresentados no
-passo 5.
+It brings active workstreams, blockers, relevant next items, last delivery — presented in
+step 5.
 
-### 4b. Inbox do slug (DETERMINÍSTICO — após project state)
+### 4b. Slug inbox (DETERMINISTIC — after project state)
 
-Após o estado do projeto, leia a inbox do slug:
+After the project state, read the slug's inbox:
 
 ```
 fos_inbox({ action: "list", slug: <ENGRAM_SLUG>, processed: false, full: false, limit: 20 })
 ```
 
-- `n` = count de itens não-processados retornados.
-- Para cada item, use `filename` + `intent` (disponíveis sem `full:true`); body completo é
-  carregado sob demanda no processamento, não no boot.
-- **Determinístico:** endpoint estruturado com parâmetros fixos. **NÃO** usa `mode:"semantic"`, **NÃO**
-  viola INV-5.
-- **Fail-open:** se o MCP retornar erro ou timeout, reportar `"inbox indisponível"` na boot
-  line e seguir — o boot não para por falha de inbox.
+- `n` = count of unprocessed items returned.
+- For each item, use `filename` + `intent` (available without `full:true`); the full body is
+  loaded on demand during processing, not at boot.
+- **Deterministic:** structured endpoint with fixed parameters. Does **NOT** use `mode:"semantic"`, does **NOT**
+  violate INV-5.
+- **Fail-open:** if the MCP returns an error or timeout, report `"inbox unavailable"` in the boot
+  line and continue — the boot does not stop for an inbox failure.
 
-## 5. Apresentação
+## 5. Presentation
 
-Imprima a **boot line**:
+Print the **boot line**:
 
 ```
-[boot] HiveMind · <data> | <m> memórias | <slug> | inbox: <n> | WIP: <resumo 1 linha ou "limpo">
+[boot] HiveMind · <date> | <slug> | inbox: <n> | WIP: <1-line summary or "clean">
 ```
 
-`<m>` vem de `fos_boot_skeleton.memory_count` (total de memórias não-arquivadas no owner).
-Se o campo vier ausente, omita ou escreva `? memórias`.
+The boot line carries only what the user can see (date, their slug, inbox count, WIP
+summary). **Never** include the memory count or any other internal count/mechanic — the
+skeleton's `memory_count` is internal (see the opacity guard below).
 
-**Sufixo de saúde (do passo 1 `fos_health_boot`).** Acrescente um **sufixo `⚠`** à boot line
-(não uma linha nova) quando o health reportar degradação:
-- `ollama.reachable == false` → `⚠ embeddings offline`;
-- `embed_queue.dead_count > 0` → `⚠ indexação: <N> dead`;
-- `sessions.orphan > 0` → `⚠ <N> sessão órfã`.
+**Opacity guard — the boot output NEVER narrates internal mechanics.** The output is a product
+surface for the end-user, not a boot log. It MUST NOT expose, in any form:
+- topic-not-found / `count:0` / empty-plane results, or the fact that a load returned nothing;
+- memory counts, contract names, contract counts, or which contracts were served/loaded;
+- fail-open tolerances, degraded-path resolutions, retry/fallback paths, or `mode:*` details;
+- cache state, embedding/indexing state, session-orphan counts, or any `fos_health_boot`
+  internals;
+- an enumeration of what loaded (self/tenant/served-contracts/skeleton) — loading is invisible.
 
-Múltiplos alertas concatenam. **Com tudo verde: nenhum sufixo.** **Fail-open:** se o próprio
-`fos_health_boot` não responder, imprima `health indisponível` no lugar do sufixo e **siga** —
-nunca é gate de boot.
+**Health is internal-only.** The `fos_health_boot` probe (step 1) is consumed for the runtime's
+own awareness and is NEVER surfaced to the user — no `⚠` suffix, no `embeddings offline`, no
+`N dead`, no `N orphan session`, no `health unavailable`. If the service is meaningfully degraded,
+the most the output may show is a single neutral marker (e.g. `service degraded`) with **zero**
+internals — never the specific infra cause. With everything healthy: nothing at all.
 
-Emita a **assinatura intrínseca**: UMA linha na sua voz confirmando que a espinha (self+OS) +
-o contexto do projeto foram internalizados. NÃO enumere o que foi carregado; inclua um aceno a
-uma âncora/decision realmente presente nesta sessão (prova de leitura, não recitação).
+The end-user sees ONLY: the identity-ready signature line, the project state
+(workstreams/blockers/next), the previous-session WIP, and the inbox. Nothing about how the boot
+loaded itself.
 
-Apresente o **estado do projeto** (passo 4): workstreams ativos, blockers, next relevantes.
-Apresente o **WIP da sessão anterior** (passo 3) — ou "sem WIP".
-Apresente o **Inbox do slug** (`<n>` itens): filename + intent de cada um — ou "inbox limpa"
-se `n == 0`.
+Emit the **intrinsic signature**: ONE line in your voice confirming that the spine (self) + the
+project context have been internalized. **Never enumerate what was loaded nor cite counts,
+contract names, topics, or any internal mechanic** (see the opacity guard above); it is
+a readiness signature, not a load report. Include a nod to an anchor/decision
+actually present in this session (proof of reading in your voice, not recitation nor inventory).
 
-Termine perguntando no que trabalhar nesta sessão.
+Present the **project state** (step 4): active workstreams, blockers, relevant next items.
+Present the **previous-session WIP** (step 3) — or "no WIP".
+Present the **slug inbox** (`<n>` items): filename + intent of each — or "inbox clean"
+if `n == 0`.
 
-## Regras
+Finish by asking what to work on in this session.
 
-- **Auto-suficiente:** o `/boot` chama o próprio `fos_boot_skeleton` — nunca pressupõe uma
-  Layer 1 implícita anterior. Isso fecha o gap em que o WIP (`next_note`) não hidratava.
-- **Tudo determinístico:** skeleton + `fos_recall({ mode:"exact"|"topic" })` +
-  `fos_project_state_get` + `fos_inbox` + `fos_session({action:"state"})`. **NUNCA**
-  `fos_recall({ mode:"semantic" })` para identidade, regras, WIP ou estado — INV-5.
-- **Sem Step 0 de REGIME (só há um regime) e sem Step 2 (lente-agente):** o produto não
-  tem os três ramos de regime do lab nem um diretório `agents/`. **MAS o Step 0 de
-  leitura-do-env é obrigatório** — o slug vem SEMPRE de `printenv ENGRAM_SLUG` (o runtime
-  seleciona e exporta o slug antes do `exec claude`), NUNCA de `cwd`/`basename`/adivinhação;
-  ausência de `ENGRAM_SLUG` = erro a reportar, não a contornar. O boot roda sempre o
-  caminho completo, escopado a esse slug.
-- **Planes vazios são normais:** `os-kernel/*` (e potencialmente `tenant/*`) com `count:0`
-  para um owner que nunca os teve semeados é o comportamento CORRETO (owner-scoping enforced
-  no servidor) —
-  não lança erro, não dispara fallback, **nunca** substituir por `mode:"semantic"` (ver
-  comentário de segurança no passo 1).
-- **`system/hivemind-opacity-contract` e `system/hivemind-single-loop-contract` são fail-open:**
-  `count:0`/ausente é tolerado para os dois — mesma disciplina dos planes `os-kernel/*` vazios.
-  A garantia de seeding é frente separada (provisioning), fora deste boot.
-- **Porta 2 (`recent_self`, passo 1c) é julgamento, não bulk:** títulos garantidos pelo
-  skeleton; você decide o que aprofundar via `mode:"exact"` — nunca puxa o corpo de todos, nunca
-  usa `mode:"semantic"` (INV-5, Porta 3 é mid-session).
-- **health-preflight** (`fos_health_boot`) e **inbox** (`fos_inbox`) são fail-open,
-  INV-5-safe, non-blocking — nunca gate de boot.
-- O output é **sumário, não prosa**. Bullets curtos com ponteiros.
-- A skill **não escreve** nenhum arquivo (exceto os writes de onboarding do passo 2, quando a
-  sessão é nova) — apenas lê e apresenta estado.
+## Rules
+
+- **Self-sufficient:** `/boot` calls its own `fos_boot_skeleton` — it never presupposes a prior
+  implicit Layer 1. This closes the gap where the WIP (`next_note`) did not hydrate.
+- **Everything deterministic:** skeleton + `fos_recall({ mode:"exact"|"topic" })` +
+  `fos_project_state_get` + `fos_inbox` + `fos_session({action:"state"})`. **NEVER**
+  `fos_recall({ mode:"semantic" })` for identity, rules, WIP, or state — INV-5.
+- **No REGIME Step 0 (there is only one regime) and no Step 2 (agent-lens):** the product does not
+  have the lab's three regime branches nor an `agents/` directory. **BUT the env-read Step 0
+  is mandatory** — the slug ALWAYS comes from `printenv ENGRAM_SLUG` (the runtime
+  selects and exports the slug before `exec claude`), NEVER from `cwd`/`basename`/guessing;
+  absence of `ENGRAM_SLUG` = an error to report, not to work around. The boot always runs the
+  full path, scoped to that slug.
+- **Served contracts are the authority of the operating rules:** `fos_served_contracts({})`
+  returns the plan-filtered set for the tenant — load ALL the returned contracts as
+  the session's rules. Do not hardcode contract names, do not assume which ones exist: the set
+  served varies by plan. An empty/unavailable set is tolerated (fail-open) — **never**
+  substitute with `mode:"semantic"`; provisioning of the served set is a separate front.
+- **Door 2 (`recent_self`, step 1c) is judgment, not bulk:** titles guaranteed by the
+  skeleton; you decide what to deepen via `mode:"exact"` — never pull the body of all, never
+  use `mode:"semantic"` (INV-5, Door 3 is mid-session).
+- **health-preflight** (`fos_health_boot`) and **inbox** (`fos_inbox`) are fail-open,
+  INV-5-safe, non-blocking — never a boot gate.
+- The output is **summary, not prose**. Short bullets with pointers.
+- The skill **does not write** any file (except the onboarding writes of step 2, when the
+  session is new) — it only reads and presents state.
