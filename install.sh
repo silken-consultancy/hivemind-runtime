@@ -161,6 +161,8 @@ cp "${SCRIPT_DIR}/.claude/hooks/user-prompt-submit.capture-quota.js" \
   "${HIVEMIND_HOME}/.claude/hooks/user-prompt-submit.capture-quota.js"
 cp "${SCRIPT_DIR}/.claude/hooks/post-tool-use.dispatch-nudge.js" \
   "${HIVEMIND_HOME}/.claude/hooks/post-tool-use.dispatch-nudge.js"
+cp "${SCRIPT_DIR}/.claude/hooks/pre-tool-use.build-nudge.js" \
+  "${HIVEMIND_HOME}/.claude/hooks/pre-tool-use.build-nudge.js"
 
 # Copy the user's personal Claude Code credentials into the isolated CONFIG_DIR
 # (item 5.0, F0 auth) — best-effort. Absence is NOT an error: bin/hivemind's

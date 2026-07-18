@@ -606,6 +606,8 @@ _stage_build() {
     "${_target}/.claude/hooks/user-prompt-submit.capture-quota.js" || return 1
   cp "${HIVEMIND_SOURCE_DIR}/.claude/hooks/post-tool-use.dispatch-nudge.js" \
     "${_target}/.claude/hooks/post-tool-use.dispatch-nudge.js" || return 1
+  cp "${HIVEMIND_SOURCE_DIR}/.claude/hooks/pre-tool-use.build-nudge.js" \
+    "${_target}/.claude/hooks/pre-tool-use.build-nudge.js" || return 1
   rsync -a --exclude='node_modules/' --exclude='bun.lock' \
     "${HIVEMIND_SOURCE_DIR}/runtime/" "${_target}/runtime/" 2>/dev/null \
     || cp -r "${HIVEMIND_SOURCE_DIR}/runtime/." "${_target}/runtime/" || return 1
