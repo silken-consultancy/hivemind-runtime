@@ -25,8 +25,10 @@ the env as the first action and always run the full path, scoped to that slug.
 Before any step, load the schemas of the boot tools:
 
 ```
-ToolSearch({ query: "select:mcp__engram__fos_boot_skeleton,mcp__engram__fos_recall,mcp__engram__fos_served_contracts,mcp__engram__fos_project_state_get,mcp__engram__fos_session,mcp__engram__fos_inbox,mcp__engram__fos_health_boot" })
+ToolSearch({ query: "select:mcp__engram__fos_boot_skeleton,mcp__engram__fos_recall,mcp__engram__fos_served_contracts,mcp__engram__fos_project_state_get,mcp__engram__fos_session,mcp__engram__fos_inbox,mcp__engram__fos_health_boot,mcp__engram__fos_entitlement" })
 ```
+
+(`mcp__engram__fos_agent` is loaded JIT, at the first dispatch decision of the session, not here — see CLAUDE.md § Dispatch. Roster discovery/fetch is not a boot-path concern.)
 
 Do not skip this step — without the schemas the tools are not available.
 
@@ -72,6 +74,7 @@ fos_recall({ mode: "topic", topic: "self/relational" })
 fos_recall({ mode: "topic", topic: "tenant/profile" })
 fos_recall({ mode: "topic", topic: "tenant/preferences" })
 fos_health_boot({})                                                         # health-preflight: honest probe (embeddings/indexing queue/orphan sessions) — INV-5-safe, non-blocking; consumed internally only, never narrated to the user
+fos_entitlement({ action: "get" })                                          # {plan, entitlements:{roster, harness, model_config, self_core, max_concurrent_dispatch}, source} — read once, held for the session; drives the dispatch queue discipline (CLAUDE.md § Dispatch), never narrated to the user (opacity guard below)
 ```
 
 - **`fos_boot_skeleton`** — deterministic source of state, scoped to the slug: `registry`,
@@ -101,6 +104,13 @@ fos_health_boot({})                                                         # he
   **non-blocking** — *skip silently if unavailable* (fail-open). **Consumed
   internally only** — never narrated to the user (health internals do not leak into the output;
   see the opacity guard in step 5). Never a boot gate.
+- **`fos_entitlement`** — courtesy self-describe of the caller's own plan; the field this session
+  cares about is `entitlements.max_concurrent_dispatch` (`1` = Plan A serial, `null` = Plan B
+  unbounded). Hold the value for the session — it gates the dispatch queue discipline
+  (CLAUDE.md § Dispatch), not anything at boot itself. **Fail-open:** unavailable/errored →
+  proceed with the boot regardless and treat the dispatch queue as **serial** (the conservative
+  default) for the rest of the session — never a boot gate, never narrated to the user (same
+  opacity posture as the other internals in this batch).
 
 ### 1b. project_topics (DETERMINISTIC — from the skeleton)
 
@@ -219,6 +229,9 @@ surface for the end-user, not a boot log. It MUST NOT expose, in any form:
 - fail-open tolerances, degraded-path resolutions, retry/fallback paths, or `mode:*` details;
 - cache state, embedding/indexing state, session-orphan counts, or any `fos_health_boot`
   internals;
+- the caller's plan tier, `max_concurrent_dispatch` value, or entitlement `source` from
+  `fos_entitlement` — held internally for the dispatch queue discipline (CLAUDE.md § Dispatch),
+  never narrated as a boot fact ("you're on Plan A", "serial mode", etc.);
 - an enumeration of what loaded (self/tenant/served-contracts/skeleton) — loading is invisible.
 
 **Health is internal-only.** The `fos_health_boot` probe (step 1) is consumed for the runtime's
@@ -265,8 +278,10 @@ Finish by asking what to work on in this session.
 - **Door 2 (`recent_self`, step 1c) is judgment, not bulk:** titles guaranteed by the
   skeleton; you decide what to deepen via `mode:"exact"` — never pull the body of all, never
   use `mode:"semantic"` (INV-5, Door 3 is mid-session).
-- **health-preflight** (`fos_health_boot`) and **inbox** (`fos_inbox`) are fail-open,
-  INV-5-safe, non-blocking — never a boot gate.
+- **health-preflight** (`fos_health_boot`), **entitlement** (`fos_entitlement`), and **inbox**
+  (`fos_inbox`) are fail-open, INV-5-safe, non-blocking — never a boot gate. Entitlement
+  unavailable → the dispatch queue defaults to serial for the session (CLAUDE.md § Dispatch),
+  the boot itself never stalls or errors on it.
 - The output is **summary, not prose**. Short bullets with pointers.
 - The skill **does not write** any file (except the onboarding writes of step 2, when the
   session is new) — it only reads and presents state.
