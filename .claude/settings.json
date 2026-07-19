@@ -138,6 +138,8 @@
       "mcp__engram__fos_planner",
       "mcp__engram__fos_edge",
       "mcp__engram__fos_edge_mark_dead",
+      "mcp__engram__fos_agent",
+      "mcp__engram__fos_entitlement",
       "Bash(gh run watch *)",
       "Bash(gh run list *)",
       "Bash(gh run view *)"

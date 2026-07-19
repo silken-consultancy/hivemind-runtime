@@ -540,10 +540,11 @@ cmd_restart() {
 # from a signer git already trusts; (b) commit hash matches a LATEST_SHA
 # manifest published on a channel separate from git itself (the product HTTPS
 # domain, not the repo host) — fallback for when no signer is configured.
-# HONEST GAP: the manifest endpoint (https://<host>/hivemind/LATEST_SHA) does
-# not exist server-side yet (not part of this slice's scope) — until it's
-# stood up, this fails closed for unsigned commits, which is the correct
-# fail-safe default (spec: "se a verificação falhar → NÃO aplica"), not a bug.
+# The manifest endpoint (https://<host>/hivemind/LATEST_SHA) is LIVE — it is
+# auto-published on every push by the publish-latest-sha workflow, so the (b)
+# path resolves normally. If the fetch fails (endpoint unreachable / empty),
+# this still fails closed for unsigned commits, which is the correct fail-safe
+# default (spec: "se a verificação falhar → NÃO aplica"), not a bug.
 _verify_commit_integrity() {
   local _dir="$1"
   if git -C "${_dir}" verify-commit HEAD > /dev/null 2>&1; then
