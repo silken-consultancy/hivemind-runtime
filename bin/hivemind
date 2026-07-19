@@ -782,7 +782,13 @@ _maybe_auto_update() {
 
   local _branch="${HIVEMIND_UPDATE_BRANCH:-main}"
   local _remote_head
-  _remote_head="$(timeout 2 git -C "${HIVEMIND_SOURCE_DIR}" ls-remote origin "refs/heads/${_branch}" 2>/dev/null | cut -f1)"
+  # `|| true` is LOAD-BEARING: under `set -euo pipefail`, if `timeout` fires
+  # (git ls-remote exceeds the limit) the command substitution exits non-zero
+  # and — being a bare assignment — set -e would ABORT the whole script right
+  # here, BEFORE the fail-open guard below ever runs (crash instead of degrade).
+  # Timeout raised 2s->5s so a normal (~2s) remote check actually completes
+  # instead of intermittently tripping the limit and skipping the update.
+  _remote_head="$(timeout 5 git -C "${HIVEMIND_SOURCE_DIR}" ls-remote origin "refs/heads/${_branch}" 2>/dev/null | cut -f1)" || true
   [ -n "${_remote_head}" ] || return 0   # offline/timeout — fail-open, continue as-is
 
   local _local_head
