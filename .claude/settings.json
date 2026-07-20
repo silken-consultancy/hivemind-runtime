@@ -186,6 +186,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node __HIVEMIND_HOME__/.claude/hooks/stop.sweep-wip-md.mjs"
+          }
+        ]
+      }
     ]
   },
   "statusLine": {
