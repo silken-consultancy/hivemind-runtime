@@ -116,13 +116,29 @@ jobs:
           trimmed_sha="$(printf '%s' "${SHA}" | tr -d '[:space:]')"
 
           echo "==> Publicando ${trimmed_sha:0:12} no manifesto de PRODUTO..."
-          if ! printf '%s' "${trimmed_sha}" | ssh \
-              -i "${key_file}" \
-              -o StrictHostKeyChecking=no \
-              -o ConnectTimeout=10 \
-              -o BatchMode=yes \
-              "${SSH_USER}@${SSH_HOST}"; then
-            echo "::error::Publish do manifesto de PRODUTO FALHOU — clientes de produto sem assinatura GPG configurada vão falhar-fechado (_verify_commit_integrity) e parar de receber updates até isto ser corrigido. Manifesto de produto permanece STALE (${trimmed_sha:0:12} não confirmado)."
+          # Retry 3× com backoff: o hop SSH:22 GHA→VPS falha de forma
+          # intermitente (connect timeout transiente). Um único flap NÃO deve
+          # virar job vermelho + manifesto stale. Só falha-fechado após 3 falhas.
+          published=0
+          for attempt in 1 2 3; do
+            if printf '%s' "${trimmed_sha}" | ssh \
+                -i "${key_file}" \
+                -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=10 \
+                -o BatchMode=yes \
+                "${SSH_USER}@${SSH_HOST}"; then
+              published=1
+              break
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              backoff=$((attempt * 5))
+              echo "==> Tentativa ${attempt}/3 falhou (provável :22 flaky) — retry em ${backoff}s..."
+              sleep "${backoff}"
+            fi
+          done
+
+          if [ "${published}" -ne 1 ]; then
+            echo "::error::Publish do manifesto de PRODUTO FALHOU após 3 tentativas — clientes de produto sem assinatura GPG configurada vão falhar-fechado (_verify_commit_integrity) e parar de receber updates até isto ser corrigido. Manifesto de produto permanece STALE (${trimmed_sha:0:12} não confirmado)."
             rm -f "${key_file}"
             exit 1
           fi
@@ -175,13 +191,28 @@ jobs:
           trimmed_sha="$(printf '%s' "${SHA}" | tr -d '[:space:]')"
 
           echo "==> Publicando ${trimmed_sha:0:12} no manifesto do LAB..."
-          if ! printf '%s' "${trimmed_sha}" | ssh \
-              -i "${key_file}" \
-              -o StrictHostKeyChecking=no \
-              -o ConnectTimeout=10 \
-              -o BatchMode=yes \
-              "${SSH_USER}@${SSH_HOST}"; then
-            echo "::error::Publish do manifesto do LAB FALHOU — o cliente de dogfood do lab (HIVEMIND_ENDPOINT=kernel.silken.ia.br:4443) sem assinatura GPG configurada vai falhar-fechado (_verify_commit_integrity) e parar de receber updates até isto ser corrigido. Manifesto do lab permanece STALE (${trimmed_sha:0:12} não confirmado)."
+          # Retry 3× com backoff — mesmo motivo do job de produto: o hop SSH:22
+          # GHA→VPS flapa de forma intermitente. Só falha-fechado após 3 falhas.
+          published=0
+          for attempt in 1 2 3; do
+            if printf '%s' "${trimmed_sha}" | ssh \
+                -i "${key_file}" \
+                -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=10 \
+                -o BatchMode=yes \
+                "${SSH_USER}@${SSH_HOST}"; then
+              published=1
+              break
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              backoff=$((attempt * 5))
+              echo "==> Tentativa ${attempt}/3 falhou (provável :22 flaky) — retry em ${backoff}s..."
+              sleep "${backoff}"
+            fi
+          done
+
+          if [ "${published}" -ne 1 ]; then
+            echo "::error::Publish do manifesto do LAB FALHOU após 3 tentativas — o cliente de dogfood do lab (HIVEMIND_ENDPOINT=kernel.silken.ia.br:4443) sem assinatura GPG configurada vai falhar-fechado (_verify_commit_integrity) e parar de receber updates até isto ser corrigido. Manifesto do lab permanece STALE (${trimmed_sha:0:12} não confirmado)."
             rm -f "${key_file}"
             exit 1
           fi
