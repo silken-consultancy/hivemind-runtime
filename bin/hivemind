@@ -603,12 +603,13 @@ _stage_build() {
   # templated settings.json above; must ship alongside it on every update.
   cp "${HIVEMIND_SOURCE_DIR}/bin/hivemind-statusline.py" "${_target}/bin/hivemind-statusline.py" || return 1
   chmod +x "${_target}/bin/hivemind-statusline.py" || return 1
-  cp "${HIVEMIND_SOURCE_DIR}/.claude/hooks/user-prompt-submit.capture-quota.js" \
-    "${_target}/.claude/hooks/user-prompt-submit.capture-quota.js" || return 1
-  cp "${HIVEMIND_SOURCE_DIR}/.claude/hooks/post-tool-use.dispatch-nudge.js" \
-    "${_target}/.claude/hooks/post-tool-use.dispatch-nudge.js" || return 1
-  cp "${HIVEMIND_SOURCE_DIR}/.claude/hooks/pre-tool-use.build-nudge.js" \
-    "${_target}/.claude/hooks/pre-tool-use.build-nudge.js" || return 1
+  # Copy the WHOLE hooks dir (the class), never a per-file allowlist. A forgotten
+  # entry here is exactly what stripped stop.sweep-wip-md.mjs on update while the
+  # freshly-templated settings.json still registered it → ERR_MODULE_NOT_FOUND at
+  # the Stop event. settings.json (Tier 1, above) is the single source of which
+  # hooks are registered; ship all of them so it can never dangle. Same
+  # "preserve the class, not an allowlist" lesson as the Tier-2 runtime-state copy.
+  cp -r "${HIVEMIND_SOURCE_DIR}/.claude/hooks/." "${_target}/.claude/hooks/" || return 1
   rsync -a --exclude='node_modules/' --exclude='bun.lock' \
     "${HIVEMIND_SOURCE_DIR}/runtime/" "${_target}/runtime/" 2>/dev/null \
     || cp -r "${HIVEMIND_SOURCE_DIR}/runtime/." "${_target}/runtime/" || return 1

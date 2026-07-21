@@ -157,14 +157,11 @@ mkdir -p "${HIVEMIND_HOME}/bin"
 cp "${SCRIPT_DIR}/bin/hivemind-statusline.py" "${HIVEMIND_HOME}/bin/hivemind-statusline.py"
 chmod +x "${HIVEMIND_HOME}/bin/hivemind-statusline.py"
 mkdir -p "${HIVEMIND_HOME}/.claude/hooks"
-cp "${SCRIPT_DIR}/.claude/hooks/user-prompt-submit.capture-quota.js" \
-  "${HIVEMIND_HOME}/.claude/hooks/user-prompt-submit.capture-quota.js"
-cp "${SCRIPT_DIR}/.claude/hooks/post-tool-use.dispatch-nudge.js" \
-  "${HIVEMIND_HOME}/.claude/hooks/post-tool-use.dispatch-nudge.js"
-cp "${SCRIPT_DIR}/.claude/hooks/pre-tool-use.build-nudge.js" \
-  "${HIVEMIND_HOME}/.claude/hooks/pre-tool-use.build-nudge.js"
-cp "${SCRIPT_DIR}/.claude/hooks/stop.sweep-wip-md.mjs" \
-  "${HIVEMIND_HOME}/.claude/hooks/stop.sweep-wip-md.mjs"
+# Copy the WHOLE hooks dir (the class), never a per-file allowlist — a forgotten
+# file in a cherry-pick list is exactly what shipped a settings.json Stop entry
+# referencing a hook the update path never installed (ERR_MODULE_NOT_FOUND at the
+# Stop event). settings.json is the single source of which hooks are registered.
+cp -r "${SCRIPT_DIR}/.claude/hooks/." "${HIVEMIND_HOME}/.claude/hooks/"
 
 # Copy the user's personal Claude Code credentials into the isolated CONFIG_DIR
 # (item 5.0, F0 auth) — best-effort. Absence is NOT an error: bin/hivemind's
