@@ -40,6 +40,24 @@ SETUP_PID_FILE="${HOME}/.engram/cache/hivemind-setup.pid"
 CERT_DIR="${HOME}/.engram/mtls"
 RUNTIME_BIN="${HIVEMIND_HOME}/runtime/src/server.ts"
 
+# One-time endpoint migration (2026-07-21): hivemind.silken.ia.br → hivemind.ia.br.
+# The product endpoints moved to hivemind.ia.br (the silken.ia.br product blocks are
+# being retired). Rewrite a pre-migration ~/.hivemind/.env IN PLACE so an already-
+# enrolled client repoints automatically (reached via the update channel while the old
+# manifest is still served). Only the HOST changes — the enrolled cert is issued by the
+# same product CA and the :4443 server cert now carries a hivemind.ia.br SAN, so no
+# re-enrollment is needed. Idempotent: a no-op once migrated.
+if [ -f "${HIVEMIND_HOME}/.env" ] && grep -q 'hivemind\.silken\.ia\.br:4443' "${HIVEMIND_HOME}/.env" 2>/dev/null; then
+  _mig_bak="${HIVEMIND_HOME}/.env.pre-hivemind-ia.$(date +%Y%m%d%H%M%S)"
+  if cp "${HIVEMIND_HOME}/.env" "${_mig_bak}" 2>/dev/null \
+     && sed 's/hivemind\.silken\.ia\.br:4443/hivemind.ia.br:4443/g' "${_mig_bak}" > "${HIVEMIND_HOME}/.env" 2>/dev/null; then
+    echo "[hivemind] endpoint migrated: hivemind.silken.ia.br:4443 → hivemind.ia.br:4443 (backup: ${_mig_bak})" >&2
+  else
+    cp "${_mig_bak}" "${HIVEMIND_HOME}/.env" 2>/dev/null || true
+  fi
+  unset _mig_bak
+fi
+
 # Load user env if present (sets MTLS_* + HIVEMIND_OWNER).
 if [ -f "${HIVEMIND_HOME}/.env" ]; then
   # shellcheck disable=SC1090
@@ -78,7 +96,7 @@ _vecho() {
 _brand_header() {
   echo ""
   echo "  $(_ok "◆") HiveMind — shared memory runtime"
-  echo "  $(_dim "→ ${HIVEMIND_ENDPOINT:-hivemind.silken.ia.br:4443}")"
+  echo "  $(_dim "→ ${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443}")"
 }
 
 # ── _has_cert: returns 0 only if THIS owner's cert exists (owner-scoped) ─────
@@ -142,7 +160,7 @@ _check_health() {
   fi
 
   # Endpoint reachability — new check (item 4.3), public path, no cert needed.
-  if curl -sf --max-time 3 "https://${HIVEMIND_ENDPOINT:-hivemind.silken.ia.br:4443}/ca/crl.pem" > /dev/null 2>&1; then
+  if curl -sf --max-time 3 "https://${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443}/ca/crl.pem" > /dev/null 2>&1; then
     _HEALTH_ENDPOINT_OK=1
   fi
 
@@ -451,9 +469,9 @@ cmd_status() {
   esac
 
   if [ "${_HEALTH_ENDPOINT_OK}" = "1" ]; then
-    echo "  Endpoint:   $(_ok "reachable") (${HIVEMIND_ENDPOINT:-hivemind.silken.ia.br:4443})"
+    echo "  Endpoint:   $(_ok "reachable") (${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443})"
   else
-    echo "  Endpoint:   $(_dim "unreachable") (${HIVEMIND_ENDPOINT:-hivemind.silken.ia.br:4443})"
+    echo "  Endpoint:   $(_dim "unreachable") (${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443})"
   fi
 }
 

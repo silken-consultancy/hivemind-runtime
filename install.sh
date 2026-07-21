@@ -11,7 +11,7 @@
 set -euo pipefail
 
 HIVEMIND_HOME="${HIVEMIND_HOME:-$HOME/.hivemind}"
-HIVEMIND_ENDPOINT="${HIVEMIND_ENDPOINT:-hivemind.silken.ia.br:4443}"
+HIVEMIND_ENDPOINT="${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_PREFIX="/usr/local"
 
