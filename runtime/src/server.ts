@@ -49,7 +49,8 @@ if (!isSetupOnly) {
   mtlsServer = startMtlsProxy();
   if (mtlsServer) {
     console.log(
-      `[mtls-proxy] listening on http://127.0.0.1:${mtlsServer.port} -> ${env.MTLS_UPSTREAM}`,
+      // https:// — local loopback listener is TLS-terminated (round-2, mtls-proxy.ts).
+      `[mtls-proxy] listening on https://127.0.0.1:${mtlsServer.port} -> ${env.MTLS_UPSTREAM}`,
     );
   } else {
     console.log('[mtls-proxy] disabled (MTLS_PROXY_PORT not set or certs absent)');

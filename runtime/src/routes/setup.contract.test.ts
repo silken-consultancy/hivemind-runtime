@@ -137,10 +137,13 @@ test('POST /enroll writes $HIVEMIND_HOME/.claude/.claude.json merge-safely (item
   const configAfterRun1 = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
   expect(configAfterRun1.someArbitraryKey).toBe('keep-me');
   expect(configAfterRun1.mcpServers.otherServer).toEqual({ type: 'stdio', command: 'some-other-mcp' });
+  // https:// + no headers (atomic-flip, round-2 2026-07-30): the loopback
+  // listener is HTTPS-only now (mtls-proxy.ts item 1.1(B)) and injects
+  // x-fos-key server-side (item 1.1(A)) — Claude Code's own config carries
+  // zero secret material.
   expect(configAfterRun1.mcpServers.engram).toEqual({
     type: 'http',
-    url: 'http://127.0.0.1:7779/v1/mcp',
-    headers: { 'x-fos-key': '${FOS_API_KEY}' },
+    url: 'https://127.0.0.1:7779/v1/mcp',
   });
 
   // Run 2 (idempotency — re-running enrollment must not clobber the survivors).
@@ -179,8 +182,7 @@ test('POST /enroll self-heals a top-level `null` .claude.json instead of throwin
   const config = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
   expect(config.mcpServers.engram).toEqual({
     type: 'http',
-    url: 'http://127.0.0.1:7779/v1/mcp',
-    headers: { 'x-fos-key': '${FOS_API_KEY}' },
+    url: 'https://127.0.0.1:7779/v1/mcp',
   });
 });
 
@@ -213,7 +215,9 @@ test('POST /enroll fails cleanly (502) if the CA response is missing cert or ca_
   }
 });
 
-// ── Item 6.1 (Fase 6) — auth cert+chave: API Key field + x-fos-key header ────
+// ── Item 6.1 (Fase 6) — auth cert+chave: API Key field ───────────────────────
+// (the x-fos-key HEADER half of item 6.1 was superseded by the round-2
+// atomic-flip, 2026-07-30 — see the dedicated test below.)
 
 test('POST /enroll rejects a body missing api_key (400)', async () => {
   const res = await setupRouter.request('/enroll', {
@@ -263,7 +267,7 @@ test('POST /enroll rejects an api_key containing a newline (400, P-b guard again
   expect(data.message).toMatch(/API Key/);
 });
 
-test('POST /enroll writes headers[\'x-fos-key\'] into mergedConfig.mcpServers.engram (item 6.1)', async () => {
+test('POST /enroll writes mergedConfig.mcpServers.engram with NO headers — zero secret material (atomic-flip, round-2 2026-07-30)', async () => {
   const ownerId = 'contract-test-owner-fos-key';
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
@@ -274,11 +278,12 @@ test('POST /enroll writes headers[\'x-fos-key\'] into mergedConfig.mcpServers.en
 
   const claudeConfigPath = join(process.env.HIVEMIND_HOME!, '.claude', '.claude.json');
   const config = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
-  // Literal template string, NOT the raw secret value — relies on the Claude
-  // Code CLI http transport's ${VAR} expansion from the process env (measured
-  // live, CLI v2.1.207: confirmed the header value IS expanded — see the
-  // OPEN-cfg-A probe in the delivery report).
-  expect(config.mcpServers.engram.headers).toEqual({ 'x-fos-key': '${FOS_API_KEY}' });
+  // Supersedes the old item 6.1 headers['x-fos-key']:'${FOS_API_KEY}' template
+  // (+ its OPEN-cfg-A live-expansion proof) — the proxy now injects the
+  // credential server-side (mtls-proxy.ts item 1.1(A)), so this file must
+  // carry no `headers` key at all, and definitely no reference to the key.
+  expect(config.mcpServers.engram.headers).toBeUndefined();
+  expect(JSON.stringify(config.mcpServers.engram)).not.toContain('FOS_API_KEY');
 });
 
 test('POST /enroll writes FOS_API_KEY=<pasted value> into $HIVEMIND_HOME/.env, mode 0600 (item 6.1)', async () => {
