@@ -61,6 +61,17 @@ your slug. The project-context call is `fos_boot_skeleton({ slug: <ENGRAM_SLUG> 
 exports it before `exec claude` — there is no `basename` fallback). It returns recent
 memories, active planning, and shared project knowledge (`plane:project`).
 
+## Session close — automatic, plus the deliberate command
+
+`bin/hivemind` opens a real session before this window starts and exports its id as
+`ENGRAM_SESSION_ID`. That session now closes **automatically** when this window really
+ends — a `SessionEnd` hook (`.claude/hooks/session-end.close-session.js`) fires without
+you typing anything. `/end-session` (`.claude/commands/end-session.md`) remains available
+and is still the **preferred** way to end deliberately: it does the one thing the hook
+cannot do — judgment-quality memory consolidation of what happened this session — before
+closing with a real handoff note. The hook is the safety net for continuity of the close
+itself, not a replacement for the deliberate command.
+
 ## Dispatch — background roster agents (fetch+inject, both plans)
 
 Long/hands-on work (the kind `pre-tool-use.build-nudge.js` and
