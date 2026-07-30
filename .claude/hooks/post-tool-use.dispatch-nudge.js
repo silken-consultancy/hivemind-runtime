@@ -25,7 +25,9 @@
 //   - Counts ONLY mutating/remote commands (see isMutating() below). Read-only
 //     commands do not count (fluidity > noise). If ambiguous → does NOT count.
 //   - On CROSSING the threshold (10) and every +STEP (5) after, emits the nudge
-//     on stdout (anti-spam).
+//     through the PostToolUse additionalContext channel (anti-spam). A raw
+//     process.stdout.write is transcript-only and never reaches the model, so the
+//     nudge is emitted via lib/emit-context (hookSpecificOutput.additionalContext).
 //
 // SUB-AGENTS DO NOT COUNT (only the main loop slides into hands-on mode):
 //   when this hook runs inside a sub-agent, the work is ALREADY dispatched — the
@@ -35,8 +37,8 @@
 // MANDATORY DISCIPLINES (ABSOLUTE fail-open):
 //   - Any error (parse, missing env, state read/write) → exit 0, NEVER blocks the
 //     Bash command. Errors go to stderr only.
-//   - NEVER calls MCP or the network. Only reads/writes the state file and prints
-//     to stdout.
+//   - NEVER calls MCP or the network. Only reads/writes the state file and emits
+//     the nudge via the additionalContext channel.
 //   - Not a log-everything: a read-only command → silent no-op.
 //
 // Input (stdin): PostToolUse event JSON — { tool_name, tool_input:{command}, session_id, ... }
@@ -46,6 +48,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { emitContext } = require('./lib/emit-context');
 
 // ─── constants (TUNABLE) ────────────────────────────────────────────────────────
 
@@ -225,11 +228,11 @@ function writeState(file, st) {
 // ─── nudge ────────────────────────────────────────────────────────────────────
 
 function emitNudge(count) {
-  process.stdout.write(
-    `\n⚠ ${count} hands-on/mutating commands in this session (foreground).\n` +
-    `   You're running a lot of hands-on work in the foreground. If this is a FLOW\n` +
-    `   (not short one-off diagnostics), the discipline is non-blocking: push the\n` +
-    `   long/hands-on work to the background (run_in_background) and stay responsive.\n` +
-    `   Non-blocking nudge — you decide.\n\n`
+  emitContext(
+    `⚠ ${count} hands-on/mutating commands in this session (foreground). ` +
+    `You're running a lot of hands-on work in the foreground. If this is a FLOW ` +
+    `(not short one-off diagnostics), the discipline is non-blocking: push the ` +
+    `long/hands-on work to the background (run_in_background) and stay responsive. ` +
+    `Non-blocking nudge — you decide.`
   );
 }
