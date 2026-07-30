@@ -186,6 +186,16 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f __HIVEMIND_HOME__/.claude/hooks/session-end.close-session.js ]; then exec node __HIVEMIND_HOME__/.claude/hooks/session-end.close-session.js; fi"
+          }
+        ]
+      }
     ]
   },
   "statusLine": {
