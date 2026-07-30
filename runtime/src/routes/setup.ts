@@ -265,9 +265,11 @@ setupRouter.post('/enroll', async (c) => {
     try { unlinkSync(csrPath); } catch { /* best-effort */ }
 
     // 5. Write $HIVEMIND_HOME/.env with MTLS_* vars + FOS_API_KEY (item 6.1,
-    // auth cert+chave — consumed by bin/hivemind's `set -a; . .env; set +a`,
-    // which exports it into the `exec env ... claude` environment so the
-    // MCP entry's `headers['x-fos-key']: '${FOS_API_KEY}'` can resolve it).
+    // auth cert+chave). FOS_API_KEY is consumed by the DAEMON now (atomic-
+    // flip, round-2 2026-07-30): mtls-proxy.ts injects x-fos-key server-side
+    // on the outbound hop from this same .env var (exported into the
+    // daemon's env by bin/hivemind's `set -a; . .env; set +a`) — Claude
+    // Code's own MCP config (step 6 below) no longer carries the key at all.
     const proxyPort = process.env.MTLS_PROXY_PORT ?? '7779';
     const envContent = [
       `# HiveMind mTLS config — written by hivemind setup on ${new Date().toISOString()}`,
@@ -317,29 +319,23 @@ setupRouter.post('/enroll', async (c) => {
         existingConfig = {};
       }
     }
-    // headers['x-fos-key'] (item 6.1, auth cert+chave): the literal string
-    // '${FOS_API_KEY}' is written here, relying on the Claude Code CLI's http
-    // transport expanding ${VAR} from the process env at connect time (the
-    // same env bin/hivemind already exports via `set -a; . .env; set +a`
-    // before `exec env ... claude`). OPEN-cfg-A RESOLVED LIVE this pass (CLI
-    // v2.1.207, matching the version pin): a probe MCP http server + a
-    // `.claude.json` with `headers: {"x-test-var": "${TESTVAR}"}` under an
-    // isolated CLAUDE_CONFIG_DIR showed the literal value `${TESTVAR}` DOES
-    // get expanded from the process env — the upstream request arrived with
-    // the header already substituted, not the template string. G-cfg1 (real
-    // enrollment against the real engram MCP endpoint) is still the
-    // end-to-end confirmation, but the CLI-level expansion mechanism itself is
-    // no longer an open question. Fallback (literal trimmedApiKey value
-    // instead of the template) is therefore NOT expected to be needed, but is
-    // documented here in case G-cfg1 surfaces an unrelated 401.
+    // mcpServers.engram (atomic-flip, round-2 2026-07-30 — supersedes the
+    // item 6.1 headers['x-fos-key'] template + its OPEN-cfg-A live-expansion
+    // proof, both removed here): url is now https://127.0.0.1:<port>/v1/mcp, matching the
+    // local HTTPS-only listener (mtls-proxy.ts item 1.1(B)) — validates
+    // against the local CA trusted into the system store by item 1.4, so no
+    // manual "accept this certificate" prompt. NO headers written: the proxy
+    // injects x-fos-key server-side from FOS_API_KEY in .env (mtls-proxy.ts
+    // item 1.1(A)), so this file — readable by anything with fs access to
+    // $HIVEMIND_HOME — carries zero secret material regardless of what wrote
+    // or read it.
     const mergedConfig = {
       ...existingConfig,
       mcpServers: {
         ...(existingConfig.mcpServers as Record<string, unknown> | undefined),
         engram: {
           type: 'http',
-          url: `http://127.0.0.1:${proxyPort}/v1/mcp`,
-          headers: { 'x-fos-key': '${FOS_API_KEY}' },
+          url: `https://127.0.0.1:${proxyPort}/v1/mcp`,
         },
       },
     };
