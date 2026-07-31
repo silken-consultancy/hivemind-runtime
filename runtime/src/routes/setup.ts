@@ -42,6 +42,70 @@ const ENDPOINT = process.env.HIVEMIND_ENDPOINT ?? 'hivemind.silken.ia.br:4443';
 // :4443 path (future design; does not block initial enrollment).
 const ENROLL_HOST = ENDPOINT.split(':')[0];
 
+// Tenant shape: it lands in a filesystem path (the rename target below), so it
+// is validated no matter which source it came from — the CA response field or
+// the issued cert's CN.
+const TENANT_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+
+// certSubjectCN — CN of a PEM certificate, or undefined if it can't be read.
+//
+// Used ONLY as the fallback identity source when the CA response has no usable
+// `tenant` (see resolveTenant below). Reads the cert over STDIN rather than
+// from a path so it can run BEFORE the cert is committed to disk — no temp file
+// to clean up on the failure path.
+//
+// openssl (not node:crypto.X509Certificate) because this handler already hard-
+// depends on the openssl binary two steps earlier (the keypair/CSR generation),
+// so this introduces no new dependency and cannot be the thing that is missing.
+// Subject rendering differs across openssl majors — 3.x prints
+// `subject=C = BR, CN = x`, 1.x prints `subject= /C=BR/CN=x` — and a subject
+// carrying ONLY a CN is rendered `subject=CN = x`, with the label's own `=`
+// immediately before the CN. So: strip the `subject=` label FIRST, then match
+// the CN on an RDN boundary. Matching the boundary without stripping the label
+// silently misses the bare-CN form (caught in review; a multi-RDN fixture had
+// hidden it), and matching without any boundary would happily read the `CN` out
+// of an unrelated RDN value.
+function certSubjectCN(certPem: string): string | undefined {
+  const result = Bun.spawnSync(['openssl', 'x509', '-noout', '-subject'], {
+    stdin: Buffer.from(certPem),
+    stdout: 'pipe',
+    stderr: 'ignore',
+  });
+  if (result.exitCode !== 0) return undefined;
+  const subject = (result.stdout?.toString() ?? '').trim().replace(/^subject\s*=\s*/i, '');
+  const match = subject.match(/(?:^|[,/])\s*CN\s*=\s*([^,/\n]+)/);
+  return match?.[1]?.trim();
+}
+
+// resolveTenant — the identity of this enrollment, from the CA response's
+// `tenant` field, else from the CN of the cert the CA just issued.
+//
+// DEFENSIVE BY DESIGN (2026-07-31). The `tenant` field used to be a hard
+// requirement: absent → HTTP 502 "Resposta da CA não contém um tenant válido",
+// and a validly-issued certificate was thrown away. That fired for real when a
+// stale server omitted the field, and it was a self-inflicted failure — the CA
+// sets the cert's CN to the same tenant, so the identity was sitting in the
+// response the whole time, in a second place the client already had in hand.
+// Deriving it from the CN decouples the client from that one field permanently;
+// enrollment now only fails when BOTH sources are unusable, which is the honest
+// condition ("we cannot name this identity"), not a field-presence check.
+//
+// This does NOT weaken the trust model: the CN is read from the cert the CA
+// itself signed and returned, not from anything the client typed — identity is
+// still entirely server-resolved (the CSR's own CN is a discarded temp id).
+function resolveTenant(responseTenant: string | undefined, certPem: string): string | undefined {
+  if (responseTenant && TENANT_RE.test(responseTenant)) return responseTenant;
+
+  const cn = certSubjectCN(certPem);
+  if (cn && TENANT_RE.test(cn)) {
+    console.warn(
+      `[setup/enroll] CA response carried no usable tenant — derived identity from the issued cert CN instead: ${cn}`,
+    );
+    return cn;
+  }
+  return undefined;
+}
+
 export const setupRouter = new Hono();
 
 // In-memory flag: true once enrollment completes in this server lifetime.
@@ -267,13 +331,17 @@ setupRouter.post('/enroll', async (c) => {
     if (!caData.cert || !caData.ca_cert_pem) {
       return c.json({ ok: false, message: 'Resposta da CA não contém os campos cert ou ca_cert_pem' }, 502);
     }
-    // Defensive: `tenant` lands in a filesystem path below (the rename target),
-    // so it's validated even though it comes from the (trusted) CA response —
-    // never trust a value that ends up in `join()` without a shape check.
-    if (!caData.tenant || !/^[a-zA-Z0-9_-]{1,128}$/.test(caData.tenant)) {
-      return c.json({ ok: false, message: 'Resposta da CA não contém um tenant válido' }, 502);
+    // Identity: the response's `tenant`, falling back to the CN of the cert the
+    // CA just issued (resolveTenant, above — both sources shape-checked, since
+    // the value lands in a filesystem path just below). Only a failure of BOTH
+    // is fatal; a missing `tenant` field alone no longer discards a valid cert.
+    const tenant = resolveTenant(caData.tenant, caData.cert);
+    if (!tenant) {
+      return c.json({
+        ok: false,
+        message: 'Resposta da CA não contém um tenant válido, e não foi possível derivar a identidade do CN do certificado emitido',
+      }, 502);
     }
-    const tenant = caData.tenant;
     const keyFinalPath  = join(mtlsDir, `${tenant}.key.pem`);
     const certFinalPath = join(mtlsDir, `${tenant}.cert.pem`);
 

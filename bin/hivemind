@@ -126,6 +126,43 @@ _has_cert() {
   fi
 }
 
+# ── _endpoint_ok: is the PRODUCT endpoint reachable from this machine? ────────
+# Semantics: liveness of the public CA surface (DNS + TLS + a server that
+# answers), NOT of the :4443 MCP port and NOT an authorization check.
+#
+# Do NOT probe ${HIVEMIND_ENDPOINT} verbatim: that host:PORT is the :4443 MCP
+# listener, and it fails a certless probe for two independent reasons — (a) it
+# is mutual-mTLS (requestCert), so it closes a connection that presents no
+# client cert, and (b) its server cert is signed by the PRODUCT CA, not a
+# publicly-trusted one. MEASURED 2026-07-31 against hivemind.ia.br:
+# `curl -sf https://hivemind.ia.br:4443/ca/crl.pem` → curl exit 60, http_code
+# 000 — so the previous probe was a PERMANENT false negative: _HEALTH_ENDPOINT_OK
+# was 0 on every healthy install, and `hivemind status`/`health` reported
+# "Endpoint: unreachable" / DEGRADED forever.
+#
+# The 443/Let's-Encrypt surface is the certless, publicly-trusted one — the
+# SAME surface enrollment itself bootstraps over (see ENROLL_HOST in
+# runtime/src/routes/setup.ts, and the reasoning there for why :4443 cannot
+# serve it) — so this strips the port and probes the CA path there. Measured:
+# 200 in ~0.12s.
+#
+# No -f, and ANY status counts as reachable — the same liveness discipline as
+# _proxy_ok (:280): a 401/403/404 still proves DNS resolved, TLS completed and
+# a server answered, which is exactly what this check claims. Only http_code
+# 000 (connection refused / TLS failure / timeout) means unreachable. Probing
+# :4443 WITH the enrolled client cert was the alternative; it was rejected
+# because this check must also be meaningful BEFORE enrollment (cmd_status runs
+# fine with no cert at all), and a cert-dependent probe would reintroduce the
+# same class of false negative it is fixing.
+_endpoint_ok() {
+  local _host="${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443}"
+  _host="${_host%%:*}"
+  local _code
+  _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+    "https://${_host}/ca/crl.pem" 2>/dev/null) || return 1
+  [ "${_code}" != "000" ]
+}
+
 # ── _check_health: single source of truth for runtime/proxy/cert/endpoint
 # state — populates _HEALTH_* globals + _HEALTH_SEVERITY (0=ok, 1=degraded,
 # 2=down). Never returns non-zero itself (severity lives in the variable, not
@@ -167,7 +204,7 @@ _check_health() {
   fi
 
   # Endpoint reachability — new check (item 4.3), public path, no cert needed.
-  if curl -sf --max-time 3 "https://${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443}/ca/crl.pem" > /dev/null 2>&1; then
+  if _endpoint_ok; then
     _HEALTH_ENDPOINT_OK=1
   fi
 
@@ -190,6 +227,25 @@ _check_health() {
 _pid_is_hivemind_runtime() {
   local _pid="$1"
   ps -p "${_pid}" -o command= 2>/dev/null | grep -qF -- "${RUNTIME_BIN}"
+}
+
+# ── _kill_wait_escalate: SIGTERM, wait (bounded) for the process to ACTUALLY
+# exit, escalate to SIGKILL if it doesn't. $1=pid, $2=seconds to wait (default 5).
+# Sending the signal is not the same as the port being released: every caller
+# here kills a daemon precisely because it wants ${RUNTIME_PORT}/${PROXY_PORT}
+# back, so returning the instant `kill` returns just races the replacement into
+# EADDRINUSE. Same wait+escalate shape cmd_stop already implements inline; this
+# is the shared version for the auto-heal paths.
+_kill_wait_escalate() {
+  local _pid="$1" _wait="${2:-5}" _t=0
+  kill "${_pid}" 2>/dev/null || true
+  while kill -0 "${_pid}" 2>/dev/null && [ "${_t}" -lt "${_wait}" ]; do
+    sleep 1; _t=$((_t + 1))
+  done
+  if kill -0 "${_pid}" 2>/dev/null; then
+    _vecho "[hivemind] pid=${_pid} still alive after ${_wait}s — escalating to SIGKILL"
+    kill -9 "${_pid}" 2>/dev/null || true
+  fi
 }
 
 # ── _setup_mode: first-login flow ─────────────────────────────────────────────
@@ -215,10 +271,49 @@ _setup_mode() {
   fi
 
   mkdir -p "$(dirname "${RUNTIME_LOG}")"
-  bun run "${RUNTIME_BIN}" --setup-only >> "${RUNTIME_LOG}" 2>&1 &
+
+  # A stale daemon from an earlier, interrupted enrollment holds ${RUNTIME_PORT}
+  # and would make the spawn below die on EADDRINUSE — with its output going to
+  # the log file the user never opens. Reap ours first (identity-guarded, never
+  # touches a foreign process).
+  #
+  # ...but NEVER when something HEALTHY is serving: a runtime answering healthz
+  # whose mTLS proxy is also up belongs to an owner who is already enrolled on
+  # this machine (the multi-owner case _has_cert's header describes — another
+  # owner's cert present, this owner's absent, so we land in setup). Killing it
+  # to make room for a first-run flow would take down a working session. Refuse
+  # loudly instead; that is also strictly clearer than the 15s EADDRINUSE
+  # timeout this case produced before. The MTLS_PROXY_PORT guard matters: with
+  # no .env yet (genuine first run) _proxy_ok short-circuits to OK, and without
+  # it a leftover setup daemon would read as "healthy" and never be reaped.
+  if [ -n "${MTLS_PROXY_PORT:-}" ] \
+    && curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1 \
+    && _proxy_ok; then
+    echo "Error: a HiveMind runtime is already running and healthy on port ${RUNTIME_PORT}." >&2
+    echo "       Enrollment needs that port. Close the other HiveMind session (or run 'hivemind stop') and try again." >&2
+    exit 1
+  fi
+  _reap_stale_runtime
+
+  _vecho "[hivemind] setup: runtime=${RUNTIME_BIN} port=${RUNTIME_PORT} log=${RUNTIME_LOG}"
+  _vecho "[hivemind] setup: endpoint=${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443} (enrollment goes to the 443/LE surface of this host)"
+  if [ "${_VERBOSE:-0}" = "1" ]; then
+    # --verbose was INERT during enrollment: the setup daemon's stdout/stderr
+    # went ONLY to ${RUNTIME_LOG}, so a failing enroll printed nothing on the
+    # terminal and the user had to know to go read a file to see why. Tee it to
+    # stderr as well when verbose.
+    # Process substitution, NOT a `| tee` pipeline: in a pipeline `$!` is the
+    # LAST command (tee), so _SETUP_PID would stop pointing at bun and every
+    # kill below — including cmd_stop's leftover cleanup — would miss the
+    # daemon. With `> >(...)`, `$!` is still bun.
+    bun run "${RUNTIME_BIN}" --setup-only > >(tee -a "${RUNTIME_LOG}" >&2) 2>&1 &
+  else
+    bun run "${RUNTIME_BIN}" --setup-only >> "${RUNTIME_LOG}" 2>&1 &
+  fi
   _SETUP_PID=$!
   mkdir -p "$(dirname "${SETUP_PID_FILE}")"
   echo "${_SETUP_PID}" > "${SETUP_PID_FILE}"
+  _vecho "[hivemind] setup: daemon spawned (pid=${_SETUP_PID}) — waiting for healthz"
 
   # Poll until setup server ready (timeout 15s).
   _TRIES=0
@@ -226,12 +321,13 @@ _setup_mode() {
     _TRIES=$((_TRIES + 1))
     if [ "${_TRIES}" -ge 15 ]; then
       echo "Error: setup server did not start after 15s. Check: ${RUNTIME_LOG}" >&2
-      kill "${_SETUP_PID}" 2>/dev/null || true
+      _kill_wait_escalate "${_SETUP_PID}" 5
       rm -f "${SETUP_PID_FILE}"
       exit 1
     fi
     sleep 1
   done
+  _vecho "[hivemind] setup: daemon answering healthz on ${RUNTIME_PORT}"
 
   local _SETUP_URL="http://localhost:${RUNTIME_PORT}/setup"
   echo "Opening browser: ${_SETUP_URL}"
@@ -263,14 +359,22 @@ _setup_mode() {
     _TRIES=$((_TRIES + 1))
     if [ "${_TRIES}" -ge 300 ]; then
       echo "Timeout: enrollment did not complete in 5 minutes." >&2
-      kill "${_SETUP_PID}" 2>/dev/null || true
+      _kill_wait_escalate "${_SETUP_PID}" 5
       rm -f "${SETUP_PID_FILE}"
       exit 1
     fi
     sleep 1
   done
+  _vecho "[hivemind] setup: enrollment reported done — stopping the setup daemon"
 
-  kill "${_SETUP_PID}" 2>/dev/null || true
+  # The setup daemon must be GONE, not merely signalled, before we tell the user
+  # to run `hivemind`: it holds ${RUNTIME_PORT}, and setup-only mode never starts
+  # the mTLS proxy. A lingering one makes the very next `hivemind` see "runtime
+  # up on ${RUNTIME_PORT}, proxy ${PROXY_PORT} dead" — the founder-reported
+  # "mTLS proxy: not responding" right after a SUCCESSFUL enroll. The reap in
+  # _start_proxy now recovers from that state; waiting here means it should
+  # never be entered in the first place.
+  _kill_wait_escalate "${_SETUP_PID}" 5
   rm -f "${SETUP_PID_FILE}"
   echo ""
   echo "Done. Run 'hivemind' in your project directory to start."
@@ -297,6 +401,47 @@ _proxy_ok() {
   [ "${_code}" != "000" ]
 }
 
+# ── _reap_orphan_runtimes: reap OUR runtimes that NO pidfile records ──────────
+# A pidfile is not a reliable census of our own daemons: _spawn_runtime writes
+# RUNTIME_PID_FILE only AFTER healthz answers (deliberate — see its header), and
+# _setup_mode removes SETUP_PID_FILE the moment enrollment ends. So a daemon
+# that outlived the shell that spawned it, or one left over from an interrupted
+# enrollment, can hold ${RUNTIME_PORT} while being invisible to BOTH the pidfile
+# reap below AND `hivemind stop` — which is exactly why the founder's only way
+# out was a manual stop+start that, by luck, also cleared SETUP_PID_FILE.
+#
+# Selection is by IDENTITY, never by port: a candidate must carry the FULL
+# absolute RUNTIME_BIN path on its command line (the same fixed-string,
+# full-path guard as _pid_is_hivemind_runtime, and RUNTIME_BIN is derived from
+# HIVEMIND_HOME — so this only ever matches THIS install's daemons). Reaping
+# "whatever holds ${RUNTIME_PORT}" was rejected: on a developer box the very
+# same default port is routinely held by an unrelated agent-runtime, and killing
+# it would be a far worse bug than the one being fixed.
+_reap_orphan_runtimes() {
+  local _pids _pid
+  if command -v pgrep > /dev/null 2>&1; then
+    _pids=$(pgrep -f -- "${RUNTIME_BIN}" 2>/dev/null || true)
+  else
+    # No pgrep (minimal container): same census via ps. The grep in this
+    # pipeline carries RUNTIME_BIN on its OWN command line, but it has exited
+    # by the time the loop runs and the re-verification below drops it anyway.
+    _pids=$(ps -eo pid=,command= 2>/dev/null | grep -F -- "${RUNTIME_BIN}" | awk '{print $1}' || true)
+  fi
+  for _pid in ${_pids}; do
+    # `if` rather than `[ ... ] && continue`: the latter's non-zero status on a
+    # non-match is an errexit trap waiting for the next edit to spring it.
+    if [ "${_pid}" = "$$" ]; then continue; fi
+    kill -0 "${_pid}" 2>/dev/null || continue
+    # Re-verify before killing: `pgrep -f` treats its argument as a REGEX (every
+    # '.' in the path is a wildcard) and the ps fallback matched a raw line —
+    # confirm with the fixed-string check cmd_stop trusts, so a loose match can
+    # never escalate into killing something that is not ours.
+    _pid_is_hivemind_runtime "${_pid}" || continue
+    _vecho "[hivemind] auto-heal: reaping orphan runtime with no pidfile (pid=${_pid})"
+    _kill_wait_escalate "${_pid}" 5
+  done
+}
+
 # ── _reap_stale_runtime: auto-heal what `hivemind stop` does by hand ──────────
 # Kills the runtime recorded in the pidfile ONLY when it is genuinely a
 # hivemind-runtime (via _pid_is_hivemind_runtime — the SAME guard cmd_stop
@@ -304,29 +449,35 @@ _proxy_ok() {
 # killed (only the stale pidfile is cleared). Callers invoke this ONLY after
 # establishing the current runtime is unhealthy (healthz down, or 7777 up but
 # proxy 7779 broken), so it never touches a HEALTHY runtime.
+#
+# BOTH pidfiles are swept, not just RUNTIME_PID_FILE: a --setup-only daemon
+# (SETUP_PID_FILE) listens on the SAME ${RUNTIME_PORT} as a normal runtime, and
+# setup-only mode deliberately never starts the mTLS proxy (server.ts:
+# `if (!isSetupOnly) startMtlsProxy()`). A leftover one therefore presents the
+# exact state the auto-heal exists for — /healthz answers on ${RUNTIME_PORT},
+# ${PROXY_PORT} is dead — while a RUNTIME_PID_FILE-only reap finds nothing to
+# kill and the fresh spawn then dies on EADDRINUSE. That is the measured
+# "enrolled fine, then 'mTLS proxy: not responding' until a manual stop+start"
+# bug (founder, 2026-07-31): _setup_mode signalled its daemon and exited without
+# waiting, and nothing downstream owned the leftover.
 _reap_stale_runtime() {
-  [ -f "${RUNTIME_PID_FILE}" ] || return 0
-  local _pid
-  _pid=$(cat "${RUNTIME_PID_FILE}" 2>/dev/null || echo '')
-  if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
-    if _pid_is_hivemind_runtime "${_pid}"; then
-      _vecho "[hivemind] auto-heal: stopping stale/stuck runtime (pid=${_pid})"
-      kill "${_pid}" 2>/dev/null || true
-      # Wait (bounded) for the process to actually exit so it releases the port
-      # before we spawn a replacement — avoids racing it into EADDRINUSE.
-      local _t=0
-      while kill -0 "${_pid}" 2>/dev/null && [ "${_t}" -lt 5 ]; do
-        sleep 1; _t=$((_t + 1))
-      done
-      if kill -0 "${_pid}" 2>/dev/null; then
-        _vecho "[hivemind] auto-heal: escalating to SIGKILL (pid=${_pid})"
-        kill -9 "${_pid}" 2>/dev/null || true
+  local _f _pid
+  for _f in "${RUNTIME_PID_FILE}" "${SETUP_PID_FILE}"; do
+    [ -f "${_f}" ] || continue
+    _pid=$(cat "${_f}" 2>/dev/null || echo '')
+    if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
+      if _pid_is_hivemind_runtime "${_pid}"; then
+        _vecho "[hivemind] auto-heal: stopping stale/stuck runtime (pid=${_pid}, pidfile=${_f})"
+        _kill_wait_escalate "${_pid}" 5
+      else
+        _vecho "[hivemind] pidfile pid=${_pid} is not a hivemind runtime (recycled) — clearing pidfile only, not killing"
       fi
-    else
-      _vecho "[hivemind] pidfile pid=${_pid} is not a hivemind runtime (recycled) — clearing pidfile only, not killing"
     fi
-  fi
-  rm -f "${RUNTIME_PID_FILE}"
+    rm -f "${_f}"
+  done
+
+  # Last resort: daemons no pidfile knows about (see _reap_orphan_runtimes).
+  _reap_orphan_runtimes
 }
 
 # ── _spawn_runtime: launch a fresh runtime, wait for healthz, THEN write pidfile
