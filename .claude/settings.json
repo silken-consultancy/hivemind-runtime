@@ -161,6 +161,10 @@
           {
             "type": "command",
             "command": "if [ -f __HIVEMIND_HOME__/.claude/hooks/user-prompt-submit.capture-quota.js ]; then exec node __HIVEMIND_HOME__/.claude/hooks/user-prompt-submit.capture-quota.js; fi"
+          },
+          {
+            "type": "command",
+            "command": "if [ -f __HIVEMIND_HOME__/.claude/hooks/user-prompt-submit.execute-boundary-turn-reset.js ]; then exec node __HIVEMIND_HOME__/.claude/hooks/user-prompt-submit.execute-boundary-turn-reset.js; fi"
           }
         ]
       }
@@ -174,11 +178,20 @@
             "command": "if [ -f __HIVEMIND_HOME__/.claude/hooks/pre-tool-use.build-nudge.js ]; then exec node __HIVEMIND_HOME__/.claude/hooks/pre-tool-use.build-nudge.js; fi"
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f __HIVEMIND_HOME__/.claude/hooks/pre-tool-use.execute-boundary-gate.js ]; then exec node __HIVEMIND_HOME__/.claude/hooks/pre-tool-use.execute-boundary-gate.js; fi"
+          }
+        ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Edit|Write|MultiEdit|Bash",
         "hooks": [
           {
             "type": "command",
