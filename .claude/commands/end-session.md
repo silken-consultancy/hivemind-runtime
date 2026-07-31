@@ -53,10 +53,22 @@ handoff de continuidade. Se não houver WIP em aberto no momento do fechamento, 
 explicitamente `WIP: nenhum` / `NEXT: nenhum` (não omita o campo).
 
 **Se `ENGRAM_SESSION_ID` estiver vazio/ausente no ambiente** (abertura da espinha falhou nesta janela —
-best-effort, ver `bin/hivemind`): pule este passo silenciosamente, sem tentar
-adivinhar um session_id. O watchdog do servidor fecha a sessão órfã sozinho; não há
-handoff de continuidade nesta janela, mas o passo 1 (memórias) já persistiu o que
-importava.
+best-effort, ver `bin/hivemind`): pule este passo, sem tentar adivinhar um session_id.
+
+O mecanismo PRIMÁRIO de fechamento automático desta janela é o hook `SessionEnd`
+(`.claude/hooks/session-end.close-session.js`, registrado em `.claude/settings.json`) —
+ele dispara sozinho quando a sessão realmente termina, sem o founder precisar digitar
+nada. Mas ele também depende de `ENGRAM_SESSION_ID` estar presente no ambiente; se a
+espinha nunca abriu nesta janela, o hook também não tem o que fechar.
+
+O watchdog do servidor (`WatchdogService.sweepOrphans`) é uma rede de segurança
+SECUNDÁRIA, não uma garantia silenciosa: ele varre por sessões órfãs num intervalo
+periódico (não instantâneo) e com um limiar conservador de inatividade — cobre o
+caso em que NENHUM dos dois hooks do cliente dispara (processo morto, rede caiu,
+terminal fechado à força). Sem `ENGRAM_SESSION_ID` nesta janela, o que se perde de
+fato é o handoff de continuidade explícito (`next_note`) — mesmo com os dois
+mecanismos de fechamento em pé, nenhum deles inventa uma nota que nunca existiu. O
+passo 1 (memórias) já persistiu o que importava do conteúdo desta sessão.
 
 ## Regras
 

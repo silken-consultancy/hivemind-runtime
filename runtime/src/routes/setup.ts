@@ -7,16 +7,22 @@
 // Contract CONFIRMED against the real enrollment endpoint:
 //
 //   Request:  POST /ca/issue  body: { csr: string, api_key: string, days?: number }
-//   Response: { cert: string, serial: string, token: string, ca_cert_pem: string }
+//   Response: { cert: string, serial: string, token: string, ca_cert_pem: string, tenant: string }
 //
 // NOTE: /ca/issue does NOT require a client cert — it validates the api_key
-// directly (the key IS the identity source: cert CN = the key's tenant, NOT the
-// client-typed owner_id nor the CSR CN). After enrollment, the issued cert is
+// directly (the key IS the identity source: cert CN = the key's tenant). There
+// is no client-typed owner_id anymore — the popup only asks for the API Key;
+// the real identity (tenant) comes back IN THE RESPONSE, not from anything the
+// user types, and the CSR CN is discarded server-side too. Because the tenant
+// is only known AFTER /ca/issue responds but the keypair must be generated
+// BEFORE that call, the key/cert files are written under a TEMP name first and
+// RENAMED to `${tenant}.{key,cert}.pem` once the response lands (see the
+// rename block in the handler below). After enrollment, the issued cert is
 // used for all subsequent mTLS connections, and the SAME api_key is the x-fos-
 // key (Path B) for the MCP.
 
 import { Hono } from 'hono';
-import { existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync, renameSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -75,20 +81,17 @@ setupRouter.get('/', (c) => {
   <div class="card">
     <h1>HiveMind</h1>
     <p class="sub">Configure seu certificado pessoal para conectar à memória.</p>
-    <label for="owner">ID do Usuário</label>
-    <input type="text" id="owner" placeholder="ex: beta-joao" autocomplete="off">
     <label for="apikey">API Key</label>
-    <input type="password" id="apikey" placeholder="Cole a API Key de config→api_key" autocomplete="off">
+    <input type="password" id="apikey" placeholder="Cole a API Key que você recebeu por e-mail" autocomplete="off">
     <button id="btn" onclick="enroll()">Configurar mTLS</button>
     <div id="log"></div>
   </div>
   <script>
     async function enroll() {
-      const owner = document.getElementById('owner').value.trim();
       const apiKey = document.getElementById('apikey').value.trim();
       const log = document.getElementById('log');
       const btn = document.getElementById('btn');
-      if (!owner || !apiKey) { step('ID do Usuário e API Key são obrigatórios.', 'err'); return; }
+      if (!apiKey) { step('API Key é obrigatória.', 'err'); return; }
       btn.disabled = true;
       log.innerHTML = '';
       step('Enviando pedido de inscrição...', '');
@@ -96,7 +99,7 @@ setupRouter.get('/', (c) => {
         const res = await fetch('/setup/enroll', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ owner_id: owner, api_key: apiKey })
+          body: JSON.stringify({ api_key: apiKey })
         });
         const data = await res.json();
         if (data.ok) {
@@ -133,39 +136,38 @@ setupRouter.get('/', (c) => {
 // ── POST /setup/enroll — enrollment handler ────────────────────────────────────
 //
 // Steps:
-//  1. Validate body (owner_id + api_key required — enrollment_token RETIRED, key-as-bootstrap)
-//  2. Generate RSA keypair + CSR via openssl (Bun.spawnSync; RSA — the CA's forge is RSA-only)
-//  3. POST /ca/issue { csr, api_key } → { cert, ca_cert_pem } (api_key resolves tenant server-side)
-//  4. Save key + cert + CA to ~/.engram/mtls/ (chmod 0600)
-//  5. Write $HIVEMIND_HOME/.env with MTLS_* vars + FOS_API_KEY
+//  1. Validate body (api_key required — enrollment_token RETIRED, key-as-bootstrap;
+//     no client-typed identity — the tenant comes back IN THE CA RESPONSE)
+//  2. Generate RSA keypair + CSR via openssl, written under a TEMP name (Bun.spawnSync;
+//     RSA — the CA's forge is RSA-only; TEMP name because the tenant isn't known yet)
+//  3. POST /ca/issue { csr, api_key } → { cert, ca_cert_pem, tenant } (api_key resolves
+//     tenant server-side)
+//  4. Save cert + CA to ~/.engram/mtls/ (chmod 0600), then RENAME key + cert from the
+//     TEMP name to `${tenant}.{key,cert}.pem`
+//  5. Write $HIVEMIND_HOME/.env with MTLS_* vars + FOS_API_KEY (HIVEMIND_OWNER = tenant)
 //  6. Merge-write $HIVEMIND_HOME/.claude/.claude.json (mcpServers.engram, incl.
 //     headers['x-fos-key']) — the only path Claude Code actually reads for
 //     user-scope MCP discovery (measured, CLI v2.1.207; ~/.claude/mcp.json and
 //     ~/.mcp.json are dead paths, never read — item 5.1/F1 fix)
-//  7. Return { ok: true, owner_id }
+//  7. Return { ok: true, tenant }
 
 setupRouter.post('/enroll', async (c) => {
-  let body: { owner_id?: string; api_key?: string };
+  let body: { api_key?: string };
   try {
     body = await c.req.json();
   } catch {
     return c.json({ ok: false, message: 'Corpo JSON inválido' }, 400);
   }
 
-  const { owner_id: ownerId, api_key: apiKey } = body;
-  if (!ownerId || !apiKey) {
-    return c.json({ ok: false, message: 'ID do usuário e API Key são obrigatórios' }, 400);
-  }
-
-  // Sanitize owner_id: only alphanumeric, dash, underscore (CN-safe).
-  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(ownerId)) {
-    return c.json({ ok: false, message: 'O ID do usuário deve conter apenas letras, números, hífen ou underscore (máx. 64 caracteres)' }, 400);
+  const { api_key: apiKey } = body;
+  if (!apiKey) {
+    return c.json({ ok: false, message: 'API Key é obrigatória' }, 400);
   }
 
   // Validate api_key: length bounds + no newlines (would corrupt env.ts's
-  // line-by-line parser, split('\n') + indexOf('=')). Deliberately NOT the
-  // CN-safe regex used for owner_id above — the real charset of an engram API
-  // Key is unknown/wider (may contain base64 chars like +, /, =).
+  // line-by-line parser, split('\n') + indexOf('=')). Deliberately NOT a
+  // CN-safe regex — the real charset of an engram API Key is unknown/wider
+  // (may contain base64 chars like +, /, =).
   const trimmedApiKey = apiKey.trim();
   if (trimmedApiKey.length < 8 || trimmedApiKey.length > 512 || /[\n\r]/.test(trimmedApiKey)) {
     return c.json({ ok: false, message: 'A API Key deve ter entre 8 e 512 caracteres e não pode conter quebras de linha' }, 400);
@@ -182,9 +184,16 @@ setupRouter.post('/enroll', async (c) => {
     mkdirSync(mtlsDir, { recursive: true });
     chmodSync(mtlsDir, 0o700);
 
-    const keyPath  = join(mtlsDir, `${ownerId}.key.pem`);
-    const csrPath  = join(mtlsDir, `${ownerId}.csr.pem`);
-    const certPath = join(mtlsDir, `${ownerId}.cert.pem`);
+    // TEMP name: the real identity (tenant) is only known once /ca/issue
+    // responds (below), but the keypair has to exist before that call — so
+    // key/csr/cert are written under this temp id first and the key+cert are
+    // RENAMED to `${tenant}.{key,cert}.pem` once the response lands (step 4).
+    // The CSR CN below uses this same temp id — it's discarded server-side
+    // (cert CN = the api_key's tenant, not the CSR CN), so its value doesn't matter.
+    const tempId = crypto.randomUUID();
+    const keyPath  = join(mtlsDir, `${tempId}.key.pem`);
+    const csrPath  = join(mtlsDir, `${tempId}.csr.pem`);
+    const tempCertPath = join(mtlsDir, `${tempId}.cert.pem`);
     const caPath   = join(mtlsDir, 'ca.cert.pem');
 
     // 2. Generate RSA keypair + CSR via openssl. RSA (not EC) because the CA
@@ -198,7 +207,7 @@ setupRouter.post('/enroll', async (c) => {
       '-nodes',
       '-keyout', keyPath,
       '-out', csrPath,
-      '-subj', `/CN=${ownerId}`,
+      '-subj', `/CN=${tempId}`,
     ], {
       stdout: 'ignore',
       stderr: 'pipe',
@@ -244,11 +253,13 @@ setupRouter.post('/enroll', async (c) => {
     }
 
     // Response shape matches the real server contract: { cert, serial, token,
-    // ca_cert_pem } — NOT { cert_pem, ca_cert_pem } (that shape never existed
-    // on the server; this is the contract fix).
-    let caData: { cert?: string; serial?: string; token?: string; ca_cert_pem?: string };
+    // ca_cert_pem, tenant } — NOT { cert_pem, ca_cert_pem } (that shape never
+    // existed on the server; this is the contract fix). `tenant` is the ONLY
+    // source of identity now — it's what the api_key resolved to server-side,
+    // not anything the client typed or asserted.
+    let caData: { cert?: string; serial?: string; token?: string; ca_cert_pem?: string; tenant?: string };
     try {
-      caData = await caRes.json();
+      caData = (await caRes.json()) as typeof caData;
     } catch {
       return c.json({ ok: false, message: 'Resposta da CA não é um JSON válido' }, 502);
     }
@@ -256,28 +267,43 @@ setupRouter.post('/enroll', async (c) => {
     if (!caData.cert || !caData.ca_cert_pem) {
       return c.json({ ok: false, message: 'Resposta da CA não contém os campos cert ou ca_cert_pem' }, 502);
     }
+    // Defensive: `tenant` lands in a filesystem path below (the rename target),
+    // so it's validated even though it comes from the (trusted) CA response —
+    // never trust a value that ends up in `join()` without a shape check.
+    if (!caData.tenant || !/^[a-zA-Z0-9_-]{1,128}$/.test(caData.tenant)) {
+      return c.json({ ok: false, message: 'Resposta da CA não contém um tenant válido' }, 502);
+    }
+    const tenant = caData.tenant;
+    const keyFinalPath  = join(mtlsDir, `${tenant}.key.pem`);
+    const certFinalPath = join(mtlsDir, `${tenant}.cert.pem`);
 
-    // 4. Save cert + CA cert (chmod 0600).
-    writeFileSync(certPath, caData.cert, { mode: 0o600 });
+    // 4. Save cert (under the temp name) + CA cert (chmod 0600), then RENAME
+    // key + cert from the temp id to the real tenant-based name now that the
+    // tenant is known (see the TEMP-name comment at step 2 above).
+    writeFileSync(tempCertPath, caData.cert, { mode: 0o600 });
     writeFileSync(caPath, caData.ca_cert_pem, { mode: 0o600 });
+    renameSync(keyPath, keyFinalPath);
+    renameSync(tempCertPath, certFinalPath);
 
     // Clean up CSR (not needed after enrollment).
     try { unlinkSync(csrPath); } catch { /* best-effort */ }
 
     // 5. Write $HIVEMIND_HOME/.env with MTLS_* vars + FOS_API_KEY (item 6.1,
-    // auth cert+chave — consumed by bin/hivemind's `set -a; . .env; set +a`,
-    // which exports it into the `exec env ... claude` environment so the
-    // MCP entry's `headers['x-fos-key']: '${FOS_API_KEY}'` can resolve it).
+    // auth cert+chave). FOS_API_KEY is consumed by the DAEMON now (atomic-
+    // flip, round-2 2026-07-30): mtls-proxy.ts injects x-fos-key server-side
+    // on the outbound hop from this same .env var (exported into the
+    // daemon's env by bin/hivemind's `set -a; . .env; set +a`) — Claude
+    // Code's own MCP config (step 6 below) no longer carries the key at all.
     const proxyPort = process.env.MTLS_PROXY_PORT ?? '7779';
     const envContent = [
       `# HiveMind mTLS config — written by hivemind setup on ${new Date().toISOString()}`,
-      `MTLS_CERT_PATH=${certPath}`,
-      `MTLS_KEY_PATH=${keyPath}`,
+      `MTLS_CERT_PATH=${certFinalPath}`,
+      `MTLS_KEY_PATH=${keyFinalPath}`,
       `MTLS_CA_PATH=${caPath}`,
       `MTLS_UPSTREAM=https://${ENDPOINT}/v1/mcp`,
       `MTLS_PROXY_PORT=${proxyPort}`,
       `HIVEMIND_ENDPOINT=${ENDPOINT}`,
-      `HIVEMIND_OWNER=${ownerId}`,
+      `HIVEMIND_OWNER=${tenant}`,
       `FOS_API_KEY=${trimmedApiKey}`,
       '',
     ].join('\n');
@@ -317,29 +343,23 @@ setupRouter.post('/enroll', async (c) => {
         existingConfig = {};
       }
     }
-    // headers['x-fos-key'] (item 6.1, auth cert+chave): the literal string
-    // '${FOS_API_KEY}' is written here, relying on the Claude Code CLI's http
-    // transport expanding ${VAR} from the process env at connect time (the
-    // same env bin/hivemind already exports via `set -a; . .env; set +a`
-    // before `exec env ... claude`). OPEN-cfg-A RESOLVED LIVE this pass (CLI
-    // v2.1.207, matching the version pin): a probe MCP http server + a
-    // `.claude.json` with `headers: {"x-test-var": "${TESTVAR}"}` under an
-    // isolated CLAUDE_CONFIG_DIR showed the literal value `${TESTVAR}` DOES
-    // get expanded from the process env — the upstream request arrived with
-    // the header already substituted, not the template string. G-cfg1 (real
-    // enrollment against the real engram MCP endpoint) is still the
-    // end-to-end confirmation, but the CLI-level expansion mechanism itself is
-    // no longer an open question. Fallback (literal trimmedApiKey value
-    // instead of the template) is therefore NOT expected to be needed, but is
-    // documented here in case G-cfg1 surfaces an unrelated 401.
+    // mcpServers.engram (atomic-flip, round-2 2026-07-30 — supersedes the
+    // item 6.1 headers['x-fos-key'] template + its OPEN-cfg-A live-expansion
+    // proof, both removed here): url is now https://127.0.0.1:<port>/v1/mcp, matching the
+    // local HTTPS-only listener (mtls-proxy.ts item 1.1(B)) — validates
+    // against the local CA trusted into the system store by item 1.4, so no
+    // manual "accept this certificate" prompt. NO headers written: the proxy
+    // injects x-fos-key server-side from FOS_API_KEY in .env (mtls-proxy.ts
+    // item 1.1(A)), so this file — readable by anything with fs access to
+    // $HIVEMIND_HOME — carries zero secret material regardless of what wrote
+    // or read it.
     const mergedConfig = {
       ...existingConfig,
       mcpServers: {
         ...(existingConfig.mcpServers as Record<string, unknown> | undefined),
         engram: {
           type: 'http',
-          url: `http://127.0.0.1:${proxyPort}/v1/mcp`,
-          headers: { 'x-fos-key': '${FOS_API_KEY}' },
+          url: `https://127.0.0.1:${proxyPort}/v1/mcp`,
         },
       },
     };
@@ -354,7 +374,7 @@ setupRouter.post('/enroll', async (c) => {
     // Mark enrollment done for /setup/status poll.
     enrollmentDone = true;
 
-    return c.json({ ok: true, owner_id: ownerId });
+    return c.json({ ok: true, tenant });
 
   } catch (err: unknown) {
     // Never expose stack trace to browser.

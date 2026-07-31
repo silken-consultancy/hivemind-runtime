@@ -26,8 +26,12 @@ process.env.HIVEMIND_ENDPOINT = 'ca-test.invalid:4443';
 
 const FAKE_CA_CERT_PEM = '-----BEGIN CERTIFICATE-----\nFAKE-CA-CERT\n-----END CERTIFICATE-----\n';
 const FAKE_CLIENT_CERT_PEM = '-----BEGIN CERTIFICATE-----\nFAKE-CLIENT-CERT\n-----END CERTIFICATE-----\n';
-const OWNER_ID = 'contract-test-owner';
 const API_KEY = 'test-api-key-1234567890';
+// The CA response now RESOLVES identity server-side — the client no longer
+// types/asserts an owner_id at all, only the api_key. Each test that needs a
+// distinct on-disk identity sets FAKE_TENANT before calling /enroll (the
+// mocked fetch below reads it live, not a snapshot at module-load time).
+let FAKE_TENANT = 'contract-test-tenant';
 
 let capturedUrl: string | undefined;
 let capturedBody: unknown;
@@ -35,7 +39,7 @@ const originalFetch = globalThis.fetch;
 
 // Intercept ONLY the /ca/issue call — everything else falls through to the
 // real fetch (unused in this test, but keeps the mock honest/scoped).
-globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
   const url = String(input);
   if (url.includes('/ca/issue')) {
     capturedUrl = url;
@@ -46,6 +50,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         serial: 'deadbeef',
         token: 'fake.jwt.token',
         ca_cert_pem: FAKE_CA_CERT_PEM,
+        tenant: FAKE_TENANT,
       }),
       { status: 201, headers: { 'content-type': 'application/json' } },
     );
@@ -63,20 +68,22 @@ afterAll(() => {
   rmSync(testHome, { recursive: true, force: true });
 });
 
-test('POST /enroll sends the REAL server request shape: { csr, api_key }', async () => {
+test('POST /enroll sends the REAL server request shape: { csr, api_key } — NO client-typed identity', async () => {
+  FAKE_TENANT = 'contract-test-tenant-1';
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ owner_id: OWNER_ID, api_key: API_KEY }),
+    body: JSON.stringify({ api_key: API_KEY }),
   });
 
-  const data = (await res.json()) as { ok: boolean; owner_id?: string; message?: string };
+  const data = (await res.json()) as { ok: boolean; tenant?: string; message?: string };
   expect(data.ok).toBe(true);
-  expect(data.owner_id).toBe(OWNER_ID);
+  // Identity is server-resolved: the response's `tenant` — never client-asserted.
+  expect(data.tenant).toBe(FAKE_TENANT);
 
   // Contract under test: key-as-bootstrap. enrollment_token is RETIRED — the
   // api_key resolves the tenant server-side (cert CN = the key's tenant), so the
-  // body carries NO `tenant` and NO `enrollment_token`, only { csr, api_key }.
+  // body carries NO `owner_id`, NO `tenant`, NO `enrollment_token`, only { csr, api_key }.
   // Enrollment goes over 443/LE — the host WITHOUT the :4443 MCP port (see ENROLL_HOST in setup.ts).
   expect(capturedUrl).toBe(`https://${process.env.HIVEMIND_ENDPOINT!.split(':')[0]}/ca/issue`);
   expect(capturedBody).toEqual({
@@ -86,20 +93,25 @@ test('POST /enroll sends the REAL server request shape: { csr, api_key }', async
   expect((capturedBody as { csr: string }).csr).toContain('BEGIN CERTIFICATE REQUEST');
 });
 
-test('POST /enroll destructures the REAL server response shape and persists cert + CA cert', async () => {
-  const ownerId = 'contract-test-owner-2';
+test('POST /enroll destructures the REAL server response shape and persists cert + CA cert under the TENANT name', async () => {
+  FAKE_TENANT = 'contract-test-tenant-2';
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'another-token', owner_id: ownerId, api_key: API_KEY }),
+    body: JSON.stringify({ api_key: API_KEY }),
   });
   const data = (await res.json()) as { ok: boolean };
   expect(data.ok).toBe(true);
 
   const mtlsDir = join(testHome, '.engram', 'mtls');
-  const certPath = join(mtlsDir, `${ownerId}.cert.pem`);
+  // File-rename mechanic: written under a temp id, then renamed to
+  // `${tenant}.{key,cert}.pem` once the response's tenant is known — so the
+  // FINAL on-disk name is the server-resolved tenant, not anything typed.
+  const keyPath = join(mtlsDir, `${FAKE_TENANT}.key.pem`);
+  const certPath = join(mtlsDir, `${FAKE_TENANT}.cert.pem`);
   const caPath = join(mtlsDir, 'ca.cert.pem');
 
+  expect(existsSync(keyPath)).toBe(true);
   expect(existsSync(certPath)).toBe(true);
   expect(existsSync(caPath)).toBe(true);
   // Contract fix under test: destructure reads `cert`/`ca_cert_pem`, NOT the
@@ -109,7 +121,7 @@ test('POST /enroll destructures the REAL server response shape and persists cert
 });
 
 test('POST /enroll writes $HIVEMIND_HOME/.claude/.claude.json merge-safely (item 5.1/F1, P1)', async () => {
-  const ownerId = 'contract-test-owner-p1';
+  FAKE_TENANT = 'contract-test-tenant-p1';
   const claudeDir = join(process.env.HIVEMIND_HOME!, '.claude');
   const claudeConfigPath = join(claudeDir, '.claude.json');
 
@@ -128,7 +140,7 @@ test('POST /enroll writes $HIVEMIND_HOME/.claude/.claude.json merge-safely (item
     setupRouter.request('/enroll', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: 'p1-token', owner_id: ownerId, api_key: API_KEY }),
+      body: JSON.stringify({ api_key: API_KEY }),
     });
 
   // Run 1.
@@ -137,10 +149,13 @@ test('POST /enroll writes $HIVEMIND_HOME/.claude/.claude.json merge-safely (item
   const configAfterRun1 = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
   expect(configAfterRun1.someArbitraryKey).toBe('keep-me');
   expect(configAfterRun1.mcpServers.otherServer).toEqual({ type: 'stdio', command: 'some-other-mcp' });
+  // https:// + no headers (atomic-flip, round-2 2026-07-30): the loopback
+  // listener is HTTPS-only now (mtls-proxy.ts item 1.1(B)) and injects
+  // x-fos-key server-side (item 1.1(A)) — Claude Code's own config carries
+  // zero secret material.
   expect(configAfterRun1.mcpServers.engram).toEqual({
     type: 'http',
-    url: 'http://127.0.0.1:7779/v1/mcp',
-    headers: { 'x-fos-key': '${FOS_API_KEY}' },
+    url: 'https://127.0.0.1:7779/v1/mcp',
   });
 
   // Run 2 (idempotency — re-running enrollment must not clobber the survivors).
@@ -155,7 +170,7 @@ test('POST /enroll writes $HIVEMIND_HOME/.claude/.claude.json merge-safely (item
 });
 
 test('POST /enroll self-heals a top-level `null` .claude.json instead of throwing (code-review hardening)', async () => {
-  const ownerId = 'contract-test-owner-null-guard';
+  FAKE_TENANT = 'contract-test-tenant-null-guard';
   const claudeDir = join(process.env.HIVEMIND_HOME!, '.claude');
   const claudeConfigPath = join(claudeDir, '.claude.json');
 
@@ -169,7 +184,7 @@ test('POST /enroll self-heals a top-level `null` .claude.json instead of throwin
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'null-guard-token', owner_id: ownerId, api_key: API_KEY }),
+    body: JSON.stringify({ api_key: API_KEY }),
   });
 
   expect(res.status).toBe(200);
@@ -179,8 +194,7 @@ test('POST /enroll self-heals a top-level `null` .claude.json instead of throwin
   const config = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
   expect(config.mcpServers.engram).toEqual({
     type: 'http',
-    url: 'http://127.0.0.1:7779/v1/mcp',
-    headers: { 'x-fos-key': '${FOS_API_KEY}' },
+    url: 'https://127.0.0.1:7779/v1/mcp',
   });
 });
 
@@ -190,13 +204,13 @@ test('POST /enroll fails cleanly (502) if the CA response is missing cert or ca_
     new Response(JSON.stringify({ serial: 'x', token: 'y' }), {
       status: 201,
       headers: { 'content-type': 'application/json' },
-    })) as typeof fetch;
+    })) as unknown as typeof fetch;
 
   try {
     const res = await setupRouter.request('/enroll', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-3', api_key: API_KEY }),
+      body: JSON.stringify({ api_key: API_KEY }),
     });
     expect(res.status).toBe(502);
     const data = (await res.json()) as { ok: boolean; message?: string };
@@ -213,13 +227,38 @@ test('POST /enroll fails cleanly (502) if the CA response is missing cert or ca_
   }
 });
 
-// ── Item 6.1 (Fase 6) — auth cert+chave: API Key field + x-fos-key header ────
+test('POST /enroll fails cleanly (502) if the CA response is missing tenant', async () => {
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({ cert: FAKE_CLIENT_CERT_PEM, serial: 'x', token: 'y', ca_cert_pem: FAKE_CA_CERT_PEM }),
+      { status: 201, headers: { 'content-type': 'application/json' } },
+    )) as unknown as typeof fetch;
+
+  try {
+    const res = await setupRouter.request('/enroll', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ api_key: API_KEY }),
+    });
+    expect(res.status).toBe(502);
+    const data = (await res.json()) as { ok: boolean; message?: string };
+    expect(data.ok).toBe(false);
+    expect(data.message).toMatch(/tenant/);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+// ── Item 6.1 (Fase 6) — auth cert+chave: API Key field ───────────────────────
+// (the x-fos-key HEADER half of item 6.1 was superseded by the round-2
+// atomic-flip, 2026-07-30 — see the dedicated test below.)
 
 test('POST /enroll rejects a body missing api_key (400)', async () => {
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-noapikey' }),
+    body: JSON.stringify({}),
   });
   expect(res.status).toBe(400);
   const data = (await res.json()) as { ok: boolean; message?: string };
@@ -231,7 +270,7 @@ test('POST /enroll rejects an api_key shorter than 8 chars (400)', async () => {
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-shortkey', api_key: 'short' }),
+    body: JSON.stringify({ api_key: 'short' }),
   });
   expect(res.status).toBe(400);
   const data = (await res.json()) as { ok: boolean; message?: string };
@@ -243,7 +282,7 @@ test('POST /enroll rejects an api_key longer than 512 chars (400)', async () => 
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-longkey', api_key: 'x'.repeat(513) }),
+    body: JSON.stringify({ api_key: 'x'.repeat(513) }),
   });
   expect(res.status).toBe(400);
   const data = (await res.json()) as { ok: boolean; message?: string };
@@ -255,7 +294,7 @@ test('POST /enroll rejects an api_key containing a newline (400, P-b guard again
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'tok', owner_id: 'contract-test-owner-newlinekey', api_key: 'valid-looking\nkey-with-newline' }),
+    body: JSON.stringify({ api_key: 'valid-looking\nkey-with-newline' }),
   });
   expect(res.status).toBe(400);
   const data = (await res.json()) as { ok: boolean; message?: string };
@@ -263,35 +302,38 @@ test('POST /enroll rejects an api_key containing a newline (400, P-b guard again
   expect(data.message).toMatch(/API Key/);
 });
 
-test('POST /enroll writes headers[\'x-fos-key\'] into mergedConfig.mcpServers.engram (item 6.1)', async () => {
-  const ownerId = 'contract-test-owner-fos-key';
+test('POST /enroll writes mergedConfig.mcpServers.engram with NO headers — zero secret material (atomic-flip, round-2 2026-07-30)', async () => {
+  FAKE_TENANT = 'contract-test-tenant-fos-key';
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'fos-key-token', owner_id: ownerId, api_key: API_KEY }),
+    body: JSON.stringify({ api_key: API_KEY }),
   });
   expect((await res.json() as { ok: boolean }).ok).toBe(true);
 
   const claudeConfigPath = join(process.env.HIVEMIND_HOME!, '.claude', '.claude.json');
   const config = JSON.parse(readFileSync(claudeConfigPath, 'utf8'));
-  // Literal template string, NOT the raw secret value — relies on the Claude
-  // Code CLI http transport's ${VAR} expansion from the process env (measured
-  // live, CLI v2.1.207: confirmed the header value IS expanded — see the
-  // OPEN-cfg-A probe in the delivery report).
-  expect(config.mcpServers.engram.headers).toEqual({ 'x-fos-key': '${FOS_API_KEY}' });
+  // Supersedes the old item 6.1 headers['x-fos-key']:'${FOS_API_KEY}' template
+  // (+ its OPEN-cfg-A live-expansion proof) — the proxy now injects the
+  // credential server-side (mtls-proxy.ts item 1.1(A)), so this file must
+  // carry no `headers` key at all, and definitely no reference to the key.
+  expect(config.mcpServers.engram.headers).toBeUndefined();
+  expect(JSON.stringify(config.mcpServers.engram)).not.toContain('FOS_API_KEY');
 });
 
-test('POST /enroll writes FOS_API_KEY=<pasted value> into $HIVEMIND_HOME/.env, mode 0600 (item 6.1)', async () => {
-  const ownerId = 'contract-test-owner-envkey';
+test('POST /enroll writes FOS_API_KEY=<pasted value> + HIVEMIND_OWNER=<tenant> into $HIVEMIND_HOME/.env, mode 0600 (item 6.1)', async () => {
+  FAKE_TENANT = 'contract-test-tenant-envkey';
   const res = await setupRouter.request('/enroll', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ token: 'env-key-token', owner_id: ownerId, api_key: API_KEY }),
+    body: JSON.stringify({ api_key: API_KEY }),
   });
   expect((await res.json() as { ok: boolean }).ok).toBe(true);
 
   const envPath = join(process.env.HIVEMIND_HOME!, '.env');
   const envContent = readFileSync(envPath, 'utf8');
   expect(envContent).toContain(`FOS_API_KEY=${API_KEY}`);
+  // HIVEMIND_OWNER is now the server-resolved tenant — never a client-typed value.
+  expect(envContent).toContain(`HIVEMIND_OWNER=${FAKE_TENANT}`);
   expect(statSync(envPath).mode & 0o777).toBe(0o600);
 });

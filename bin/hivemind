@@ -39,6 +39,13 @@ RUNTIME_PID_FILE="${HOME}/.engram/cache/hivemind-runtime.pid"
 SETUP_PID_FILE="${HOME}/.engram/cache/hivemind-setup.pid"
 CERT_DIR="${HOME}/.engram/mtls"
 RUNTIME_BIN="${HIVEMIND_HOME}/runtime/src/server.ts"
+# Local HTTPS loopback listener cert (round-2, item 1.1(B)/1.4, founder
+# 2026-07-30) — generated lazily by mtls-proxy.ts under this subdir, DISTINCT
+# from CERT_DIR's enrollment client cert. Trusted into the WSL/Linux system
+# store here so a strict-TLS IDE client validates it without a skip-verify
+# flag (see _trust_local_ca).
+LOCAL_HTTPS_CA="${HOME}/.engram/mtls/local-https/ca.cert.pem"
+SYSTEM_CA_DEST="/usr/local/share/ca-certificates/hivemind-local-https-ca.crt"
 
 # One-time endpoint migration (2026-07-21): hivemind.silken.ia.br → hivemind.ia.br.
 # The product endpoints moved to hivemind.ia.br (the silken.ia.br product blocks are
@@ -140,7 +147,7 @@ _check_health() {
   # setups without MTLS_PROXY_PORT are a deliberate mode, not a failure.
   if [ -n "${MTLS_PROXY_PORT:-}" ]; then
     _HEALTH_PROXY_CONFIGURED=1
-    if curl -sf "http://127.0.0.1:${PROXY_PORT}/v1/mcp" > /dev/null 2>&1; then
+    if curl -sf "https://127.0.0.1:${PROXY_PORT}/v1/mcp" > /dev/null 2>&1; then
       _HEALTH_PROXY_OK=1
     fi
   fi
@@ -237,7 +244,7 @@ _setup_mode() {
     echo "(Could not auto-open browser — open manually: ${_SETUP_URL})"
   fi
 
-  echo "Fill in your API Key and Owner ID, then click 'Configure mTLS'."
+  echo "Fill in your API Key, then click 'Configure mTLS'."
   echo "Waiting for enrollment to complete (timeout: 5 min)..."
 
   # Poll /setup/status until done (timeout 300s / 5 min).
@@ -286,7 +293,7 @@ _proxy_ok() {
   [ -n "${MTLS_PROXY_PORT:-}" ] || return 0
   local _code
   _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
-    "http://127.0.0.1:${PROXY_PORT}/v1/mcp" 2>/dev/null) || return 1
+    "https://127.0.0.1:${PROXY_PORT}/v1/mcp" 2>/dev/null) || return 1
   [ "${_code}" != "000" ]
 }
 
@@ -368,6 +375,44 @@ _spawn_runtime() {
   return 0
 }
 
+# ── _local_ca_trusted: is the CURRENT local-https CA already in the system
+# store? Fingerprint-compared (not just presence) so a rotated/regenerated CA
+# (e.g. ~/.engram/mtls/local-https/ wiped and regenerated) is detected and
+# re-trusted, instead of silently trusting a stale copy forever.
+_local_ca_trusted() {
+  [ -f "${SYSTEM_CA_DEST}" ] || return 1
+  local _have _want
+  _have="$(_cert_fingerprint_sha256 "${SYSTEM_CA_DEST}" 2>/dev/null)"
+  _want="$(_cert_fingerprint_sha256 "${LOCAL_HTTPS_CA}" 2>/dev/null)"
+  [ -n "${_have}" ] && [ "${_have}" = "${_want}" ]
+}
+
+# ── _trust_local_ca: item 1.4 — trust the local HTTPS listener CA into the
+# WSL/Linux system store (this machine only; Windows/Antigravity trust is
+# Phase 4 item 4.4, out of scope here). No-op when the local CA has not been
+# generated yet (mtls-proxy.ts generates it lazily on first proxy start —
+# nothing to trust before that) or when already trusted (idempotent).
+# System-level act (sudo + update-ca-certificates) — this is the ONE place
+# in the codebase that escalates; never called speculatively, only from
+# _start_proxy right after a runtime is confirmed up.
+_trust_local_ca() {
+  [ -f "${LOCAL_HTTPS_CA}" ] || return 0
+  _local_ca_trusted && return 0
+
+  if ! command -v update-ca-certificates > /dev/null 2>&1; then
+    _vecho "[hivemind] update-ca-certificates not found (non-Debian/Ubuntu host?) — local HTTPS CA not trusted system-wide; strict-TLS clients will fail to verify 127.0.0.1:${PROXY_PORT}"
+    return 0
+  fi
+
+  echo "[hivemind] trusting local HTTPS CA into the system store (sudo required): ${SYSTEM_CA_DEST}" >&2
+  if sudo cp "${LOCAL_HTTPS_CA}" "${SYSTEM_CA_DEST}" 2>/dev/null \
+    && sudo update-ca-certificates > /dev/null 2>&1; then
+    _vecho "[hivemind] local HTTPS CA trusted"
+  else
+    echo "[hivemind] WARNING: failed to trust local HTTPS CA — a strict-TLS IDE client will fail to verify https://127.0.0.1:${PROXY_PORT}/v1/mcp until 'sudo update-ca-certificates' is run manually with ${LOCAL_HTTPS_CA} copied to ${SYSTEM_CA_DEST}" >&2
+  fi
+}
+
 # ── _start_proxy: ensure a HEALTHY runtime+proxy is running (idempotent) ──────
 # Reuse only a genuinely healthy runtime: healthz(7777) AND proxy(7779) both OK.
 # If 7777 answers but the proxy is broken (the orphaned/stuck runtime left by an
@@ -379,6 +424,12 @@ _spawn_runtime() {
 _start_proxy() {
   # Fast path: an already-healthy runtime+proxy is reused untouched.
   if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; then
+    # Item 1.4: ensure the local HTTPS cert (if present) is trusted BEFORE
+    # the _proxy_ok probe below — that probe is now an https:// request, so
+    # an untrusted CA would make a perfectly healthy proxy read as "down"
+    # (SSL verify failure, not connection-refused) and trigger a needless
+    # reap+restart loop. Idempotent/cheap when already trusted.
+    _trust_local_ca
     if _proxy_ok; then
       return 0
     fi
@@ -415,6 +466,12 @@ _start_proxy() {
     fi
   fi
   _vecho "[hivemind] runtime up (pid=$(cat "${RUNTIME_PID_FILE}" 2>/dev/null || echo '?'))"
+
+  # healthz(7777) confirmed above by _spawn_runtime — by server.ts's own
+  # startup order, startMtlsProxy() (and its lazy cert generation) runs
+  # synchronously BEFORE the main app's Bun.serve, so LOCAL_HTTPS_CA already
+  # exists on disk here if the proxy is configured at all (item 1.4).
+  _trust_local_ca
 }
 
 # ── Subcommands ───────────────────────────────────────────────────────────────
@@ -953,7 +1010,7 @@ _mcp_call() {
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":${_id},\"method\":\"tools/call\",\"params\":{\"name\":\"${_tool}\",\"arguments\":${_args_json}}}" \
-    "http://127.0.0.1:${PROXY_PORT}/v1/mcp" 2>/dev/null \
+    "https://127.0.0.1:${PROXY_PORT}/v1/mcp" 2>/dev/null \
     | grep "^data:" | head -1 | sed 's/^data: //' || true
 }
 
