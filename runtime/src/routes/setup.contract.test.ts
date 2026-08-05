@@ -23,6 +23,13 @@ mock.module('node:os', () => ({
 
 process.env.HIVEMIND_HOME = join(testHome, '.hivemind');
 process.env.HIVEMIND_ENDPOINT = 'ca-test.invalid:4443';
+// Isolate from whatever MTLS_PROXY_PORT the invoking shell happens to export
+// (setup.ts reads it directly: `process.env.MTLS_PROXY_PORT ?? '7779'`) — a
+// real `hivemind` session (like the one this repo's own dev box may already
+// be running under) exports its OWN proxy port, which silently overrides the
+// 7779 default every assertion below hardcodes (measured: this exact leak
+// flipped 7779→7879 depending on which shell ran `bun test`).
+delete process.env.MTLS_PROXY_PORT;
 
 const FAKE_CA_CERT_PEM = '-----BEGIN CERTIFICATE-----\nFAKE-CA-CERT\n-----END CERTIFICATE-----\n';
 const FAKE_CLIENT_CERT_PEM = '-----BEGIN CERTIFICATE-----\nFAKE-CLIENT-CERT\n-----END CERTIFICATE-----\n';

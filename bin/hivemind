@@ -184,7 +184,12 @@ _check_health() {
   # setups without MTLS_PROXY_PORT are a deliberate mode, not a failure.
   if [ -n "${MTLS_PROXY_PORT:-}" ]; then
     _HEALTH_PROXY_CONFIGURED=1
-    if curl -sf "https://127.0.0.1:${PROXY_PORT}/v1/mcp" > /dev/null 2>&1; then
+    # Reuse _proxy_ok's status-tolerant probe. A bare GET /v1/mcp returns 406
+    # (Not Acceptable) while the proxy is perfectly GO — so `curl -sf`, which
+    # fails on any 4xx, false-negatives the proxy as DEGRADED (measured
+    # 2026-08-04). _proxy_ok counts any HTTP status back (incl. 4xx/5xx) as
+    # "listener alive"; only http_code 000 (refused/timeout) is a real death.
+    if _proxy_ok; then
       _HEALTH_PROXY_OK=1
     fi
   fi
@@ -1535,6 +1540,85 @@ _bootstrap_first_slug() {
   return 0
 }
 
+# _seed_engram_mcp_config: re-assert mcpServers.engram in
+# $HIVEMIND_HOME/.claude/.claude.json at OPEN time (papercut d,
+# pattern_hivemind-runtime-mcp-config-is-user-scope-not-project-mcp-json,
+# measured 2026-08-04).
+#
+# WHY: cmd_open execs `claude --setting-sources user`, so Claude Code
+# discovers MCP servers ONLY from this user-scope file. The enrollment-time
+# seed (routes/setup.ts ~387-440) writes it ONCE, but Claude Code itself can
+# clobber the file on exit — leaving a future `/mcp` with no engram entry
+# until someone hand-reseeds it. Re-running the same merge-safe write on
+# every open closes that gap without ever needing a second source of truth.
+#
+# MERGE-SAFE, mirrors setup.ts's write EXACTLY (do not reinvent): preserve
+# every OTHER top-level key and every OTHER mcpServers.* entry; overwrite
+# ONLY mcpServers.engram; self-heal a missing/corrupted/non-object top-level
+# document AND a missing/null/array `mcpServers` to {} rather than throwing.
+# NO headers, NO FOS_API_KEY or other secret material in the written entry —
+# the mTLS proxy injects x-fos-key server-side (atomic-flip, round-2
+# 2026-07-30; setup.ts:414-423) — so this file, readable by anything with fs
+# access to $HIVEMIND_HOME, carries zero secrets regardless of who wrote or
+# reads it. Atomic write (temp file + rename) + chmod 0600, same posture as
+# setup.ts's own write of this file.
+#
+# No new dependency: bun is already a hard requirement of this script
+# (checked in _start_proxy) and is what setup.ts itself runs under, so this
+# reuses the same JS runtime rather than introducing a `node`/`jq` dependency.
+#
+# BEST-EFFORT (same fail-soft posture as _open_session_spine above, "engram
+# outage must not block opening Claude"): any failure here (disk full,
+# permissions, a transient bun hiccup) is logged via _vecho and swallowed —
+# it only degrades the NEXT session's /mcp discovery, never blocks THIS
+# session from opening Claude. Idempotent: running it twice back-to-back
+# produces byte-identical output on the second run.
+_seed_engram_mcp_config() {
+  local _claude_dir="${HIVEMIND_HOME}/.claude"
+  local _claude_config="${_claude_dir}/.claude.json"
+  if ! bun -e '
+    import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, mkdirSync } from "node:fs";
+    import { dirname } from "node:path";
+
+    const configPath = process.argv[1];
+    const proxyPort = process.argv[2];
+
+    let existing = {};
+    if (existsSync(configPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(configPath, "utf8"));
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          existing = parsed;
+        }
+        // else: corrupted/non-object document → {} (never throws, never
+        // aborts the open — same "corrompido → {}" contract as setup.ts).
+      } catch { /* unparseable → {} */ }
+    }
+
+    let existingServers = existing.mcpServers;
+    if (typeof existingServers !== "object" || existingServers === null || Array.isArray(existingServers)) {
+      existingServers = {};
+    }
+
+    const merged = {
+      ...existing,
+      mcpServers: {
+        ...existingServers,
+        engram: { type: "http", url: `https://127.0.0.1:${proxyPort}/v1/mcp` },
+      },
+    };
+
+    mkdirSync(dirname(configPath), { recursive: true });
+    const tmpPath = `${configPath}.tmp-${process.pid}`;
+    writeFileSync(tmpPath, JSON.stringify(merged, null, 2), { mode: 0o600 });
+    renameSync(tmpPath, configPath);
+    chmodSync(configPath, 0o600);
+  ' "${_claude_config}" "${PROXY_PORT}" 2>/dev/null; then
+    _vecho "[hivemind] aviso: falha ao re-selar mcpServers.engram em .claude.json (não bloqueante)"
+  fi
+  return 0
+}
+
 # cmd_open: start proxy + exec claude.
 # $1 = slug (optional); remaining $@ passed to claude.
 cmd_open() {
@@ -1694,6 +1778,12 @@ cmd_open() {
     echo "Nenhuma credencial encontrada no runtime isolado do HiveMind — fazendo login..."
     env CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" claude auth login || true
   fi
+
+  # Re-assert mcpServers.engram in the user-scope .claude.json RIGHT BEFORE
+  # exec (papercut d) — closes the window where a prior Claude Code exit
+  # clobbered the enrollment-time seed, without depending on anything else
+  # in cmd_open having run first. Best-effort, never blocks the exec below.
+  _seed_engram_mcp_config
 
   # --setting-sources user (item 5.2, F2 isolation): the isolated CONFIG_DIR
   # already redirects commands/skills/MCP/global-CLAUDE.md (CLAUDE_CONFIG_DIR
