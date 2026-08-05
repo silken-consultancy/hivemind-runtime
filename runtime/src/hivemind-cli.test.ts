@@ -17,7 +17,7 @@
 // guard under test while listening on nothing. The endpoint tests shadow `curl`
 // with a shell function, so they make no network call at all.
 import { test, expect, afterAll } from 'bun:test';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 
@@ -50,6 +50,14 @@ function sh(name: string, body: string): string {
     `#!/usr/bin/env bash
 export HOME="${caseDir}/home"
 export HIVEMIND_HOME="${caseDir}/home/.hivemind"
+# Isolate from whatever the invoking shell happens to export — notably
+# MTLS_PROXY_PORT, which a real \`hivemind\` session (like the one this repo's
+# own dev box may be running under) sets to its OWN proxy port. Without this,
+# bin/hivemind's top-level \`PROXY_PORT="\${MTLS_PROXY_PORT:-7779}"\` silently
+# picks up the invoking shell's port instead of the deterministic 7779
+# default every case here assumes (measured: this exact leak flipped
+# 7779→7879 depending on which shell ran \`bun test\`).
+unset MTLS_PROXY_PORT
 mkdir -p "\$HOME"
 sed '/^# ── Entry point/,$d' "${HIVEMIND_BIN}" > "${caseDir}/lib.sh"
 # shellcheck disable=SC1090
@@ -70,6 +78,46 @@ ${body}
     throw new Error(`case '${name}' produced no assertions.\nstdout:\n${out}\nstderr:\n${res.stderr.toString()}`);
   }
   return out;
+}
+
+// caseHome/caseClaudeConfig — the exact paths `sh()`'s preamble exports as
+// $HOME/$HIVEMIND_HOME for a given case name, so a test can read back files a
+// case script wrote without threading them through `_assert`/stdout.
+function caseHome(name: string): string {
+  return join(testRoot, name, 'home');
+}
+function caseClaudeConfig(name: string): string {
+  return join(caseHome(name), '.hivemind', '.claude', '.claude.json');
+}
+
+// Runs a case script WITHOUT requiring an `_assert` line in its output (some
+// of the _seed_engram_mcp_config cases below assert on the written JSON file
+// directly, in TS, rather than via the bash `_assert` helper). Surfaces
+// stderr on a non-zero exit so a `set -euo pipefail` abort is visible.
+function shRaw(name: string, body: string): void {
+  const caseDir = join(testRoot, name);
+  mkdirSync(caseDir, { recursive: true });
+  const scriptPath = join(caseDir, 'case.sh');
+  writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env bash
+export HOME="${caseDir}/home"
+export HIVEMIND_HOME="${caseDir}/home/.hivemind"
+# See sh()'s matching comment: isolate PROXY_PORT from whatever
+# MTLS_PROXY_PORT the invoking shell happens to export.
+unset MTLS_PROXY_PORT
+mkdir -p "\$HOME"
+sed '/^# ── Entry point/,$d' "${HIVEMIND_BIN}" > "${caseDir}/lib.sh"
+# shellcheck disable=SC1090
+source "${caseDir}/lib.sh"
+
+${body}
+`,
+  );
+  const res = Bun.spawnSync(['bash', scriptPath], { stdout: 'pipe', stderr: 'pipe' });
+  if (res.exitCode !== 0) {
+    throw new Error(`case '${name}' exited ${res.exitCode}.\nstdout:\n${res.stdout.toString()}\nstderr:\n${res.stderr.toString()}`);
+  }
 }
 
 // ── Fix 1: stale-runtime auto-reap ───────────────────────────────────────────
@@ -238,5 +286,118 @@ _assert severity-ok "\${_HEALTH_SEVERITY}" 0
 `);
   expect(out).toContain('ok endpoint-ok');
   expect(out).toContain('ok severity-ok');
+  expect(out).not.toContain('not ok');
+});
+
+// ── Fix 3 (papercut d): _seed_engram_mcp_config — durable open-time reseed ──
+// setup.ts writes mcpServers.engram into $HIVEMIND_HOME/.claude/.claude.json
+// ONCE, at enrollment. Claude Code can clobber that file on exit (measured
+// 2026-08-04), so cmd_open now re-runs the SAME merge-safe write on every
+// open. These cases mirror setup.contract.test.ts's assertions for the
+// enrollment-time seed 1:1, against this open-time seed instead.
+
+test('_seed_engram_mcp_config preserves other top-level keys and other mcpServers.* entries, and is idempotent', () => {
+  const configPath = caseClaudeConfig('seed-merge-safe');
+  shRaw('seed-merge-safe', `
+export MTLS_PROXY_PORT=7779
+mkdir -p "\$(dirname "${configPath}")"
+cat > "${configPath}" <<'JSON'
+{
+  "someArbitraryKey": "keep-me",
+  "mcpServers": { "otherServer": { "type": "stdio", "command": "some-other-mcp" } }
+}
+JSON
+_seed_engram_mcp_config
+`);
+
+  const afterRun1 = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(afterRun1.someArbitraryKey).toBe('keep-me');
+  expect(afterRun1.mcpServers.otherServer).toEqual({ type: 'stdio', command: 'some-other-mcp' });
+  expect(afterRun1.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
+  // NO headers, no secret material — the proxy injects x-fos-key server-side.
+  expect(afterRun1.mcpServers.engram.headers).toBeUndefined();
+  expect(JSON.stringify(afterRun1.mcpServers.engram)).not.toContain('FOS_API_KEY');
+  expect(statSync(configPath).mode & 0o777).toBe(0o600);
+
+  // Idempotency: calling it again (this is what every `hivemind` open does)
+  // must not disturb the survivors or drift the engram entry.
+  shRaw('seed-merge-safe', `
+export MTLS_PROXY_PORT=7779
+_seed_engram_mcp_config
+`);
+  const afterRun2 = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(afterRun2).toEqual(afterRun1);
+});
+
+test('_seed_engram_mcp_config self-heals a null mcpServers instead of throwing', () => {
+  const configPath = caseClaudeConfig('seed-null-mcpservers');
+  shRaw('seed-null-mcpservers', `
+export MTLS_PROXY_PORT=7779
+mkdir -p "\$(dirname "${configPath}")"
+printf '{"mcpServers": null, "otherKey": "kept"}' > "${configPath}"
+_seed_engram_mcp_config
+`);
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(config.otherKey).toBe('kept');
+  expect(config.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
+});
+
+test('_seed_engram_mcp_config self-heals an array mcpServers instead of throwing', () => {
+  const configPath = caseClaudeConfig('seed-array-mcpservers');
+  shRaw('seed-array-mcpservers', `
+export MTLS_PROXY_PORT=7779
+mkdir -p "\$(dirname "${configPath}")"
+printf '{"mcpServers": ["not", "an", "object"], "otherKey": "kept"}' > "${configPath}"
+_seed_engram_mcp_config
+`);
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(config.otherKey).toBe('kept');
+  expect(config.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
+  // The stray array entries must not survive as numeric keys.
+  expect(Object.keys(config.mcpServers)).toEqual(['engram']);
+});
+
+test('_seed_engram_mcp_config self-heals a top-level null document instead of throwing', () => {
+  const configPath = caseClaudeConfig('seed-null-toplevel');
+  shRaw('seed-null-toplevel', `
+export MTLS_PROXY_PORT=7779
+mkdir -p "\$(dirname "${configPath}")"
+printf 'null' > "${configPath}"
+_seed_engram_mcp_config
+`);
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(config.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
+});
+
+test('_seed_engram_mcp_config creates .claude.json fresh when absent', () => {
+  const configPath = caseClaudeConfig('seed-fresh');
+  shRaw('seed-fresh', `
+export MTLS_PROXY_PORT=7779
+_seed_engram_mcp_config
+`);
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(config).toEqual({
+    mcpServers: { engram: { type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' } },
+  });
+  expect(statSync(configPath).mode & 0o777).toBe(0o600);
+});
+
+test('_seed_engram_mcp_config never blocks the caller (returns 0) even when the write fails', () => {
+  // Guard-rail under test: "engram outage must not block opening Claude"
+  // (the same fail-soft posture as _open_session_spine) extends to this seed
+  // — a disk/permissions hiccup here must degrade the NEXT open's /mcp
+  // discovery, never abort THIS one. Forced failure: a plain FILE sits where
+  // the .claude directory should be, so mkdirSync(dirname(...)) inside the
+  // bun snippet cannot create it.
+  const out = sh('seed-never-blocks', `
+mkdir -p "\$(dirname "\${HIVEMIND_HOME}")"
+mkdir -p "\${HIVEMIND_HOME}"
+touch "\${HIVEMIND_HOME}/.claude"
+export MTLS_PROXY_PORT=7779
+_rc=0
+_seed_engram_mcp_config || _rc=\$?
+_assert never-blocks-open "\${_rc}" 0
+`);
+  expect(out).toContain('ok never-blocks-open');
   expect(out).not.toContain('not ok');
 });
