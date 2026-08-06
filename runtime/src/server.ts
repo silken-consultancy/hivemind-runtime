@@ -20,7 +20,7 @@ import { env } from './lib/env.ts';
 import { health } from './routes/health.ts';
 import { setupRouter } from './routes/setup.ts';
 import { sessions, reconcileOnStartup, shutdownSessions } from './routes/sessions.ts';
-import { startMtlsProxy } from './lib/mtls-proxy.ts';
+import { startAllMtlsProxies, reloadNewProxyListeners } from './lib/mtls-proxy.ts';
 import { VERSION } from './version.ts';
 
 const isSetupOnly = process.argv.includes('--setup-only');
@@ -38,20 +38,45 @@ app.route('/setup', setupRouter);
 // Public, localhost-only bind — same bypass as /healthz and /setup.
 app.route('/sessions', sessions);
 
+// POST /internal/proxy/reload — Option 2 hot-add (item 46d0eeed). Lets a
+// RUNNING daemon pick up a freshly-`install`ed target's port WITHOUT a
+// restart: diffs port-map.json against the currently-bound port set and
+// binds only what's new, never touching/rebinding an existing listener (zero
+// session disruption). `hivemind install` calls this best-effort right after
+// writing a new port-map entry; if the daemon isn't running, the next
+// _start_proxy spawn reads the full port-map at boot instead (startAllMtlsProxies
+// above already covers that path). Public, localhost-only bind — same bypass
+// as /healthz/setup/sessions; skipped entirely in setup-only mode (no proxy
+// running to reload).
+app.post('/internal/proxy/reload', (c) => {
+  if (isSetupOnly) {
+    return c.json({ error: 'setup_only_mode', added: [], total: mtlsServers.length }, 409);
+  }
+  const alreadyBoundPorts = mtlsServers.map((s) => s.port as number);
+  const added = reloadNewProxyListeners(alreadyBoundPorts);
+  mtlsServers.push(...added);
+  return c.json({ added: added.map((s) => s.port), total: mtlsServers.length });
+});
+
 app.onError((err, c) => {
   console.error('[server] unhandled error:', err);
   return c.json({ error: 'internal_server_error' }, 500);
 });
 
 // mTLS proxy — skipped in setup-only mode (no cert provisioned yet).
-let mtlsServer: ReturnType<typeof startMtlsProxy> = null;
+// N-listener daemon (Option 2, item 46d0eeed): the default/shared port PLUS
+// one pinned listener per ~/.engram/mtls/port-map.json entry, all in this
+// one process. `mtlsServers` is the mutable, server.ts-owned registry that
+// both shutdown() (stop ALL of them) and POST /internal/proxy/reload
+// (append newly-bound ones, never touch existing) operate on.
+let mtlsServers: Bun.Server<undefined>[] = [];
 if (!isSetupOnly) {
-  mtlsServer = startMtlsProxy();
-  if (mtlsServer) {
-    console.log(
+  mtlsServers = startAllMtlsProxies();
+  if (mtlsServers.length > 0) {
+    for (const s of mtlsServers) {
       // https:// — local loopback listener is TLS-terminated (round-2, mtls-proxy.ts).
-      `[mtls-proxy] listening on https://127.0.0.1:${mtlsServer.port} -> ${env.MTLS_UPSTREAM}`,
-    );
+      console.log(`[mtls-proxy] listening on https://127.0.0.1:${s.port} -> ${env.MTLS_UPSTREAM}`);
+    }
   } else {
     console.log('[mtls-proxy] disabled (MTLS_PROXY_PORT not set or certs absent)');
   }
@@ -90,7 +115,7 @@ if (isSetupOnly) {
 // below and never calls this.
 async function shutdown(signal: string): Promise<void> {
   console.log(`[hivemind-runtime] ${signal} — shutting down`);
-  if (mtlsServer) mtlsServer.stop(true);
+  for (const s of mtlsServers) s.stop(true);
   try {
     await shutdownSessions();
   } catch (err) {
