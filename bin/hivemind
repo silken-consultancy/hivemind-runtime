@@ -1871,21 +1871,43 @@ _allocate_target_port() {
 # Prints "<port>\t<device_id>" on success; returns 1 (nothing printed, error
 # already on stderr via _allocate_target_port) if the range is exhausted on a
 # fresh allocation.
+#
+# code-review FIX (TOCTOU): the lookup-then-allocate-then-write sequence used
+# to run WITHOUT any cross-process lock, so N concurrent `hivemind install`s
+# (or N concurrent callers of this function) could all read the SAME "used
+# ports" snapshot before any of them persisted — measured: 8 concurrent
+# installs all minted port 7780, and 3 of the 8 port-map entries were lost
+# outright (each writer's read-merge-write raced the others' unflushed
+# write). The whole read+allocate+write critical section now runs inside a
+# single `flock -x` on ${PORT_MAP_FILE}.lock, so allocation and persistence
+# are atomic per install — a second concurrent caller blocks until the first
+# has both picked ITS port and written it to disk, and therefore always sees
+# it as "used". Same lock file guards every caller (this is the ONLY writer
+# of port-map.json), so this also serializes against itself when called
+# twice back-to-back for different paths in the same process (idempotent
+# re-install, two-distinct-targets tests below).
 _resolve_target_port_and_device_id() {
   local _path="$1" _target_id="$2" _scope="$3"
-  local _existing
-  _existing="$(_port_map_lookup "${_path}")"
-  if [ -n "${_existing}" ]; then
-    printf '%s\n' "${_existing}"
-    return 0
-  fi
+  mkdir -p "$(dirname "${PORT_MAP_FILE}")" 2>/dev/null || true
+  local _lock_file="${PORT_MAP_FILE}.lock"
+  local _rc=0
+  (
+    flock -x 200
+    local _existing
+    _existing="$(_port_map_lookup "${_path}")"
+    if [ -n "${_existing}" ]; then
+      printf '%s\n' "${_existing}"
+      exit 0
+    fi
 
-  local _port
-  _port="$(_allocate_target_port)" || return 1
-  local _device_id
-  _device_id="$(_mint_uuid)"
-  _port_map_write_entry "${_path}" "${_target_id}" "${_scope}" "${_port}" "${_device_id}"
-  printf '%s\t%s\n' "${_port}" "${_device_id}"
+    local _port
+    _port="$(_allocate_target_port)" || exit 1
+    local _device_id
+    _device_id="$(_mint_uuid)"
+    _port_map_write_entry "${_path}" "${_target_id}" "${_scope}" "${_port}" "${_device_id}"
+    printf '%s\t%s\n' "${_port}" "${_device_id}"
+  ) 200>"${_lock_file}" || _rc=$?
+  return "${_rc}"
 }
 
 # cmd_open: start proxy + exec claude.

@@ -732,6 +732,83 @@ test('_install_run — two DIFFERENT installs (cursor global, then cursor projec
   expect(new Set(deviceIds).size).toBe(2); // two distinct device_ids too
 });
 
+// code-review FIX (TOCTOU): _resolve_target_port_and_device_id used to
+// read the "used ports" snapshot and persist its pick with NO cross-process
+// lock, so N truly concurrent callers (N parallel `hivemind install`s, or
+// N parallel MCP-client bootstraps hitting this at once) could all read the
+// SAME snapshot before any of them wrote — measured before the fix: 8
+// concurrent installs all minted port 7780, and 3 of the 8 port-map entries
+// were lost outright (a read-merge-write race clobbering another writer's
+// unflushed entry). The fix wraps the whole read+allocate+write critical
+// section in `flock -x` on port-map.json.lock. This test drives that
+// directly (not through the interactive `_install_run` TTY flow, which
+// isn't meaningfully "concurrent" for N real terminals) — N bash processes,
+// each sourcing the SAME stripped bin/hivemind against the SAME $HOME,
+// spawned together and calling _resolve_target_port_and_device_id for N
+// DISTINCT paths (N distinct installs) at once.
+test('_resolve_target_port_and_device_id: N concurrent installs get N distinct ports, N entries, zero loss (TOCTOU regression)', async () => {
+  const name = 'resolve-concurrent';
+  const dir = join(testRoot, name);
+  const home = join(dir, 'home');
+  mkdirSync(home, { recursive: true });
+
+  const libPath = join(dir, 'lib.sh');
+  const strip = Bun.spawnSync(['bash', '-c', `sed '/^# ── Entry point/,$d' "${HIVEMIND_BIN}" > "${libPath}"`]);
+  if (strip.exitCode !== 0) throw new Error(`failed to strip entry point: ${strip.stderr.toString()}`);
+
+  const N = 8;
+  const procs = Array.from({ length: N }, (_, i) => {
+    const scriptPath = join(dir, `run-${i}.sh`);
+    writeFileSync(
+      scriptPath,
+      `#!/usr/bin/env bash
+set -euo pipefail
+export HOME="${home}"
+export HIVEMIND_HOME="${home}/.hivemind"
+unset MTLS_PROXY_PORT
+# shellcheck disable=SC1090
+source "${libPath}"
+_resolve_target_port_and_device_id "/concurrent-target-${i}/config.json" "cursor" "global"
+`,
+    );
+    return Bun.spawn(['bash', scriptPath], { stdout: 'pipe', stderr: 'pipe' });
+  });
+
+  const results = await Promise.all(
+    procs.map(async (p) => {
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(p.stdout).text(),
+        new Response(p.stderr).text(),
+        p.exited,
+      ]);
+      return { stdout: stdout.trim(), stderr, exitCode };
+    }),
+  );
+
+  for (const r of results) {
+    if (r.exitCode !== 0) {
+      throw new Error(`a concurrent _resolve_target_port_and_device_id call failed (rc=${r.exitCode}).\nstderr:\n${r.stderr}`);
+    }
+  }
+
+  // N distinct ports handed back to the N callers — zero collisions.
+  const ports = results.map((r) => Number(r.stdout.split('\t')[0]));
+  expect(ports).toHaveLength(N);
+  expect(new Set(ports).size).toBe(N);
+
+  // N distinct device_ids too.
+  const deviceIds = results.map((r) => r.stdout.split('\t')[1]);
+  expect(new Set(deviceIds).size).toBe(N);
+
+  // N entries actually persisted to port-map.json — zero lost writes.
+  const portMapPath = join(home, '.engram', 'mtls', 'port-map.json');
+  const map = JSON.parse(readFileSync(portMapPath, 'utf8'));
+  expect(map.entries).toHaveLength(N);
+  const persistedPorts: number[] = map.entries.map((e: { port: number }) => e.port);
+  expect(new Set(persistedPorts).size).toBe(N);
+  expect([...persistedPorts].sort((a, b) => a - b)).toEqual([...ports].sort((a, b) => a - b));
+}, 30000);
+
 test('_install_run — the CLI\'s own self-seed (_seed_engram_mcp_config) stays on the shared PROXY_PORT, untouched by install\'s dedicated-port allocation', () => {
   // Migration/non-breaking guarantee: item 18cff9b7 changes ONLY the
   // `hivemind install` carrier's port; _seed_engram_mcp_config (Claude
