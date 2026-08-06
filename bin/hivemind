@@ -1910,6 +1910,34 @@ _resolve_target_port_and_device_id() {
   return "${_rc}"
 }
 
+# _preview_target_port: READ-ONLY preview of the port `_resolve_target_port_
+# and_device_id` would return right now — reuses an existing port-map entry
+# for `path` if one is already there (the idempotent re-install case, so the
+# confirmation prompt shows the SAME port the commit below will reuse), or
+# computes the lowest currently-free port in range for DISPLAY ONLY: no
+# lock, no write, no minted device_id, no port-map.json mutation.
+#
+# Exists so `_install_run` can show the human "here's the port you're about
+# to wire up" at the y/N confirmation WITHOUT allocating/persisting anything
+# yet (code-review FIX: declining used to still leave a minted device_id +
+# reserved port behind — see _resolve_target_port_and_device_id's caller in
+# _install_run). Because this is a lock-free peek, under real concurrent
+# installs the previewed port could in principle differ from the one
+# actually committed after confirmation (another install grabs it in
+# between) — cosmetic only (never a collision: the real allocation is still
+# atomic), and _install_run re-displays the committed port if that happens.
+# $1=path. Prints "<port>" (no device_id — not minted yet for a fresh path).
+_preview_target_port() {
+  local _path="$1"
+  local _existing
+  _existing="$(_port_map_lookup "${_path}")"
+  if [ -n "${_existing}" ]; then
+    printf '%s' "${_existing}" | cut -f1
+    return 0
+  fi
+  _allocate_target_port
+}
+
 # cmd_open: start proxy + exec claude.
 # $1 = slug (optional); remaining $@ passed to claude.
 cmd_open() {
@@ -2437,32 +2465,37 @@ _install_run() {
     done
   fi
 
-  # Option 2 (fos_decision 1caee6a7, item 18cff9b7): allocate/reuse a
-  # DEDICATED loopback port + device_id for this exact config path BEFORE
-  # showing the confirmation, so the human sees the real port they're about
-  # to wire up — never PROXY_PORT (that stays the shared/default port for
-  # the CLI's OWN self-seed entry only, unchanged). Idempotent: re-running
-  # install against an already-mapped path reuses its existing port+id
-  # rather than reallocating (_resolve_target_port_and_device_id above).
+  # Option 2 (fos_decision 1caee6a7, item 18cff9b7): a DEDICATED loopback
+  # port + device_id for this exact config path — never PROXY_PORT (that
+  # stays the shared/default port for the CLI's OWN self-seed entry only,
+  # unchanged). Idempotent: re-running install against an already-mapped
+  # path reuses its existing port+id rather than reallocating
+  # (_resolve_target_port_and_device_id above).
+  #
+  # code-review FIX: allocation + port-map.json persistence used to happen
+  # HERE, before the y/N confirmation below — so declining ("Cancelado —
+  # nada escrito") was a lie: a device_id was already minted and a port
+  # already reserved/written to disk regardless of the answer. The prompt
+  # below now shows a READ-ONLY preview (_preview_target_port — no lock, no
+  # write, no minted device_id); the REAL allocate-or-reuse + persist
+  # (_resolve_target_port_and_device_id, lock-protected) only runs AFTER
+  # the human confirms, so a decline truly writes nothing.
   local _scope_for_map="${_INSTALL_SCOPE:-}"
   case "${_chosen_id}" in
     antigravity) _scope_for_map="global" ;; # structurally single-scope
     manual)      _scope_for_map="manual" ;;
   esac
-  local _port_resolved
-  if ! _port_resolved="$(_resolve_target_port_and_device_id "${_final_path}" "${_chosen_id}" "${_scope_for_map}")"; then
-    echo "  $(_err "✗") falha ao alocar uma porta dedicada para '${_chosen_id}' — nada escrito." >&2
+  local _preview_port
+  if ! _preview_port="$(_preview_target_port "${_final_path}")"; then
+    echo "  $(_err "✗") falha ao calcular uma porta dedicada para '${_chosen_id}' — nada escrito." >&2
     return 1
   fi
-  local _target_port _target_device_id
-  _target_port="$(printf '%s' "${_port_resolved}" | cut -f1)"
-  _target_device_id="$(printf '%s' "${_port_resolved}" | cut -f2)"
 
   echo "" >&2
   echo "  Alvo:    ${_chosen_label:-${_chosen_id}}" >&2
   echo "  Arquivo: ${_final_path}" >&2
-  echo "  Porta dedicada: ${_target_port} (device_id ${_target_device_id})" >&2
-  echo "  Entrada: mcpServers.engram = {type:\"http\", url:\"https://127.0.0.1:${_target_port}/v1/mcp\"}" >&2
+  echo "  Porta dedicada: ${_preview_port}" >&2
+  echo "  Entrada: mcpServers.engram = {type:\"http\", url:\"https://127.0.0.1:${_preview_port}/v1/mcp\"}" >&2
   printf '  Confirma a escrita neste caminho? [y/N] ' >&2
   local _confirm
   if ! IFS= read -r _confirm; then
@@ -2477,9 +2510,27 @@ _install_run() {
       ;;
   esac
 
+  # Confirmed — NOW allocate-or-reuse + persist, atomically (lock-protected,
+  # see _resolve_target_port_and_device_id). Under real concurrent installs
+  # the committed port could in principle differ from the preview shown
+  # above (another install won the race in between); surface that plainly
+  # rather than silently writing a config that doesn't match what the human
+  # just confirmed.
+  local _port_resolved
+  if ! _port_resolved="$(_resolve_target_port_and_device_id "${_final_path}" "${_chosen_id}" "${_scope_for_map}")"; then
+    echo "  $(_err "✗") falha ao alocar uma porta dedicada para '${_chosen_id}' — nada escrito." >&2
+    return 1
+  fi
+  local _target_port _target_device_id
+  _target_port="$(printf '%s' "${_port_resolved}" | cut -f1)"
+  _target_device_id="$(printf '%s' "${_port_resolved}" | cut -f2)"
+  if [ "${_target_port}" != "${_preview_port}" ]; then
+    echo "  $(_dim "(porta ajustada para ${_target_port} — outra instalação reservou ${_preview_port} nesse meio-tempo)")" >&2
+  fi
+
   local _write_err
   if _write_err="$(_write_generic_mcp_config "${_final_path}" "${_target_port}" 2>&1)"; then
-    echo "  $(_ok "✓") gravado: ${_final_path}" >&2
+    echo "  $(_ok "✓") gravado: ${_final_path} (device_id ${_target_device_id})" >&2
     # Best-effort: tell an already-running daemon about the freshly-mapped
     # port so it's live immediately, no daemon restart needed (item
     # 46d0eeed's POST /internal/proxy/reload). NOT a hard dependency — if

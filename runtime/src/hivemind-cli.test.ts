@@ -497,13 +497,19 @@ test('_install_run — no target arg: guided menu → Cursor → global scope �
   expect(written.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7780/v1/mcp' });
 });
 
-test('_install_run — declining the final confirmation writes nothing', () => {
+test('_install_run — declining the final confirmation writes nothing (code-review fix: no port-map entry, no reserved port either)', () => {
   const { rc, home } = runInstallRun('install-cursor-decline', {
     stdin: '1\n1\nn\n',
     seedCursor: true,
   });
   expect(rc).not.toBe(0);
   expect(existsSync(join(home, '.cursor', 'mcp.json'))).toBe(false);
+  // The old behaviour allocated + persisted a port-map entry (minted
+  // device_id, reserved port) BEFORE the confirmation prompt, so declining
+  // still left an entry behind. The allocate+write now happens strictly
+  // AFTER confirmation, so declining must leave port-map.json completely
+  // untouched — not even created.
+  expect(existsSync(join(home, '.engram', 'mtls', 'port-map.json'))).toBe(false);
 });
 
 test('_install_run — target arg supplied: skips the candidate menu but still asks scope and confirms (project scope)', () => {
