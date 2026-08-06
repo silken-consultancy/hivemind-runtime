@@ -828,6 +828,11 @@ _stage_build() {
   sed "s|__HIVEMIND_HOME__|${HIVEMIND_HOME}|g" \
     "${HIVEMIND_SOURCE_DIR}/.claude/settings.json" > "${_target}/.claude/settings.json" || return 1
   # Product slash-commands (item 5.3) — same mirror requirement as above.
+  # These are THIN STUBS (Branch B, decision_serve-boot-and-end-session-as-mcp-prompts-fail-closed):
+  # the canonical procedure body is served by the engram (fos_procedure({id})) and fetched at
+  # invocation, FAIL-CLOSED (engram unreachable → no local fallback, session does not
+  # boot/close). This copy step only ships the stub files, not the procedure content — see
+  # CLAUDE.md § Session start / § Session close.
   mkdir -p "${_target}/.claude/commands" || return 1
   cp -r "${HIVEMIND_SOURCE_DIR}/.claude/commands/." "${_target}/.claude/commands/" || return 1
   # Status-CLI (F5.1) + quota-capture hook (F5.2) — referenced by the

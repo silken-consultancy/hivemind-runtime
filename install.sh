@@ -147,6 +147,11 @@ sed "s|__HIVEMIND_HOME__|${HIVEMIND_HOME}|g" \
   "${SCRIPT_DIR}/.claude/settings.json" > "${HIVEMIND_HOME}/.claude/settings.json"
 
 # Copy product slash-commands (item 5.3, F3 — /boot + /end-session).
+# These are THIN STUBS (Branch B, decision_serve-boot-and-end-session-as-mcp-prompts-fail-closed):
+# the canonical procedure body no longer lives here — each stub fetches it live from the
+# engram via fos_procedure({id}) at invocation time and executes it verbatim. FAIL-CLOSED:
+# if the engram is unreachable, the stub does not fall back to any local copy — the session
+# does not boot/close. See CLAUDE.md § Session start / § Session close for the full contract.
 mkdir -p "${HIVEMIND_HOME}/.claude/commands"
 cp -r "${SCRIPT_DIR}/.claude/commands/." "${HIVEMIND_HOME}/.claude/commands/"
 
