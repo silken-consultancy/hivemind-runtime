@@ -22,7 +22,7 @@
 // key (Path B) for the MCP.
 
 import { Hono } from 'hono';
-import { existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync, renameSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -356,27 +356,73 @@ setupRouter.post('/enroll', async (c) => {
     // Clean up CSR (not needed after enrollment).
     try { unlinkSync(csrPath); } catch { /* best-effort */ }
 
-    // 5. Write $HIVEMIND_HOME/.env with MTLS_* vars + FOS_API_KEY (item 6.1,
-    // auth cert+chave). FOS_API_KEY is consumed by the DAEMON now (atomic-
-    // flip, round-2 2026-07-30): mtls-proxy.ts injects x-fos-key server-side
-    // on the outbound hop from this same .env var (exported into the
-    // daemon's env by bin/hivemind's `set -a; . .env; set +a`) — Claude
+    // 5. Merge-write $HIVEMIND_HOME/.env with MTLS_* vars + FOS_API_KEY (item
+    // 6.1, auth cert+chave). FOS_API_KEY is consumed by the DAEMON now
+    // (atomic-flip, round-2 2026-07-30): mtls-proxy.ts injects x-fos-key
+    // server-side on the outbound hop from this same .env var (exported into
+    // the daemon's env by bin/hivemind's `set -a; . .env; set +a`) — Claude
     // Code's own MCP config (step 6 below) no longer carries the key at all.
+    //
+    // MERGE-SAFE (root cause fix, measured via fos_report 226b1fee): this used
+    // to be a bare writeFileSync of ONLY these ~8 keys, with no read of the
+    // existing file — a full-file OVERWRITE that erased whatever install.sh
+    // had written into this SAME .env seconds earlier, in particular
+    // HIVEMIND_SOURCE_DIR / HIVEMIND_UPDATE_REMOTE / HIVEMIND_UPDATE_BRANCH
+    // (the pins `hivemind update`, bin/hivemind:904, depends on) — breaking
+    // `hivemind update` permanently on every enrollment. Now: read→parse the
+    // existing .env (if present) into a key=value map, overlay only the keys
+    // this enrollment owns, and write the union back — preserving every other
+    // key, in original order, with the enrollment's keys appended after.
+    // Mirrors the read→parse→overlay→write pattern used for .claude.json
+    // below (corrupted/unreadable .env → treated as absent, never aborts
+    // enrollment).
     const proxyPort = process.env.MTLS_PROXY_PORT ?? '7779';
+    const envFile = join(hivemindHome, '.env');
+
+    const existingEnv: Record<string, string> = {};
+    const existingEnvOrder: string[] = [];
+    if (existsSync(envFile)) {
+      try {
+        const raw = readFileSync(envFile, 'utf8');
+        for (const line of raw.split('\n')) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine || trimmedLine.startsWith('#')) continue;
+          const eqIdx = trimmedLine.indexOf('=');
+          if (eqIdx === -1) continue;
+          const key = trimmedLine.slice(0, eqIdx).trim();
+          const value = trimmedLine.slice(eqIdx + 1).trim();
+          if (!key) continue;
+          if (!(key in existingEnv)) existingEnvOrder.push(key);
+          existingEnv[key] = value;
+        }
+      } catch {
+        // Corrupted/unreadable .env → treat as absent, never abort enrollment.
+      }
+    }
+
+    const enrollmentEnv: Record<string, string> = {
+      MTLS_CERT_PATH: certFinalPath,
+      MTLS_KEY_PATH: keyFinalPath,
+      MTLS_CA_PATH: caPath,
+      MTLS_UPSTREAM: `https://${ENDPOINT}/v1/mcp`,
+      MTLS_PROXY_PORT: proxyPort,
+      HIVEMIND_ENDPOINT: ENDPOINT,
+      HIVEMIND_OWNER: tenant,
+      FOS_API_KEY: trimmedApiKey,
+    };
+
+    const mergedEnv: Record<string, string> = { ...existingEnv, ...enrollmentEnv };
+    const mergedEnvOrder = [
+      ...existingEnvOrder,
+      ...Object.keys(enrollmentEnv).filter((key) => !existingEnvOrder.includes(key)),
+    ];
+
     const envContent = [
       `# HiveMind mTLS config — written by hivemind setup on ${new Date().toISOString()}`,
-      `MTLS_CERT_PATH=${certFinalPath}`,
-      `MTLS_KEY_PATH=${keyFinalPath}`,
-      `MTLS_CA_PATH=${caPath}`,
-      `MTLS_UPSTREAM=https://${ENDPOINT}/v1/mcp`,
-      `MTLS_PROXY_PORT=${proxyPort}`,
-      `HIVEMIND_ENDPOINT=${ENDPOINT}`,
-      `HIVEMIND_OWNER=${tenant}`,
-      `FOS_API_KEY=${trimmedApiKey}`,
+      ...mergedEnvOrder.map((key) => `${key}=${mergedEnv[key]}`),
       '',
     ].join('\n');
 
-    const envFile = join(hivemindHome, '.env');
     writeFileSync(envFile, envContent, { mode: 0o600 });
 
     // 6. Merge-write $HIVEMIND_HOME/.claude/.claude.json — the only path

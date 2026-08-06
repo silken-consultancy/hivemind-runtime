@@ -488,3 +488,107 @@ test('POST /enroll writes FOS_API_KEY=<pasted value> + HIVEMIND_OWNER=<tenant> i
   expect(envContent).toContain(`HIVEMIND_OWNER=${FAKE_TENANT}`);
   expect(statSync(envPath).mode & 0o777).toBe(0o600);
 });
+
+// ── .env MERGE (root cause fix, measured via fos_report 226b1fee) ───────────
+// This used to be a bare writeFileSync of ONLY the ~8 enrollment keys, with NO
+// read of the existing .env — a full-file OVERWRITE that erased whatever
+// install.sh had written into this SAME file seconds earlier, in particular
+// HIVEMIND_SOURCE_DIR / HIVEMIND_UPDATE_REMOTE / HIVEMIND_UPDATE_BRANCH (the
+// pins `hivemind update`, bin/hivemind:904, depends on) — breaking
+// `hivemind update` permanently on every enrollment.
+
+test('POST /enroll merges $HIVEMIND_HOME/.env — pre-existing HIVEMIND_SOURCE_DIR/HIVEMIND_UPDATE_REMOTE/HIVEMIND_UPDATE_BRANCH (written by install.sh) and an arbitrary key survive enrollment', async () => {
+  FAKE_TENANT = 'contract-test-tenant-env-merge';
+  const envPath = join(process.env.HIVEMIND_HOME!, '.env');
+
+  // Simulate exactly what install.sh writes BEFORE enrollment ever runs: the
+  // update pins + an arbitrary unrelated key that must never be dropped.
+  mkdirSync(process.env.HIVEMIND_HOME!, { recursive: true });
+  writeFileSync(
+    envPath,
+    [
+      '# HiveMind config — written by install.sh',
+      'HIVEMIND_ENDPOINT=pre-existing-endpoint:4443',
+      'HIVEMIND_SOURCE_DIR=/home/user/hivemind-runtime',
+      'HIVEMIND_UPDATE_REMOTE=git@github.com:example/hivemind-runtime.git',
+      'HIVEMIND_UPDATE_BRANCH=main',
+      'SOME_ARBITRARY_KEY=keep-me',
+      '',
+    ].join('\n'),
+    { mode: 0o600 },
+  );
+
+  const res = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ api_key: API_KEY }),
+  });
+  expect((await res.json() as { ok: boolean }).ok).toBe(true);
+
+  const envContent = readFileSync(envPath, 'utf8');
+  // The install.sh pins survive the enrollment write — this is the bug fix
+  // under test. A regression back to the bare overwrite drops all four.
+  expect(envContent).toContain('HIVEMIND_SOURCE_DIR=/home/user/hivemind-runtime');
+  expect(envContent).toContain('HIVEMIND_UPDATE_REMOTE=git@github.com:example/hivemind-runtime.git');
+  expect(envContent).toContain('HIVEMIND_UPDATE_BRANCH=main');
+  expect(envContent).toContain('SOME_ARBITRARY_KEY=keep-me');
+  // The enrollment's own ~8 keys are still applied, overlaying the pre-existing
+  // stub value — HIVEMIND_ENDPOINT is one of the keys this handler owns, so it
+  // is updated to the live ENDPOINT, not left at the pre-existing placeholder.
+  expect(envContent).toContain(`HIVEMIND_ENDPOINT=${process.env.HIVEMIND_ENDPOINT}`);
+  expect(envContent).toContain(`HIVEMIND_OWNER=${FAKE_TENANT}`);
+  expect(envContent).toContain(`FOS_API_KEY=${API_KEY}`);
+  expect(statSync(envPath).mode & 0o777).toBe(0o600);
+});
+
+test('POST /enroll .env merge is idempotent across two enrollments — re-running does not drop the pins a first run already wrote', async () => {
+  const envPath = join(process.env.HIVEMIND_HOME!, '.env');
+  mkdirSync(process.env.HIVEMIND_HOME!, { recursive: true });
+  writeFileSync(
+    envPath,
+    ['HIVEMIND_SOURCE_DIR=/home/user/hivemind-runtime', 'HIVEMIND_UPDATE_BRANCH=main', ''].join('\n'),
+    { mode: 0o600 },
+  );
+
+  FAKE_TENANT = 'contract-test-tenant-env-merge-run1';
+  const res1 = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ api_key: API_KEY }),
+  });
+  expect((await res1.json() as { ok: boolean }).ok).toBe(true);
+  expect(readFileSync(envPath, 'utf8')).toContain('HIVEMIND_SOURCE_DIR=/home/user/hivemind-runtime');
+
+  FAKE_TENANT = 'contract-test-tenant-env-merge-run2';
+  const res2 = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ api_key: API_KEY }),
+  });
+  expect((await res2.json() as { ok: boolean }).ok).toBe(true);
+
+  const envContent = readFileSync(envPath, 'utf8');
+  // The pins survive a SECOND enrollment too, not just the first.
+  expect(envContent).toContain('HIVEMIND_SOURCE_DIR=/home/user/hivemind-runtime');
+  expect(envContent).toContain('HIVEMIND_UPDATE_BRANCH=main');
+  // And the enrollment-owned keys reflect the LATEST run, not the first.
+  expect(envContent).toContain(`HIVEMIND_OWNER=${FAKE_TENANT}`);
+  expect(envContent).not.toContain('contract-test-tenant-env-merge-run1');
+});
+
+test('POST /enroll does not crash on an unparseable pre-existing .env (fail-open, never aborts enrollment)', async () => {
+  FAKE_TENANT = 'contract-test-tenant-env-corrupt';
+  const envPath = join(process.env.HIVEMIND_HOME!, '.env');
+  mkdirSync(process.env.HIVEMIND_HOME!, { recursive: true });
+  writeFileSync(envPath, 'not a key=value file at all\njust garbage\n');
+
+  const res = await setupRouter.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ api_key: API_KEY }),
+  });
+  expect(res.status).toBe(200);
+  const data = (await res.json()) as { ok: boolean };
+  expect(data.ok).toBe(true);
+  expect(readFileSync(envPath, 'utf8')).toContain(`HIVEMIND_OWNER=${FAKE_TENANT}`);
+});
