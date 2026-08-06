@@ -82,6 +82,22 @@ fi
 RUNTIME_PORT="${AR_PORT:-${RUNTIME_PORT}}"
 PROXY_PORT="${MTLS_PROXY_PORT:-${PROXY_PORT}}"
 
+# ── Option 2 per-target proxy (fos_decision 1caee6a7, item 18cff9b7) ────────
+# `hivemind install <target>` allocates a DEDICATED loopback port + mints a
+# device_id per installed target, instead of every foreign client sharing
+# PROXY_PORT — full design: fos_sketchpad 4f8142e3 § ADDENDUM 3. Persisted to
+# PORT_MAP_FILE (sibling to CERT_DIR, same owner-scoped ~/.engram/mtls root);
+# read by runtime/src/lib/mtls-proxy.ts's startAllMtlsProxies() at daemon boot
+# and on every POST /internal/proxy/reload.
+PORT_MAP_FILE="${CERT_DIR}/port-map.json"
+# Range default 7780-7879 (100 max installed targets) — a technical default
+# with an obvious safe choice, not escalated as a founder fork (ADDENDUM 3
+# OPEN 17). Tunable via env, mirroring the existing MTLS_PROXY_PORT override
+# pattern. Computed AFTER the PROXY_PORT refresh above so a .env-overridden
+# MTLS_PROXY_PORT shifts the range with it.
+MTLS_INSTALL_PORT_RANGE_START="${MTLS_INSTALL_PORT_RANGE_START:-$((PROXY_PORT + 1))}"
+MTLS_INSTALL_PORT_RANGE_END="${MTLS_INSTALL_PORT_RANGE_END:-$((PROXY_PORT + 100))}"
+
 # ── ANSI helpers (NO_COLOR-aware) ────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   _ok()  { printf '\033[0;32m%s\033[0m' "$*"; }
@@ -1122,22 +1138,33 @@ _resolve_device_id() {
   cat "${_id_file}"
 }
 
-# _regenerate_device_id: mint a fresh uuid and persist it atomically
-# (DR-6.2). Shared by first-creation and self-heal/rebind paths.
-_regenerate_device_id() {
-  local _id_file="$1" _uuid
-  mkdir -p "$(dirname "${_id_file}")"
+# _mint_uuid: RFC4122 uuid via uuidgen, /proc fallback, then a last-resort
+# non-RFC4122-but-locally-unique fallback. Extracted from
+# _regenerate_device_id's inline chain (Fase 6) so item 18cff9b7's port-map
+# device_id minting (_resolve_target_port_and_device_id below) shares the
+# exact same fallback discipline instead of duplicating it — the two are
+# independent identity namespaces (~/.engram/device-id vs a per-target
+# device_id inside port-map.json), but "how do we mint a uuid on this
+# machine" is one concern, not two.
+_mint_uuid() {
   if command -v uuidgen > /dev/null 2>&1; then
-    _uuid="$(uuidgen)"
+    uuidgen
   elif [ -r /proc/sys/kernel/random/uuid ]; then
-    _uuid="$(cat /proc/sys/kernel/random/uuid)"
+    cat /proc/sys/kernel/random/uuid
   else
     # Last-resort fallback (no uuidgen, no /proc — e.g. some minimal
     # containers): not RFC4122, but stable across runs on THIS machine,
-    # which is all device_id needs to be.
-    _uuid="$(hostname)-$(date +%s)-$$"
+    # which is all a device_id needs to be.
+    printf '%s-%s-%s' "$(hostname)" "$(date +%s)" "$$"
   fi
-  _atomic_write "${_id_file}" "${_uuid}"
+}
+
+# _regenerate_device_id: mint a fresh uuid and persist it atomically
+# (DR-6.2). Shared by first-creation and self-heal/rebind paths.
+_regenerate_device_id() {
+  local _id_file="$1"
+  mkdir -p "$(dirname "${_id_file}")"
+  _atomic_write "${_id_file}" "$(_mint_uuid)"
 }
 
 # _atomic_write: write $2 (+ trailing newline) to $1 via tmp+rename (DR-6.2)
@@ -1630,7 +1657,16 @@ _bootstrap_first_slug() {
 # $HIVEMIND_HOME/.claude/.claude.json. Shared by _seed_engram_mcp_config
 # below (Claude Code's user-scope file) and `hivemind install`'s carrier
 # (P2, item ef1c9385 — reuse, don't reinvent) for any OTHER local client's
-# own mcp.json-shaped config. $1 = absolute path to write/merge.
+# own mcp.json-shaped config. $1 = absolute path to write/merge, $2 = port.
+#
+# PORT IS NOW AN EXPLICIT REQUIRED ARG (Option 2, item 18cff9b7) — this used
+# to hardcode the implicit shared "${PROXY_PORT}" as its 2nd positional bun
+# arg; every caller now decides which port an entry points at.
+# _seed_engram_mcp_config (Claude Code's own self-seed) still passes
+# "${PROXY_PORT}" explicitly — that entry stays on the shared/default port,
+# unchanged behavior. `hivemind install`'s guided flow (_install_run) now
+# passes a DEDICATED port allocated by _resolve_target_port_and_device_id
+# below, instead.
 #
 # Same contract as before this extraction (behavior-preserving refactor):
 # preserve every other top-level key + mcpServers.* entry; self-heal a
@@ -1644,6 +1680,7 @@ _bootstrap_first_slug() {
 # a failure is fail-soft (re-seed) or fail-loud (a fresh `install`).
 _write_generic_mcp_config() {
   local _target_path="$1"
+  local _port="$2"
   bun -e '
     import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, mkdirSync } from "node:fs";
     import { dirname } from "node:path";
@@ -1681,7 +1718,7 @@ _write_generic_mcp_config() {
     writeFileSync(tmpPath, JSON.stringify(merged, null, 2), { mode: 0o600 });
     renameSync(tmpPath, configPath);
     chmodSync(configPath, 0o600);
-  ' "${_target_path}" "${PROXY_PORT}"
+  ' "${_target_path}" "${_port}"
   # code-review fix: stderr used to be swallowed HERE (`2>/dev/null` on the
   # bun invocation), which made every caller's failure branch blind — in
   # particular _install_run's interactive "✗ falha ao gravar <path>" (below)
@@ -1695,10 +1732,160 @@ _write_generic_mcp_config() {
 _seed_engram_mcp_config() {
   local _claude_config="${HIVEMIND_HOME}/.claude/.claude.json"
   local _seed_err
-  if ! _seed_err="$(_write_generic_mcp_config "${_claude_config}" 2>&1)"; then
+  if ! _seed_err="$(_write_generic_mcp_config "${_claude_config}" "${PROXY_PORT}" 2>&1)"; then
     _vecho "[hivemind] aviso: falha ao re-selar mcpServers.engram em .claude.json (não bloqueante)${_seed_err:+: ${_seed_err}}"
   fi
   return 0
+}
+
+# ── Option 2 per-target proxy — port-map.json helpers (item 18cff9b7) ───────
+# Full design: fos_sketchpad 4f8142e3 § ADDENDUM 3. `hivemind install
+# <target>` allocates a DEDICATED loopback port + mints a device_id per
+# installed target, persisted to PORT_MAP_FILE — read at daemon boot and on
+# every POST /internal/proxy/reload by runtime/src/lib/mtls-proxy.ts's
+# startAllMtlsProxies()/reloadNewProxyListeners(). Shape: {"version":1,
+# "entries":[{"path","target_id","scope","port","device_id","created_at",
+# "updated_at"}]}, keyed on `path` (the resolved absolute config file path —
+# unique per installed target/scope combination).
+
+# _port_map_used_ports: prints every entries[].port on its own line. Never
+# throws — same self-heal posture as every other JSON read in this file
+# (absent/corrupted file, non-array entries, or a non-numeric port on any one
+# entry all degrade to "not used", never abort the caller).
+_port_map_used_ports() {
+  bun -e '
+    import { existsSync, readFileSync } from "node:fs";
+    const mapPath = process.argv[1];
+    if (!existsSync(mapPath)) process.exit(0);
+    try {
+      const parsed = JSON.parse(readFileSync(mapPath, "utf8"));
+      const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+      for (const e of entries) {
+        if (e && typeof e.port === "number") console.log(e.port);
+      }
+    } catch { /* corrupted -> no used ports on record */ }
+  ' "${PORT_MAP_FILE}" 2>/dev/null
+}
+
+# _port_map_lookup: prints "<port>\t<device_id>" for the entry whose `path`
+# matches $1, or nothing (empty stdout) if PORT_MAP_FILE is absent/corrupted/
+# has no matching entry. Never throws.
+_port_map_lookup() {
+  local _path="$1"
+  bun -e '
+    import { existsSync, readFileSync } from "node:fs";
+    const mapPath = process.argv[1];
+    const targetPath = process.argv[2];
+    if (!existsSync(mapPath)) process.exit(0);
+    try {
+      const parsed = JSON.parse(readFileSync(mapPath, "utf8"));
+      const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+      const hit = entries.find((e) => e && e.path === targetPath);
+      if (hit && typeof hit.port === "number" && typeof hit.device_id === "string") {
+        console.log(`${hit.port}\t${hit.device_id}`);
+      }
+    } catch { /* corrupted -> no match, caller allocates fresh */ }
+  ' "${PORT_MAP_FILE}" "${_path}" 2>/dev/null
+}
+
+# _port_map_write_entry: merge-safe upsert of ONE entry, keyed on `path` (any
+# prior entry for the same path is replaced, preserving its created_at).
+# Atomic tmp+rename + chmod 0600 — same posture as _write_generic_mcp_config.
+# $1=path $2=target_id $3=scope $4=port $5=device_id.
+_port_map_write_entry() {
+  local _path="$1" _target_id="$2" _scope="$3" _port="$4" _device_id="$5"
+  bun -e '
+    import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, mkdirSync } from "node:fs";
+    import { dirname } from "node:path";
+
+    const mapPath  = process.argv[1];
+    const path_    = process.argv[2];
+    const targetId = process.argv[3];
+    const scope    = process.argv[4];
+    const port     = Number(process.argv[5]);
+    const deviceId = process.argv[6];
+
+    let doc = { version: 1, entries: [] };
+    if (existsSync(mapPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(mapPath, "utf8"));
+        if (parsed && typeof parsed === "object" && Array.isArray(parsed.entries)) {
+          doc = parsed;
+        }
+        // else: corrupted/non-shaped document -> start fresh {version:1,
+        // entries:[]} rather than throwing (same self-heal contract as every
+        // other JSON read/write in this file).
+      } catch { /* unparseable -> start fresh */ }
+    }
+
+    const priorEntries = Array.isArray(doc.entries) ? doc.entries : [];
+    const prior = priorEntries.find((e) => e && e.path === path_);
+    const others = priorEntries.filter((e) => !(e && e.path === path_));
+
+    const now = new Date().toISOString();
+    const entry = {
+      path: path_,
+      target_id: targetId || undefined,
+      scope: scope || undefined,
+      port,
+      device_id: deviceId,
+      created_at: (prior && prior.created_at) || now,
+      updated_at: now,
+    };
+
+    const merged = { version: 1, entries: [...others, entry] };
+
+    mkdirSync(dirname(mapPath), { recursive: true, mode: 0o700 });
+    const tmpPath = `${mapPath}.tmp-${process.pid}`;
+    writeFileSync(tmpPath, JSON.stringify(merged, null, 2), { mode: 0o600 });
+    renameSync(tmpPath, mapPath);
+    chmodSync(mapPath, 0o600);
+  ' "${PORT_MAP_FILE}" "${_path}" "${_target_id}" "${_scope}" "${_port}" "${_device_id}"
+}
+
+# _allocate_target_port: lowest free port in
+# [MTLS_INSTALL_PORT_RANGE_START, MTLS_INSTALL_PORT_RANGE_END] not already a
+# port-map entries[].port. Prints the chosen port on stdout; on range
+# exhaustion, prints nothing and returns 1 with a message on stderr (max
+# targets = range size, 100 by default) rather than silently colliding.
+_allocate_target_port() {
+  local _used
+  _used="$(_port_map_used_ports)"
+  local _p
+  for ((_p = MTLS_INSTALL_PORT_RANGE_START; _p <= MTLS_INSTALL_PORT_RANGE_END; _p++)); do
+    if ! printf '%s\n' "${_used}" | grep -qx "${_p}"; then
+      echo "${_p}"
+      return 0
+    fi
+  done
+  echo "Erro: intervalo de portas para 'hivemind install' esgotado (${MTLS_INSTALL_PORT_RANGE_START}-${MTLS_INSTALL_PORT_RANGE_END}) — máximo de alvos instalados atingido." >&2
+  return 1
+}
+
+# _resolve_target_port_and_device_id: idempotent port+device_id resolution
+# for `hivemind install`. Keyed on the resolved absolute config file PATH
+# (the same value _install_run computes as _final_path) — re-running install
+# against an ALREADY-mapped path REUSES that entry's existing port+device_id
+# rather than reallocating (self-heal, no-silent-reallocate posture, mirrors
+# _write_generic_mcp_config's own idempotency). $1=path $2=target_id $3=scope.
+# Prints "<port>\t<device_id>" on success; returns 1 (nothing printed, error
+# already on stderr via _allocate_target_port) if the range is exhausted on a
+# fresh allocation.
+_resolve_target_port_and_device_id() {
+  local _path="$1" _target_id="$2" _scope="$3"
+  local _existing
+  _existing="$(_port_map_lookup "${_path}")"
+  if [ -n "${_existing}" ]; then
+    printf '%s\n' "${_existing}"
+    return 0
+  fi
+
+  local _port
+  _port="$(_allocate_target_port)" || return 1
+  local _device_id
+  _device_id="$(_mint_uuid)"
+  _port_map_write_entry "${_path}" "${_target_id}" "${_scope}" "${_port}" "${_device_id}"
+  printf '%s\t%s\n' "${_port}" "${_device_id}"
 }
 
 # cmd_open: start proxy + exec claude.
@@ -2228,10 +2415,32 @@ _install_run() {
     done
   fi
 
+  # Option 2 (fos_decision 1caee6a7, item 18cff9b7): allocate/reuse a
+  # DEDICATED loopback port + device_id for this exact config path BEFORE
+  # showing the confirmation, so the human sees the real port they're about
+  # to wire up — never PROXY_PORT (that stays the shared/default port for
+  # the CLI's OWN self-seed entry only, unchanged). Idempotent: re-running
+  # install against an already-mapped path reuses its existing port+id
+  # rather than reallocating (_resolve_target_port_and_device_id above).
+  local _scope_for_map="${_INSTALL_SCOPE:-}"
+  case "${_chosen_id}" in
+    antigravity) _scope_for_map="global" ;; # structurally single-scope
+    manual)      _scope_for_map="manual" ;;
+  esac
+  local _port_resolved
+  if ! _port_resolved="$(_resolve_target_port_and_device_id "${_final_path}" "${_chosen_id}" "${_scope_for_map}")"; then
+    echo "  $(_err "✗") falha ao alocar uma porta dedicada para '${_chosen_id}' — nada escrito." >&2
+    return 1
+  fi
+  local _target_port _target_device_id
+  _target_port="$(printf '%s' "${_port_resolved}" | cut -f1)"
+  _target_device_id="$(printf '%s' "${_port_resolved}" | cut -f2)"
+
   echo "" >&2
   echo "  Alvo:    ${_chosen_label:-${_chosen_id}}" >&2
   echo "  Arquivo: ${_final_path}" >&2
-  echo "  Entrada: mcpServers.engram = {type:\"http\", url:\"https://127.0.0.1:${PROXY_PORT}/v1/mcp\"}" >&2
+  echo "  Porta dedicada: ${_target_port} (device_id ${_target_device_id})" >&2
+  echo "  Entrada: mcpServers.engram = {type:\"http\", url:\"https://127.0.0.1:${_target_port}/v1/mcp\"}" >&2
   printf '  Confirma a escrita neste caminho? [y/N] ' >&2
   local _confirm
   if ! IFS= read -r _confirm; then
@@ -2247,8 +2456,14 @@ _install_run() {
   esac
 
   local _write_err
-  if _write_err="$(_write_generic_mcp_config "${_final_path}" 2>&1)"; then
+  if _write_err="$(_write_generic_mcp_config "${_final_path}" "${_target_port}" 2>&1)"; then
     echo "  $(_ok "✓") gravado: ${_final_path}" >&2
+    # Best-effort: tell an already-running daemon about the freshly-mapped
+    # port so it's live immediately, no daemon restart needed (item
+    # 46d0eeed's POST /internal/proxy/reload). NOT a hard dependency — if
+    # the daemon isn't running (or this call fails for any reason), the
+    # next _start_proxy spawn reads the full port-map.json at boot anyway.
+    curl -sf --max-time 3 -X POST "http://127.0.0.1:${RUNTIME_PORT}/internal/proxy/reload" > /dev/null 2>&1 || true
   else
     echo "  $(_err "✗") falha ao gravar ${_final_path}" >&2
     # code-review fix: surface the real reason (permission denied, disk

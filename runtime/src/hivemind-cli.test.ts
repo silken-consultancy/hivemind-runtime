@@ -494,7 +494,7 @@ test('_install_run — no target arg: guided menu → Cursor → global scope �
   });
   expect(rc).toBe(0);
   const written = JSON.parse(readFileSync(join(home, '.cursor', 'mcp.json'), 'utf8'));
-  expect(written.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
+  expect(written.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7780/v1/mcp' });
 });
 
 test('_install_run — declining the final confirmation writes nothing', () => {
@@ -514,7 +514,7 @@ test('_install_run — target arg supplied: skips the candidate menu but still a
   });
   expect(rc).toBe(0);
   const written = JSON.parse(readFileSync(join(cwd, '.cursor', 'mcp.json'), 'utf8'));
-  expect(written.mcpServers.engram.url).toBe('https://127.0.0.1:7779/v1/mcp');
+  expect(written.mcpServers.engram.url).toBe('https://127.0.0.1:7780/v1/mcp');
 });
 
 test('_install_run — antigravity: global-only, single Windows user detected, never asks scope', () => {
@@ -525,7 +525,7 @@ test('_install_run — antigravity: global-only, single Windows user detected, n
   });
   expect(rc).toBe(0);
   const written = JSON.parse(readFileSync(join(antigravityRoot, 'alice', '.gemini', 'config', 'mcp_config.json'), 'utf8'));
-  expect(written.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
+  expect(written.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7780/v1/mcp' });
 });
 
 test('_install_run — antigravity: multiple Windows users found → guided path picker, exactly one candidate written', () => {
@@ -557,7 +557,7 @@ test('_install_run — manual target: free-text path, merge-safe write (shared c
   const written = JSON.parse(readFileSync(manualPath, 'utf8'));
   expect(written.keepMe).toBe(true);
   expect(written.mcpServers.other).toEqual({ command: 'x' });
-  expect(written.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
+  expect(written.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7780/v1/mcp' });
 });
 
 test('_install_run — unknown target arg fails without prompting or writing anything', () => {
@@ -566,4 +566,182 @@ test('_install_run — unknown target arg fails without prompting or writing any
     targetArg: 'does-not-exist',
   });
   expect(rc).toBe(1);
+});
+
+// ── Option 2 (fos_decision 1caee6a7, item 18cff9b7) — dedicated per-target
+// port allocation + port-map.json persistence ───────────────────────────────
+// Full design: fos_sketchpad 4f8142e3 § ADDENDUM 3. `hivemind install`
+// no longer writes every foreign client onto the shared PROXY_PORT — each
+// install allocates its OWN loopback port + device_id, persisted to
+// ~/.engram/mtls/port-map.json (read by runtime/src/lib/mtls-proxy.ts's
+// startAllMtlsProxies() at daemon boot).
+
+test('_allocate_target_port picks the lowest free port in the configured range, skipping already-used ports', () => {
+  const out = sh('allocate-port-lowest-free', `
+export MTLS_INSTALL_PORT_RANGE_START=9500
+export MTLS_INSTALL_PORT_RANGE_END=9510
+mkdir -p "\$(dirname "\${PORT_MAP_FILE}")"
+cat > "\${PORT_MAP_FILE}" <<'JSON'
+{"version":1,"entries":[{"path":"/a","port":9500,"device_id":"d1"},{"path":"/b","port":9501,"device_id":"d2"}]}
+JSON
+_got="\$(_allocate_target_port)"
+_assert lowest-free-port "\${_got}" 9502
+`);
+  expect(out).toContain('ok lowest-free-port');
+  expect(out).not.toContain('not ok');
+});
+
+test('_allocate_target_port fails clearly (empty stdout, non-zero rc) when the range is fully used — never silently collides', () => {
+  const out = sh('allocate-port-exhausted', `
+export MTLS_INSTALL_PORT_RANGE_START=9600
+export MTLS_INSTALL_PORT_RANGE_END=9601
+mkdir -p "\$(dirname "\${PORT_MAP_FILE}")"
+cat > "\${PORT_MAP_FILE}" <<'JSON'
+{"version":1,"entries":[{"path":"/a","port":9600,"device_id":"d1"},{"path":"/b","port":9601,"device_id":"d2"}]}
+JSON
+_rc=0
+_got="\$(_allocate_target_port 2>/dev/null)" || _rc=\$?
+_assert alloc-exhausted-fails "\${_rc}" 1
+_assert alloc-exhausted-empty-stdout "\${_got}" ""
+`);
+  expect(out).toContain('ok alloc-exhausted-fails');
+  expect(out).toContain('ok alloc-exhausted-empty-stdout');
+  expect(out).not.toContain('not ok');
+});
+
+test('_resolve_target_port_and_device_id: idempotent for the SAME path, mints a DISTINCT port+device_id for a DIFFERENT path', () => {
+  const out = sh('resolve-idempotent', `
+_first="\$(_resolve_target_port_and_device_id /a/config.json cursor global)"
+_second="\$(_resolve_target_port_and_device_id /a/config.json cursor global)"
+_assert same-path-reused "\${_first}" "\${_second}"
+
+_third="\$(_resolve_target_port_and_device_id /b/config.json cursor project)"
+_assert different-path-distinct "\$([ "\${_first}" != "\${_third}" ] && echo distinct || echo same)" distinct
+`);
+  expect(out).toContain('ok same-path-reused');
+  expect(out).toContain('ok different-path-distinct');
+  expect(out).not.toContain('not ok');
+});
+
+test('_port_map_write_entry persists a well-shaped, chmod-0600 entry; _port_map_lookup finds it back by path', () => {
+  const configPath = join(caseHome('port-map-shape'), '.engram', 'mtls', 'port-map.json');
+  shRaw('port-map-shape', `
+_port_map_write_entry "/some/config.json" "cursor" "global" "7780" "device-abc"
+`);
+  const doc = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(doc.version).toBe(1);
+  expect(doc.entries).toHaveLength(1);
+  expect(doc.entries[0]).toMatchObject({
+    path: '/some/config.json',
+    target_id: 'cursor',
+    scope: 'global',
+    port: 7780,
+    device_id: 'device-abc',
+  });
+  expect(typeof doc.entries[0].created_at).toBe('string');
+  expect(typeof doc.entries[0].updated_at).toBe('string');
+  expect(statSync(configPath).mode & 0o777).toBe(0o600);
+});
+
+// runInstallRunSequence: like runInstallRun above, but drives `_install_run`
+// MULTIPLE times in ONE bash process against the SAME $HOME — needed here
+// because port-map.json state must persist ACROSS invocations within a
+// single "install session" (idempotent re-install, two distinct targets
+// getting two distinct ports) — runInstallRun's isolated-$HOME-per-call
+// contract can't express that on its own.
+function runInstallRunSequence(
+  name: string,
+  calls: Array<{ stdin: string; targetArg?: string }>,
+  opts: { seedCursor?: boolean } = {},
+): { rcs: number[]; home: string; cwd: string; portMapPath: string } {
+  const dir = join(testRoot, name);
+  const home = join(dir, 'home');
+  const cwd = join(dir, 'cwd');
+  mkdirSync(home, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  if (opts.seedCursor) mkdirSync(join(home, '.cursor'), { recursive: true });
+
+  const libPath = join(dir, 'lib.sh');
+  const strip = Bun.spawnSync(['bash', '-c', `sed '/^# ── Entry point/,$d' "${HIVEMIND_BIN}" > "${libPath}"`]);
+  if (strip.exitCode !== 0) throw new Error(`failed to strip entry point: ${strip.stderr.toString()}`);
+
+  const lines: string[] = [
+    '#!/usr/bin/env bash',
+    `export HOME="${home}"`,
+    `export HIVEMIND_HOME="${home}/.hivemind"`,
+    'unset MTLS_PROXY_PORT',
+    `cd "${cwd}"`,
+    '# shellcheck disable=SC1090',
+    `source "${libPath}"`,
+    '',
+    `: > "${dir}/rcs"`,
+  ];
+  calls.forEach((c, i) => {
+    const stdinLiteral = c.stdin.replace(/'/g, `'\\''`);
+    const targetLiteral = (c.targetArg ?? '').replace(/'/g, `'\\''`);
+    lines.push(
+      `_rc${i}=0`,
+      `printf '%s' '${stdinLiteral}' | _install_run '${targetLiteral}' || _rc${i}=\$?`,
+      `printf '%s\\n' "\${_rc${i}}" >> "${dir}/rcs"`,
+    );
+  });
+
+  writeFileSync(join(dir, 'case.sh'), lines.join('\n') + '\n');
+  const res = Bun.spawnSync(['bash', join(dir, 'case.sh')], { stdout: 'pipe', stderr: 'pipe' });
+  const rcsPath = join(dir, 'rcs');
+  if (!existsSync(rcsPath)) {
+    throw new Error(`case '${name}' never wrote an rcs marker (script aborted?).\nstdout:\n${res.stdout.toString()}\nstderr:\n${res.stderr.toString()}`);
+  }
+  const rcs = readFileSync(rcsPath, 'utf8').trim().split('\n').filter(Boolean).map(Number);
+  return { rcs, home, cwd, portMapPath: join(home, '.engram', 'mtls', 'port-map.json') };
+}
+
+test('_install_run — idempotent re-install: running install AGAIN against the same resolved path reuses the same port+device_id (one port-map entry, not two)', () => {
+  const { rcs, home, portMapPath } = runInstallRunSequence('install-idempotent-reinstall', [
+    { stdin: '1\ny\n', targetArg: 'cursor' }, // scope #1 = global, confirm = y
+    { stdin: '1\ny\n', targetArg: 'cursor' }, // same target/scope again
+  ], { seedCursor: true });
+  expect(rcs).toEqual([0, 0]);
+
+  const written = JSON.parse(readFileSync(join(home, '.cursor', 'mcp.json'), 'utf8'));
+  expect(written.mcpServers.engram.url).toBe('https://127.0.0.1:7780/v1/mcp');
+
+  const map = JSON.parse(readFileSync(portMapPath, 'utf8'));
+  // Exactly ONE entry — the second install call REUSED it, never allocated
+  // a second one for the same resolved config path.
+  expect(map.entries).toHaveLength(1);
+  expect(map.entries[0].port).toBe(7780);
+});
+
+test('_install_run — two DIFFERENT installs (cursor global, then cursor project) get two DIFFERENT dedicated ports, both persisted', () => {
+  const { rcs, home, cwd, portMapPath } = runInstallRunSequence('install-two-distinct-targets', [
+    { stdin: '1\ny\n', targetArg: 'cursor' }, // scope #1 = global
+    { stdin: '2\ny\n', targetArg: 'cursor' }, // scope #2 = project (different resolved path -> different port-map key)
+  ], { seedCursor: true });
+  expect(rcs).toEqual([0, 0]);
+
+  const globalWritten = JSON.parse(readFileSync(join(home, '.cursor', 'mcp.json'), 'utf8'));
+  const projectWritten = JSON.parse(readFileSync(join(cwd, '.cursor', 'mcp.json'), 'utf8'));
+  expect(globalWritten.mcpServers.engram.url).not.toBe(projectWritten.mcpServers.engram.url);
+
+  const map = JSON.parse(readFileSync(portMapPath, 'utf8'));
+  expect(map.entries).toHaveLength(2);
+  const ports: number[] = map.entries.map((e: { port: number }) => e.port);
+  expect(new Set(ports).size).toBe(2); // two distinct ports, no collision
+  const deviceIds: string[] = map.entries.map((e: { device_id: string }) => e.device_id);
+  expect(new Set(deviceIds).size).toBe(2); // two distinct device_ids too
+});
+
+test('_install_run — the CLI\'s own self-seed (_seed_engram_mcp_config) stays on the shared PROXY_PORT, untouched by install\'s dedicated-port allocation', () => {
+  // Migration/non-breaking guarantee: item 18cff9b7 changes ONLY the
+  // `hivemind install` carrier's port; _seed_engram_mcp_config (Claude
+  // Code's own entry, written by cmd_open on every launch) must keep using
+  // the implicit shared PROXY_PORT exactly as before this item.
+  const configPath = caseClaudeConfig('seed-still-shared-port-after-install-change');
+  shRaw('seed-still-shared-port-after-install-change', `
+export MTLS_PROXY_PORT=7779
+_seed_engram_mcp_config
+`);
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(config.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
 });
