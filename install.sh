@@ -143,8 +143,25 @@ cp "${SCRIPT_DIR}/CLAUDE.md" "${HIVEMIND_HOME}/.claude/CLAUDE.md"
 # at install time, so the substitution happens now, via sed, same idempotent
 # pattern as _set_env_kv above — ADDITIVE to the existing copy step, not the
 # rejected --profile mechanism.
+#
+# MERGE-SAFE (founder report): a re-install used to `sed ... >` this file
+# directly — a full-file OVERWRITE that silently deleted whatever the user had
+# added on top of the shipped defaults (extra permissions.allow/deny entries
+# via /config, a custom hook, etc.), forcing full reconfiguration on every
+# re-install. Deep-merge via scripts/merge-settings-json.mjs instead: objects
+# merge key-by-key (the user's extra keys survive), arrays union with dedup
+# (template ∪ existing, so a user-added entry is never dropped), scalars
+# re-apply the freshly-templated value (statusLine command path, defaultMode,
+# hook command lines must track the shipped runtime, not a stale local edit).
+# A corrupted/non-object existing file is treated as absent — never aborts the
+# install; a fresh install (no pre-existing file) is just the templated
+# content, unchanged.
+_templated_settings="$(mktemp)"
 sed "s|__HIVEMIND_HOME__|${HIVEMIND_HOME}|g" \
-  "${SCRIPT_DIR}/.claude/settings.json" > "${HIVEMIND_HOME}/.claude/settings.json"
+  "${SCRIPT_DIR}/.claude/settings.json" > "${_templated_settings}"
+bun run "${SCRIPT_DIR}/scripts/merge-settings-json.mjs" \
+  "${HIVEMIND_HOME}/.claude/settings.json" "${_templated_settings}"
+rm -f "${_templated_settings}"
 
 # Copy product slash-commands (item 5.3, F3 — /boot + /end-session).
 # These are THIN STUBS (Branch B, decision_serve-boot-and-end-session-as-mcp-prompts-fail-closed):
