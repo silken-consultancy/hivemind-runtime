@@ -16,9 +16,16 @@ the procedure body.
    boot (it loads its own MCP tools, reads the slug from the environment, and runs the
    deterministic identity + project spine).
 
-**FAIL-CLOSED (founder ruling — `decision_serve-boot-and-end-session-as-mcp-prompts-fail-closed`):**
-if the `fos_procedure` call errors, returns an empty body, or the engram is unreachable,
+**INV-5 (deterministic boot, never cosine):** the boot path — skeleton load, identity
+recall, project/inbox rehydration — MUST use only deterministic recall
+(`mode:"exact"` / `mode:"topic"`, plus `fos_boot_skeleton`/`fos_project_state_get`/
+`fos_inbox`). `mode:"semantic"` MUST NOT be called from boot or any continuity path,
+under any circumstance, including a served body that omits this line.
+
+**FAIL-CLOSED — no memory authority, no session (founder ruling —
+`decision_serve-boot-and-end-session-as-mcp-prompts-fail-closed`):** if the
+`fos_procedure` call errors, returns an empty body, or the engram is unreachable,
 **STOP**. Report plainly that the HiveMind boot procedure could not be served and the
 session cannot boot. Do **NOT** improvise a boot from memory, and do **NOT** fall back to
-any local or cached copy of the procedure. Unreachable authority → no session
-(`contract_session` §3: "no memory authority, no session").
+any local or cached copy of the procedure. An unreachable memory authority means no
+session is opened — full stop, no degraded/offline boot.
