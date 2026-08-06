@@ -1255,12 +1255,32 @@ _open_session_spine() {
   # server's answer is treated as canonical and persisted the same atomic way
   # _regenerate_device_id does. In steady state this is a no-op echo — see
   # DR-6.3/_spawn_runtime's unavoidable local-bootstrap need, unchanged here.
+  #
+  # code-review fix: this is a TRUST-DIRECTION change — the server is telling
+  # the client to overwrite its own local identity file — so it now logs at
+  # the SAME unconditional visibility as the cert/device-id binding-mismatch
+  # path above (_resolve_device_id, "MISMATCH — cert changed..."), not just
+  # -v. And the value is now shape-VALIDATED as a UUID before either being
+  # persisted OR assigned into ENGRAM_DEVICE_ID: this variable is later
+  # interpolated UNESCAPED into hand-built JSON literals (e.g. this very
+  # function's own _open_args above, `"device_id":"${ENGRAM_DEVICE_ID}"`) —
+  # an unvalidated server string containing a `"` or `\` would corrupt that
+  # JSON or inject fields into subsequent calls. A response that fails the
+  # shape check is DROPPED (kept on the locally-resolved id) rather than
+  # adopted, and reported unconditionally so it's never silently ignored.
   local _server_device_id
   _server_device_id="$(_mcp_result_field "${_resp}" "device_id")"
   if [ -n "${_server_device_id}" ] && [ "${_server_device_id}" != "${ENGRAM_DEVICE_ID}" ]; then
-    _vecho "[hivemind] device_id adotado do servidor: ${_server_device_id} (era ${ENGRAM_DEVICE_ID})"
-    _atomic_write "${HOME}/.engram/device-id" "${_server_device_id}"
-    ENGRAM_DEVICE_ID="${_server_device_id}"
+    case "${_server_device_id}" in
+      [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
+        echo "[hivemind] device_id adotado do servidor: ${_server_device_id} (era ${ENGRAM_DEVICE_ID})" >&2
+        _atomic_write "${HOME}/.engram/device-id" "${_server_device_id}"
+        ENGRAM_DEVICE_ID="${_server_device_id}"
+        ;;
+      *)
+        echo "[hivemind] aviso: servidor propôs device_id '${_server_device_id}' fora do formato UUID esperado — ignorado, mantendo o local (${ENGRAM_DEVICE_ID})" >&2
+        ;;
+    esac
   fi
 
   _vecho "[hivemind] sessão aberta: ${ENGRAM_SESSION_ID} (slug=${_slug})"
