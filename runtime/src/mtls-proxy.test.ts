@@ -134,6 +134,25 @@ test('readPortMap filters out entries missing a numeric port or a string device_
   expect(entries).toEqual([{ path: '/a', port: 7780, device_id: 'dev-ok' }]);
 });
 
+test('readPortMap filters out entries with an out-of-range or non-integer port (code-review fix: numeric alone is not enough)', () => {
+  writePortMap([
+    { path: '/ok', port: 7780, device_id: 'dev-ok' },
+    { path: '/zero', port: 0, device_id: 'dev-zero' },
+    { path: '/negative', port: -1, device_id: 'dev-negative' },
+    { path: '/fractional', port: 7780.5, device_id: 'dev-fractional' },
+    { path: '/too-big', port: 65536, device_id: 'dev-too-big' },
+    { path: '/way-too-big', port: 999999, device_id: 'dev-way-too-big' },
+    { path: '/nan', port: Number.NaN, device_id: 'dev-nan' },
+    { path: '/infinity', port: Number.POSITIVE_INFINITY, device_id: 'dev-infinity' },
+    { path: '/boundary-max', port: 65535, device_id: 'dev-boundary-max' }, // valid: max TCP port
+  ]);
+  const entries = readPortMap(STATE_DIR);
+  expect(entries).toEqual([
+    { path: '/ok', port: 7780, device_id: 'dev-ok' },
+    { path: '/boundary-max', port: 65535, device_id: 'dev-boundary-max' },
+  ]);
+});
+
 test('readPortMap defaults to the real ~/.engram/mtls when called with no argument', () => {
   // Not exercised against the real filesystem (would touch the developer's
   // actual home dir) — just proves the parameter is truly optional at the

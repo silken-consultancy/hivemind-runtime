@@ -78,18 +78,37 @@ interface PortMapFile {
 // all degrade to an empty list — this must never abort daemon boot (mirrors
 // the self-heal posture every other JSON read in this repo already uses,
 // e.g. bin/hivemind's `_write_generic_mcp_config`).
+//
+// code-review FIX: the filter only checked `typeof port === 'number'`, which
+// happily let NaN, Infinity, negative, fractional (e.g. 7780.5), or
+// out-of-range (0, 65536+) values through as "valid" — a corrupted or
+// hand-edited port-map.json would then reach Bun.serve({port}) downstream
+// and rely on IT throwing (or worse, silently coercing) rather than being
+// rejected right here at the read boundary. Now explicitly range/integer-
+// validated (Number.isInteger(port) && port>0 && port<65536, the valid TCP
+// port range) and an invalid entry is skipped+logged — same self-heal
+// posture as the rest of this function, just per-entry instead of
+// per-document: one bad entry no longer needs to be diagnosed by chasing a
+// Bun.serve stack trace back to this file.
 export function readPortMap(stateDir: string = DEFAULT_MTLS_STATE_DIR): PortMapEntry[] {
   const portMapPath = join(stateDir, 'port-map.json');
   if (!existsSync(portMapPath)) return [];
   try {
     const parsed = JSON.parse(readFileSync(portMapPath, 'utf8')) as Partial<PortMapFile>;
     if (parsed && Array.isArray(parsed.entries)) {
-      return parsed.entries.filter(
-        (e): e is PortMapEntry =>
-          typeof e === 'object' && e !== null &&
-          typeof (e as PortMapEntry).port === 'number' &&
-          typeof (e as PortMapEntry).device_id === 'string',
-      );
+      return parsed.entries.filter((e): e is PortMapEntry => {
+        if (typeof e !== 'object' || e === null) return false;
+        const entry = e as PortMapEntry;
+        if (typeof entry.device_id !== 'string') return false;
+        const port = entry.port;
+        if (!(typeof port === 'number' && Number.isInteger(port) && port > 0 && port < 65536)) {
+          console.error(
+            `[mtls-proxy] port-map entry for path ${JSON.stringify((entry as { path?: unknown }).path ?? '<unknown>')} has an invalid port (${JSON.stringify(port)}) — skipped`,
+          );
+          return false;
+        }
+        return true;
+      });
     }
   } catch {
     /* unparseable → treat as no installed targets, not a boot failure */
