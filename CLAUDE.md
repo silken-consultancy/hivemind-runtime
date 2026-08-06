@@ -69,6 +69,38 @@ unreachable or the fetch returns nothing, the session does **not** boot — ther
 local copy of the procedure to fall back to (unreachable authority → no session). The
 same served body is also exposed as the native MCP prompt `/mcp__engram__boot`.
 
+### Universal session lifecycle — infrastructure-enforced, identical across clients
+
+OPEN/CLOSE of the session record (`active_sessions`) is **not something an agent decides
+to do** — it is enforced the same way regardless of which client launched you (decision
+`hivemind-session-lifecycle-centralized-in-runtime-not-agent`, decision `3cab5d01`
+Option B device-identity):
+
+- **`bin/hivemind` (the CLI you are most likely running under):** opens the session
+  itself, **before** `exec claude` — `_open_session_spine` calls `fos_session(action:
+  "open", { slug, device_id, ... })` pre-flight and exports the result as
+  `ENGRAM_SESSION_ID`/`ENGRAM_DEVICE_ID`. By the time `/boot` runs, the session already
+  exists — `/boot` never opens one itself.
+- **A foreign client (Cursor, Antigravity, Cowork, or any MCP client not wrapped by
+  `bin/hivemind`):** has no pre-flight opener and no `ENGRAM_SESSION_ID` in its
+  environment. In that case, **you** (the agent) are the opener: once your slug is known
+  (env, or the conversational fallback), call `fos_session(action: "open", { slug,
+  device_id })` yourself, using the `device_id` the boot fetch gave you (below). This is
+  the **only** case where an agent opens its own session — `fos_session(action:"open")`
+  stays the single opener either way, never raced between the CLI and the agent.
+
+**The device_id mechanism** (decision `3cab5d01`, Option B — server mints device
+identity on absence): both `fos_procedure({ id: "boot" })` and `fos_session(action:
+"open", ...)` accept an **optional** `device_id`. `bin/hivemind` always supplies its own
+locally-resolved one (`~/.engram/device-id`, DR-6.1–6.4) — for the CLI this makes the
+mechanism a no-op echo in steady state. A foreign client, which has no local device_id at
+all, simply **omits** the field: the engram mints one (or echoes a just-minted one for
+the same owner within a short dedup window) and returns it in the `fos_procedure`
+response — use that value as the `device_id` for your own `fos_session(action:"open")`
+call. `fos_procedure('boot')` only ever mints/echoes this identity — it never opens a
+session itself; that stays exclusively `fos_session(action:"open")`'s job (no double-open
+race between the two).
+
 ## Session close — automatic, plus the deliberate command
 
 `bin/hivemind` opens a real session before this window starts and exports its id as
@@ -85,6 +117,16 @@ Like `/boot`, the `/end-session` command file is a **thin stub**: its procedure 
 then executed verbatim, **fail-closed** (engram unreachable → no served close; do not
 improvise from a local copy). The automatic `SessionEnd` hook remains the safety net for
 closing the session record itself even when the served procedure cannot be fetched.
+
+**No `SessionEnd` hook, no explicit `/end-session` (e.g. a foreign client whose host app
+never fires a comparable hook):** the session is not orphaned forever. A server-side
+watchdog (engram `WatchdogService`, runs every 5 minutes) auto-closes any `active_sessions`
+row idle past a configurable threshold (default 60 minutes, `WATCHDOG_ORPHAN_THRESHOLD_MIN`)
+— idle meaning both `last_seen_at` and the runtime heartbeat are stale. It writes a floor
+handoff note in the same `WIP:`/`NEXT:` shape the `SessionEnd` hook itself uses (`'WIP:
+[auto-close: watchdog idle-timeout — session closed at <ts>; ...]\nNEXT: run
+/end-session next time...'`), so the next `/boot` on that slug still finds a real,
+structured `next_note` — never a silently-orphaned session.
 
 ## Dispatch — background roster agents (fetch+inject, both plans)
 

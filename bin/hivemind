@@ -1246,6 +1246,23 @@ _open_session_spine() {
   fi
 
   ENGRAM_SESSION_ID="${_session_id}"
+
+  # Adopt-back (decision 3cab5d01, Option B device-identity): fos_session(open)'s
+  # response now echoes device_id — supplied-and-reused (the normal case here,
+  # since we always sent one from _resolve_device_id above) or freshly minted
+  # (only for callers who had none — never us, DR-6.1-6.4 already resolves one
+  # locally before this point). If it ever differs from what we sent, the
+  # server's answer is treated as canonical and persisted the same atomic way
+  # _regenerate_device_id does. In steady state this is a no-op echo — see
+  # DR-6.3/_spawn_runtime's unavoidable local-bootstrap need, unchanged here.
+  local _server_device_id
+  _server_device_id="$(_mcp_result_field "${_resp}" "device_id")"
+  if [ -n "${_server_device_id}" ] && [ "${_server_device_id}" != "${ENGRAM_DEVICE_ID}" ]; then
+    _vecho "[hivemind] device_id adotado do servidor: ${_server_device_id} (era ${ENGRAM_DEVICE_ID})"
+    _atomic_write "${HOME}/.engram/device-id" "${_server_device_id}"
+    ENGRAM_DEVICE_ID="${_server_device_id}"
+  fi
+
   _vecho "[hivemind] sessão aberta: ${ENGRAM_SESSION_ID} (slug=${_slug})"
 }
 
