@@ -48,6 +48,25 @@ app.route('/sessions', sessions);
 // above already covers that path). Public, localhost-only bind — same bypass
 // as /healthz/setup/sessions; skipped entirely in setup-only mode (no proxy
 // running to reload).
+//
+// code-review confirmation (loopback boundary): this route carries NO route-
+// level auth of its own — it relies ENTIRELY on the process-wide bind below
+// (`Bun.serve({ hostname: env.AR_BIND, ... })`, env.ts default '127.0.0.1'),
+// the SAME boundary /healthz, /setup and /sessions already rely on (see
+// sessions.ts's matching comment). That is a real boundary, not a false one:
+// AR_BIND governs the ONE Bun.serve() call this whole Hono app is mounted
+// on, so every route here — this one included — is unreachable off-box
+// unless an operator deliberately overrides AR_BIND away from its loopback
+// default. Deliberately NOT gating this one route behind env.AR_API_TOKEN
+// (defined in env.ts, currently unused everywhere in this codebase): doing so
+// would protect ONLY this endpoint while every other route mounted on the
+// exact same listener (including /sessions/adopt, which mutates state) stays
+// exactly as reachable as before — an inconsistent, route-by-route posture
+// that reads as "fixed" without changing what an attacker who already
+// cleared the loopback boundary can do. Turning AR_API_TOKEN into a real,
+// uniformly-enforced bearer check across this app is a legitimate follow-up,
+// but it is a whole-server auth design decision, not a one-route patch —
+// out of scope here.
 app.post('/internal/proxy/reload', (c) => {
   if (isSetupOnly) {
     return c.json({ error: 'setup_only_mode', added: [], total: mtlsServers.length }, 409);
