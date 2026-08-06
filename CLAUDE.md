@@ -61,6 +61,14 @@ your slug. The project-context call is `fos_boot_skeleton({ slug: <ENGRAM_SLUG> 
 exports it before `exec claude` — there is no `basename` fallback). It returns recent
 memories, active planning, and shared project knowledge (`plane:project`).
 
+**The `/boot` command file is a thin stub** — the canonical boot procedure body is
+**served by the engram** as config-as-data and fetched at invocation via
+`fos_procedure({ id: "boot" })`, then executed verbatim. **Fail-closed**
+(`decision_serve-boot-and-end-session-as-mcp-prompts-fail-closed`): if the engram is
+unreachable or the fetch returns nothing, the session does **not** boot — there is no
+local copy of the procedure to fall back to (unreachable authority → no session). The
+same served body is also exposed as the native MCP prompt `/mcp__engram__boot`.
+
 ## Session close — automatic, plus the deliberate command
 
 `bin/hivemind` opens a real session before this window starts and exports its id as
@@ -71,6 +79,12 @@ and is still the **preferred** way to end deliberately: it does the one thing th
 cannot do — judgment-quality memory consolidation of what happened this session — before
 closing with a real handoff note. The hook is the safety net for continuity of the close
 itself, not a replacement for the deliberate command.
+
+Like `/boot`, the `/end-session` command file is a **thin stub**: its procedure body is
+**served by the engram** and fetched at invocation via `fos_procedure({ id: "end-session" })`,
+then executed verbatim, **fail-closed** (engram unreachable → no served close; do not
+improvise from a local copy). The automatic `SessionEnd` hook remains the safety net for
+closing the session record itself even when the served procedure cannot be fetched.
 
 ## Dispatch — background roster agents (fetch+inject, both plans)
 
