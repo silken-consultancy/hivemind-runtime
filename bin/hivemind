@@ -20,6 +20,8 @@
 #   hivemind health       # same checks as status, script-friendly exit code (0/1/2)
 #   hivemind update       # pull-agent: staged+verified+atomic update, auto-rollback
 #   hivemind resume <slug>  # explicit crash recovery: close a dead-holder session, then open
+#   hivemind install [<target>]  # guided setup of another local MCP client (Cursor,
+#                          # Antigravity, ...) — interactive only, NO default path ever
 #   hivemind --version    # print version and exit
 #   hivemind --verbose [...]  # show startup/debug logs (default: quiet, GO/NO-GO only)
 
@@ -39,6 +41,11 @@ RUNTIME_PID_FILE="${HOME}/.engram/cache/hivemind-runtime.pid"
 SETUP_PID_FILE="${HOME}/.engram/cache/hivemind-setup.pid"
 CERT_DIR="${HOME}/.engram/mtls"
 RUNTIME_BIN="${HIVEMIND_HOME}/runtime/src/server.ts"
+# `hivemind install`'s Antigravity candidate — the WSL↔Windows bridge root
+# (measured, 62e96c8e item 4.4: Windows-side config lives at
+# <root>/<user>/.gemini/config/mcp_config.json). Overridable so tests can
+# point detection at a fixture tree instead of a real /mnt/c mount.
+ANTIGRAVITY_WINDOWS_USERS_ROOT="${ANTIGRAVITY_WINDOWS_USERS_ROOT:-/mnt/c/Users}"
 # Local HTTPS loopback listener cert (round-2, item 1.1(B)/1.4, founder
 # 2026-07-30) — generated lazily by mtls-proxy.ts under this subdir, DISTINCT
 # from CERT_DIR's enrollment client cert. Trusted into the WSL/Linux system
@@ -637,7 +644,7 @@ cmd_version() {
 }
 
 cmd_help() {
-  echo "Usage: hivemind [<slug>] | start | stop | restart | status | health | update | resume <slug> | --version"
+  echo "Usage: hivemind [<slug>] | start | stop | restart | status | health | update | resume <slug> | install [<target>] | --version"
   echo ""
   echo "  hivemind [<slug>]     Start proxy + open Claude Code (slug = arg, else interactive picker)"
   echo "  hivemind start        Start proxy only"
@@ -647,6 +654,9 @@ cmd_help() {
   echo "  hivemind health       Same checks as status; exit 0=ok 1=degraded 2=down"
   echo "  hivemind update       Pull-agent: staged + verified + atomic update, auto-rollback"
   echo "  hivemind resume <slug>  Explicit crash recovery: close a dead-holder session for <slug>, then open"
+  echo "  hivemind install [<target>]  Guided setup of another local MCP client (Cursor, Antigravity, ...)"
+  echo "                         Interactive only — detects candidates, asks scope, confirms the exact"
+  echo "                         path with you before writing anything. No default path, ever."
   echo "  hivemind --version    Print version"
   echo ""
   echo "  --verbose             Show startup/debug logs (default: quiet, GO/NO-GO + errors only)"
@@ -1615,10 +1625,26 @@ _bootstrap_first_slug() {
 # it only degrades the NEXT session's /mcp discovery, never blocks THIS
 # session from opening Claude. Idempotent: running it twice back-to-back
 # produces byte-identical output on the second run.
-_seed_engram_mcp_config() {
-  local _claude_dir="${HIVEMIND_HOME}/.claude"
-  local _claude_config="${_claude_dir}/.claude.json"
-  if ! bun -e '
+# _write_generic_mcp_config: the same merge-safe mcpServers.engram write,
+# EXTRACTED so it can target an ARBITRARY path — not just Claude Code's own
+# $HIVEMIND_HOME/.claude/.claude.json. Shared by _seed_engram_mcp_config
+# below (Claude Code's user-scope file) and `hivemind install`'s carrier
+# (P2, item ef1c9385 — reuse, don't reinvent) for any OTHER local client's
+# own mcp.json-shaped config. $1 = absolute path to write/merge.
+#
+# Same contract as before this extraction (behavior-preserving refactor):
+# preserve every other top-level key + mcpServers.* entry; self-heal a
+# missing/corrupted/non-object document AND a missing/null/array
+# `mcpServers` to {} rather than throwing; atomic tmp+rename; chmod 0600;
+# NO headers/FOS_API_KEY or other secret material in the written entry — the
+# mTLS proxy injects the credential server-side (decision `bee7f370`:
+# HTTPS-loopback-by-default, no stdio, no header/${VAR} dependency for any
+# client). Returns bun's exit status — 0 on a clean write, non-zero on any
+# failure (disk full, permissions, malformed args) — callers decide whether
+# a failure is fail-soft (re-seed) or fail-loud (a fresh `install`).
+_write_generic_mcp_config() {
+  local _target_path="$1"
+  bun -e '
     import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, mkdirSync } from "node:fs";
     import { dirname } from "node:path";
 
@@ -1633,7 +1659,7 @@ _seed_engram_mcp_config() {
           existing = parsed;
         }
         // else: corrupted/non-object document → {} (never throws, never
-        // aborts the open — same "corrompido → {}" contract as setup.ts).
+        // aborts the caller — same "corrompido → {}" contract as setup.ts).
       } catch { /* unparseable → {} */ }
     }
 
@@ -1655,8 +1681,22 @@ _seed_engram_mcp_config() {
     writeFileSync(tmpPath, JSON.stringify(merged, null, 2), { mode: 0o600 });
     renameSync(tmpPath, configPath);
     chmodSync(configPath, 0o600);
-  ' "${_claude_config}" "${PROXY_PORT}" 2>/dev/null; then
-    _vecho "[hivemind] aviso: falha ao re-selar mcpServers.engram em .claude.json (não bloqueante)"
+  ' "${_target_path}" "${PROXY_PORT}"
+  # code-review fix: stderr used to be swallowed HERE (`2>/dev/null` on the
+  # bun invocation), which made every caller's failure branch blind — in
+  # particular _install_run's interactive "✗ falha ao gravar <path>" (below)
+  # showed NO reason at all (permission denied, disk full, ...), the exact
+  # moment a human is standing there waiting to know why. Left un-swallowed
+  # now; each caller decides what to do with stderr — _seed_engram_mcp_config
+  # (best-effort, non-blocking re-seed) captures it into its own -v-gated
+  # line, _install_run (interactive, blocking) surfaces it directly.
+}
+
+_seed_engram_mcp_config() {
+  local _claude_config="${HIVEMIND_HOME}/.claude/.claude.json"
+  local _seed_err
+  if ! _seed_err="$(_write_generic_mcp_config "${_claude_config}" 2>&1)"; then
+    _vecho "[hivemind] aviso: falha ao re-selar mcpServers.engram em .claude.json (não bloqueante)${_seed_err:+: ${_seed_err}}"
   fi
   return 0
 }
@@ -1918,6 +1958,353 @@ cmd_resume() {
   cmd_open "${_slug}"
 }
 
+# ── install (P2 — guided MCP-client installer, platform-agnostic core) ──────
+# `hivemind install [<target>]` walks a human through wiring the SAME generic
+# entry `_seed_engram_mcp_config` already writes for Claude Code itself
+# (`mcpServers.engram = {type:"http", url:"https://127.0.0.1:<port>/v1/mcp"}`,
+# decision `bee7f370`: HTTPS-loopback-by-default, no stdio, no header/${VAR}
+# dependency for any client — the mTLS proxy injects the credential
+# server-side) into ANOTHER local client's own mcp.json-shaped config
+# (Cursor, Antigravity, ...).
+#
+# FOUNDER CONSTRAINT — NO DEFAULT PATH, EVER: every write is preceded by an
+# explicit, typed confirmation of the EXACT path about to be touched.
+# Candidates are DETECTED and PRESENTED, never assumed; scope (global vs
+# per-project) is ASKED, never assumed. This is why the whole command is
+# TTY-gated (cmd_install below) — a guided confirmation cannot happen
+# non-interactively. Supplying `<target>` only skips the "which client"
+# menu; it never skips the scope/path confirmation.
+#
+# SCOPE (per the task order — core, platform-agnostic): this command and
+# _install_run below own the command skeleton, detection, prompts, and the
+# generic carrier (_write_generic_mcp_config, above). Per-client FORMAT
+# quirks (e.g. a client whose own config uses a different top-level
+# key/shape than the mcpServers convention) are explicitly OUT of scope —
+# _INSTALL_IDS/_INSTALL_LABELS below is the seam a P3 per-client writer
+# would extend or override, not something to speculatively build now.
+
+# _install_target_catalog: populates the static candidate list. Parallel
+# arrays (matches this file's existing convention — see _pick_project's
+# slugs/names) rather than an associative array, since bash 3.2-compatible
+# arrays are what the rest of the script already assumes.
+_install_target_catalog() {
+  _INSTALL_IDS=(cursor antigravity)
+  _INSTALL_LABELS=("Cursor" "Antigravity (Windows, via WSL)")
+}
+
+# _install_detected: $1 = target id → prints 1 (detected) or 0 (not) on
+# stdout. A "not detected" candidate still appears in the picker (labeled
+# accordingly) — detection narrows nothing, it only informs the human.
+_install_detected() {
+  case "$1" in
+    cursor)
+      [ -d "${HOME}/.cursor" ] && echo 1 || echo 0
+      ;;
+    antigravity)
+      compgen -G "${ANTIGRAVITY_WINDOWS_USERS_ROOT}/*/.gemini/config" > /dev/null 2>&1 && echo 1 || echo 0
+      ;;
+    *)
+      echo 0
+      ;;
+  esac
+}
+
+# _install_pick_target: renders the detected-candidates menu (+ an always-
+# present "manual path" option) and sets _INSTALL_PICKED_ID/_LABEL from an
+# explicit numeric choice — never a default, never auto-accepted on a bare
+# Enter. Mirrors _pick_project's box/number styling. Returns 130 on
+# cancel (Ctrl-C/Ctrl-D), matching this file's existing convention.
+_install_pick_target() {
+  _INSTALL_PICKED_ID=""; _INSTALL_PICKED_LABEL=""
+  _install_target_catalog
+  local n="${#_INSTALL_IDS[@]}"
+  local -a _det=()
+  local i
+  for ((i = 0; i < n; i++)); do
+    _det+=("$(_install_detected "${_INSTALL_IDS[$i]}")")
+  done
+
+  echo "" >&2
+  echo "  Clientes MCP locais detectados nesta máquina:" >&2
+  for ((i = 0; i < n; i++)); do
+    if [ "${_det[$i]}" = "1" ]; then
+      printf '   %2d) %-32s %s\n' "$((i + 1))" "${_INSTALL_LABELS[$i]}" "$(_ok "[detectado]")" >&2
+    else
+      printf '   %2d) %-32s %s\n' "$((i + 1))" "${_INSTALL_LABELS[$i]}" "$(_dim "[não detectado]")" >&2
+    fi
+  done
+  printf '   %2d) Outro (informar o caminho manualmente)\n' "$((n + 1))" >&2
+  echo "" >&2
+
+  local _choice
+  while :; do
+    printf '  → número [1-%d] (Ctrl-C cancela): ' "$((n + 1))" >&2
+    if ! IFS= read -r _choice; then
+      echo "" >&2
+      return 130
+    fi
+    case "${_choice}" in
+      # code-review fix: a >8-digit all-numeric string used to pass this
+      # filter and reach the `-ge`/`-le` arithmetic test below, where bash
+      # prints a raw "value too large for defined data type" / "integer
+      # expression expected" straight to the terminal BEFORE falling through
+      # to the friendly "Fora do intervalo" — cosmetic, but jarring, and
+      # menus here are never anywhere close to 9 digits long, so this range
+      # costs nothing real.
+      '' | *[!0-9]* | ?????????*)
+        printf '  ✗ Entrada inválida.\n' >&2
+        continue
+        ;;
+    esac
+    if [ "${_choice}" -ge 1 ] && [ "${_choice}" -le "$((n + 1))" ]; then
+      break
+    fi
+    printf '  ✗ Fora do intervalo.\n' >&2
+  done
+
+  if [ "${_choice}" -eq "$((n + 1))" ]; then
+    _INSTALL_PICKED_ID="manual"
+    _INSTALL_PICKED_LABEL="Outro (caminho manual)"
+  else
+    _INSTALL_PICKED_ID="${_INSTALL_IDS[$((_choice - 1))]}"
+    _INSTALL_PICKED_LABEL="${_INSTALL_LABELS[$((_choice - 1))]}"
+  fi
+  return 0
+}
+
+# _install_ask_scope: $1 = human label for the chosen target. Sets
+# _INSTALL_SCOPE to "global" or "project" from an explicit numeric choice
+# (never a default). Returns 130 on cancel.
+_install_ask_scope() {
+  local _label="$1"
+  echo "" >&2
+  echo "  Escopo da configuração para ${_label}:" >&2
+  echo "   1) Global (todos os projetos deste usuário)" >&2
+  printf '   2) Apenas este projeto (diretório atual: %s)\n' "$(pwd)" >&2
+  local _choice
+  while :; do
+    printf '  → número [1-2] (Ctrl-C cancela): ' >&2
+    if ! IFS= read -r _choice; then
+      echo "" >&2
+      return 130
+    fi
+    case "${_choice}" in
+      1) _INSTALL_SCOPE="global"; return 0 ;;
+      2) _INSTALL_SCOPE="project"; return 0 ;;
+      *) printf '  ✗ Entrada inválida.\n' >&2 ;;
+    esac
+  done
+}
+
+# _install_run: the guided flow itself, WITHOUT the TTY gate (that lives in
+# cmd_install, its only caller in production) — kept separate so a test can
+# drive it directly with piped stdin ("mock the interactive prompts") without
+# fighting a `[ -t 0 ]` check that a pipe can never satisfy. $1 = optional
+# target id arg.
+_install_run() {
+  local _target_arg="${1:-}"
+
+  local -a _INSTALL_IDS=() _INSTALL_LABELS=()
+  _install_target_catalog
+
+  local _chosen_id="" _chosen_label=""
+  if [ -n "${_target_arg}" ]; then
+    if [ "${_target_arg}" = "manual" ]; then
+      _chosen_id="manual"; _chosen_label="Outro (caminho manual)"
+    else
+      local i
+      for ((i = 0; i < ${#_INSTALL_IDS[@]}; i++)); do
+        if [ "${_INSTALL_IDS[$i]}" = "${_target_arg}" ]; then
+          _chosen_id="${_INSTALL_IDS[$i]}"
+          _chosen_label="${_INSTALL_LABELS[$i]}"
+          break
+        fi
+      done
+      if [ -z "${_chosen_id}" ]; then
+        echo "Erro: alvo desconhecido '${_target_arg}'." >&2
+        echo "      Alvos suportados: ${_INSTALL_IDS[*]}, manual (caminho informado por você)." >&2
+        return 1
+      fi
+    fi
+  else
+    local _rc=0
+    _install_pick_target || _rc=$?
+    if [ "${_rc}" -ne 0 ]; then
+      echo "Instalação cancelada." >&2
+      return "${_rc}"
+    fi
+    _chosen_id="${_INSTALL_PICKED_ID}"
+    _chosen_label="${_INSTALL_PICKED_LABEL}"
+  fi
+
+  # Resolve the candidate path(s) for the chosen target — never fewer/more
+  # than what the target structurally supports, never a silent pick among
+  # several without asking.
+  local -a _paths=()
+  case "${_chosen_id}" in
+    manual)
+      printf 'Caminho completo do arquivo de configuração (ex: /home/voce/.algum-cliente/mcp.json): ' >&2
+      local _typed
+      if ! IFS= read -r _typed; then
+        echo "" >&2
+        return 130
+      fi
+      _typed="$(printf '%s' "${_typed}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      if [ -z "${_typed}" ]; then
+        echo "Caminho vazio — nada instalado." >&2
+        return 1
+      fi
+      _paths=("${_typed}")
+      ;;
+    cursor)
+      local _rc=0
+      _install_ask_scope "${_chosen_label}" || _rc=$?
+      if [ "${_rc}" -ne 0 ]; then
+        echo "Instalação cancelada." >&2
+        return "${_rc}"
+      fi
+      if [ "${_INSTALL_SCOPE}" = "project" ]; then
+        _paths=("$(pwd)/.cursor/mcp.json")
+      else
+        _paths=("${HOME}/.cursor/mcp.json")
+      fi
+      ;;
+    antigravity)
+      # Global-only — a Windows-side per-user config, there is no
+      # per-project equivalent crossing the WSL↔Windows boundary. Stated
+      # plainly rather than silently skipped, per the "guided, never
+      # assumed" bar even where there is structurally only one scope.
+      echo "" >&2
+      echo "  $(_dim "Antigravity só suporta configuração global (não há escopo por projeto).")" >&2
+      local _wp
+      for _wp in "${ANTIGRAVITY_WINDOWS_USERS_ROOT}"/*/.gemini/config; do
+        [ -d "${_wp}" ] || continue
+        _paths+=("${_wp}/mcp_config.json")
+      done
+      if [ "${#_paths[@]}" -eq 0 ]; then
+        echo "Erro: nenhum diretório de configuração do Antigravity encontrado (${ANTIGRAVITY_WINDOWS_USERS_ROOT}/*/.gemini/config)." >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "Erro interno: alvo '${_chosen_id}' sem resolução de caminho." >&2
+      return 1
+      ;;
+  esac
+
+  local _final_path
+  if [ "${#_paths[@]}" -eq 1 ]; then
+    _final_path="${_paths[0]}"
+  else
+    # More than one structural candidate (e.g. >1 Windows user profile) —
+    # guided pick among them, still no default.
+    echo "" >&2
+    echo "  Mais de um caminho candidato encontrado:" >&2
+    local i
+    for ((i = 0; i < ${#_paths[@]}; i++)); do
+      printf '   %2d) %s\n' "$((i + 1))" "${_paths[$i]}" >&2
+    done
+    local _idx
+    while :; do
+      printf '  → número [1-%d] (Ctrl-C cancela): ' "${#_paths[@]}" >&2
+      if ! IFS= read -r _idx; then
+        echo "" >&2
+        return 130
+      fi
+      case "${_idx}" in
+        # code-review fix: same overly-long-digit-string guard as the target
+        # picker above — keeps the arithmetic test below from ever seeing a
+        # value it can't parse.
+        '' | *[!0-9]* | ?????????*)
+          printf '  ✗ Entrada inválida.\n' >&2
+          continue
+          ;;
+      esac
+      if [ "${_idx}" -ge 1 ] && [ "${_idx}" -le "${#_paths[@]}" ]; then
+        _final_path="${_paths[$((_idx - 1))]}"
+        break
+      fi
+      printf '  ✗ Fora do intervalo.\n' >&2
+    done
+  fi
+
+  echo "" >&2
+  echo "  Alvo:    ${_chosen_label:-${_chosen_id}}" >&2
+  echo "  Arquivo: ${_final_path}" >&2
+  echo "  Entrada: mcpServers.engram = {type:\"http\", url:\"https://127.0.0.1:${PROXY_PORT}/v1/mcp\"}" >&2
+  printf '  Confirma a escrita neste caminho? [y/N] ' >&2
+  local _confirm
+  if ! IFS= read -r _confirm; then
+    echo "" >&2
+    return 130
+  fi
+  case "${_confirm}" in
+    y | Y | yes | YES | s | S | sim | SIM) ;;
+    *)
+      echo "Cancelado — nada escrito." >&2
+      return 130
+      ;;
+  esac
+
+  local _write_err
+  if _write_err="$(_write_generic_mcp_config "${_final_path}" 2>&1)"; then
+    echo "  $(_ok "✓") gravado: ${_final_path}" >&2
+  else
+    echo "  $(_err "✗") falha ao gravar ${_final_path}" >&2
+    # code-review fix: surface the real reason (permission denied, disk
+    # full, malformed path, ...) instead of swallowing it — a human is
+    # standing at this prompt waiting to know why, not scripting around it.
+    [ -n "${_write_err}" ] && echo "      ${_write_err}" >&2
+    return 1
+  fi
+
+  # ef1c9385 — no local skill/stub file is written for ANY P2 target: per
+  # decision bee7f370 the URL+header (server-injected credential) wiring
+  # above is sufficient on its own for every target this pass ships. A
+  # thin-stub carrier (aea3837b/boot.md's shape — a fetch+inject pointer,
+  # never the full procedure body) would only be needed for a FUTURE target
+  # whose client cannot discover served MCP prompts/resources on its own —
+  # none of today's targets need that, so none is speculatively built here.
+  echo "  $(_dim "Nenhum arquivo local de skill/stub foi escrito para '${_chosen_id}' — apenas o wiring de URL acima (decisão bee7f370).")" >&2
+  return 0
+}
+
+# cmd_install: TTY gate + dispatch to _install_run. The gate lives HERE
+# (not inside _install_run) specifically so tests can call _install_run
+# directly with piped stdin to exercise the guided flow — the pipe itself
+# is never a TTY, so a gate inside _install_run would make that untestable.
+# Same fail-closed posture as the slug-picker (cmd_open, F2.3): a target arg
+# does NOT bypass this gate — the scope/path confirmation below still needs
+# a real terminal, so a non-interactive `hivemind install <target>` would
+# only hang or silently fail a `read`, never a safe outcome.
+cmd_install() {
+  if ! { [ -t 0 ] && [ -t 1 ]; }; then
+    echo "Erro: 'hivemind install' é guiado e interativo (sem caminho padrão) — a entrada não é um terminal." >&2
+    echo "      Rode 'hivemind install' (ou 'hivemind install <target>') em um terminal interativo." >&2
+    exit 1
+  fi
+
+  # code-review fix: unlike cmd_open, this command used to write the OTHER
+  # client's mcpServers.engram entry (pointing at https://127.0.0.1:${PROXY_PORT})
+  # WITHOUT ever ensuring anything is listening on that port — "✓ gravado" with
+  # nothing behind it. This machine must already be enrolled (a proxy cannot
+  # authenticate without a cert; _setup_mode is an enrollment flow of its own
+  # and out of scope for a command whose whole point is "wire up ANOTHER
+  # client to the cert THIS one already has") — warn+instruct rather than
+  # silently degrade. If enrolled, mirror cmd_open and ensure a healthy
+  # proxy is actually up before the guided write below.
+  if ! _has_cert; then
+    echo "Erro: nenhum certificado encontrado para este usuário — 'hivemind install' conecta OUTRO" >&2
+    echo "      cliente ao mesmo proxy que este dispositivo já usa, então este dispositivo precisa" >&2
+    echo "      estar inscrito primeiro. Rode 'hivemind' (sem argumentos) para inscrever, depois" >&2
+    echo "      tente 'hivemind install' de novo." >&2
+    exit 1
+  fi
+  _start_proxy
+
+  _install_run "$@"
+}
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 # Parse --verbose anywhere in argv; strip it before subcommand dispatch (it's
@@ -1940,6 +2327,7 @@ case "${1:-}" in
   health)         shift || true; cmd_health ;;
   update)         shift || true; cmd_update ;;
   resume)         shift || true; cmd_resume "$@" ;;
+  install)        shift || true; cmd_install "$@" ;;
   --version|-v)   cmd_version ;;
   --help|-h)      cmd_help ;;
   *)              cmd_open "$@" ;;

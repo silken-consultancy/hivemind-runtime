@@ -17,7 +17,7 @@
 // guard under test while listening on nothing. The endpoint tests shadow `curl`
 // with a shell function, so they make no network call at all.
 import { test, expect, afterAll } from 'bun:test';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 
@@ -400,4 +400,170 @@ _assert never-blocks-open "\${_rc}" 0
 `);
   expect(out).toContain('ok never-blocks-open');
   expect(out).not.toContain('not ok');
+});
+
+// ── P2: `hivemind install` — dispatcher wiring + guided flow (mocked prompts) ──
+// bin/hivemind's dispatcher gained a new `install [<target>]` case arm
+// (30e3e435) that runs `cmd_install`, a thin TTY gate wrapping `_install_run`
+// — the actual guided logic (detect candidates, ask scope, confirm the exact
+// path, write via the shared `_write_generic_mcp_config` carrier; 6ea3a95d/
+// ef1c9385). The gate lives in `cmd_install`, not `_install_run`, specifically
+// so these tests can drive `_install_run` directly with piped stdin ("mock
+// the interactive prompts") without a `[ -t 0 ]` check a pipe can never pass.
+
+// runInstallRun: sources the stripped script (same technique as sh()/shRaw()
+// above) into an isolated $HOME/cwd, optionally pre-seeds a `~/.cursor` dir
+// and/or a fake Windows-users tree (via ANTIGRAVITY_WINDOWS_USERS_ROOT, the
+// override added alongside the feature for exactly this reason), feeds
+// `opts.stdin` to `_install_run <targetArg>`, and reports back the exit code
+// (via a marker file — stdout/stderr from the case carry the guided-flow
+// prompts themselves, not a clean return value) plus the resolved paths a
+// test needs to assert against.
+function runInstallRun(
+  name: string,
+  opts: { stdin: string; targetArg?: string; seedCursor?: boolean; antigravityUsers?: string[] },
+): { rc: number; home: string; cwd: string; antigravityRoot: string } {
+  const dir = join(testRoot, name);
+  const home = join(dir, 'home');
+  const cwd = join(dir, 'cwd');
+  const antigravityRoot = join(dir, 'winusers');
+  mkdirSync(home, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  if (opts.seedCursor) mkdirSync(join(home, '.cursor'), { recursive: true });
+  for (const u of opts.antigravityUsers ?? []) {
+    mkdirSync(join(antigravityRoot, u, '.gemini', 'config'), { recursive: true });
+  }
+
+  const libPath = join(dir, 'lib.sh');
+  const strip = Bun.spawnSync(['bash', '-c', `sed '/^# ── Entry point/,$d' "${HIVEMIND_BIN}" > "${libPath}"`]);
+  if (strip.exitCode !== 0) throw new Error(`failed to strip entry point: ${strip.stderr.toString()}`);
+
+  const scriptPath = join(dir, 'case.sh');
+  const stdinLiteral = opts.stdin.replace(/'/g, `'\\''`);
+  const targetLiteral = (opts.targetArg ?? '').replace(/'/g, `'\\''`);
+  writeFileSync(
+    scriptPath,
+    `#!/usr/bin/env bash
+export HOME="${home}"
+export HIVEMIND_HOME="${home}/.hivemind"
+export ANTIGRAVITY_WINDOWS_USERS_ROOT="${antigravityRoot}"
+unset MTLS_PROXY_PORT
+cd "${cwd}"
+# shellcheck disable=SC1090
+source "${libPath}"
+
+_rc=0
+printf '%s' '${stdinLiteral}' | _install_run '${targetLiteral}' || _rc=\$?
+printf '%s' "\${_rc}" > "${dir}/rc"
+`,
+  );
+  const res = Bun.spawnSync(['bash', scriptPath], { stdout: 'pipe', stderr: 'pipe' });
+  const rcPath = join(dir, 'rc');
+  if (!existsSync(rcPath)) {
+    throw new Error(`case '${name}' never wrote an rc marker (script aborted?).\nstdout:\n${res.stdout.toString()}\nstderr:\n${res.stderr.toString()}`);
+  }
+  return { rc: Number(readFileSync(rcPath, 'utf8')), home, cwd, antigravityRoot };
+}
+
+test('the dispatcher routes `install` to cmd_install, and a non-interactive invocation fails closed — with or without a target arg', () => {
+  // Real (unstripped) script, isolated $HOME, default spawn stdin (never a
+  // TTY under the test runner) — proves the dispatcher wiring end-to-end
+  // AND the "no TTY, no default path" fail-closed acceptance gate (30e3e435)
+  // in one shot, safely: cmd_install's TTY check is the very first thing it
+  // does, before any daemon/network/proxy work.
+  const home = mkdtempSync(join(tmpdir(), 'hivemind-install-noninteractive-'));
+
+  const helpRes = Bun.spawnSync(['bash', HIVEMIND_BIN, '--help'], { env: { ...process.env, HOME: home }, stdout: 'pipe', stderr: 'pipe' });
+  expect(helpRes.stdout.toString()).toContain('install [<target>]');
+
+  const noArgRes = Bun.spawnSync(['bash', HIVEMIND_BIN, 'install'], { env: { ...process.env, HOME: home }, stdout: 'pipe', stderr: 'pipe' });
+  expect(noArgRes.exitCode).toBe(1);
+  expect(noArgRes.stderr.toString()).toContain('terminal');
+
+  // A target arg is NOT a bypass — the scope/path confirmation downstream
+  // still needs a real terminal.
+  const withArgRes = Bun.spawnSync(['bash', HIVEMIND_BIN, 'install', 'cursor'], { env: { ...process.env, HOME: home }, stdout: 'pipe', stderr: 'pipe' });
+  expect(withArgRes.exitCode).toBe(1);
+  expect(withArgRes.stderr.toString()).toContain('terminal');
+});
+
+test('_install_run — no target arg: guided menu → Cursor → global scope → confirmed write', () => {
+  const { rc, home } = runInstallRun('install-cursor-global', {
+    stdin: '1\n1\ny\n', // menu #1 = cursor, scope #1 = global, confirm = y
+    seedCursor: true,
+  });
+  expect(rc).toBe(0);
+  const written = JSON.parse(readFileSync(join(home, '.cursor', 'mcp.json'), 'utf8'));
+  expect(written.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
+});
+
+test('_install_run — declining the final confirmation writes nothing', () => {
+  const { rc, home } = runInstallRun('install-cursor-decline', {
+    stdin: '1\n1\nn\n',
+    seedCursor: true,
+  });
+  expect(rc).not.toBe(0);
+  expect(existsSync(join(home, '.cursor', 'mcp.json'))).toBe(false);
+});
+
+test('_install_run — target arg supplied: skips the candidate menu but still asks scope and confirms (project scope)', () => {
+  const { rc, cwd } = runInstallRun('install-cursor-project', {
+    stdin: '2\ny\n', // scope #2 = project, confirm = y (no menu prompt consumed — target arg given)
+    targetArg: 'cursor',
+    seedCursor: true,
+  });
+  expect(rc).toBe(0);
+  const written = JSON.parse(readFileSync(join(cwd, '.cursor', 'mcp.json'), 'utf8'));
+  expect(written.mcpServers.engram.url).toBe('https://127.0.0.1:7779/v1/mcp');
+});
+
+test('_install_run — antigravity: global-only, single Windows user detected, never asks scope', () => {
+  const { rc, antigravityRoot } = runInstallRun('install-antigravity-single', {
+    stdin: 'y\n', // only the final confirmation — no scope prompt, no path-picker (one candidate)
+    targetArg: 'antigravity',
+    antigravityUsers: ['alice'],
+  });
+  expect(rc).toBe(0);
+  const written = JSON.parse(readFileSync(join(antigravityRoot, 'alice', '.gemini', 'config', 'mcp_config.json'), 'utf8'));
+  expect(written.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
+});
+
+test('_install_run — antigravity: multiple Windows users found → guided path picker, exactly one candidate written', () => {
+  const { rc, antigravityRoot } = runInstallRun('install-antigravity-multi', {
+    stdin: '2\ny\n', // path-picker #2, confirm = y
+    targetArg: 'antigravity',
+    antigravityUsers: ['alice', 'bob'],
+  });
+  expect(rc).toBe(0);
+  const aliceWritten = existsSync(join(antigravityRoot, 'alice', '.gemini', 'config', 'mcp_config.json'));
+  const bobWritten = existsSync(join(antigravityRoot, 'bob', '.gemini', 'config', 'mcp_config.json'));
+  // Exactly one of the two candidates was written — never both, never neither
+  // — the specific one depends on glob ordering, which this test does not pin.
+  expect(aliceWritten !== bobWritten).toBe(true);
+});
+
+test('_install_run — manual target: free-text path, merge-safe write (shared carrier proven against a non-Claude path)', () => {
+  const dir = join(testRoot, 'install-manual-merge-safe');
+  mkdirSync(dir, { recursive: true });
+  const manualPath = join(dir, 'some-other-client', 'mcp.json');
+  mkdirSync(dirname(manualPath), { recursive: true });
+  writeFileSync(manualPath, JSON.stringify({ keepMe: true, mcpServers: { other: { command: 'x' } } }));
+
+  const { rc } = runInstallRun('install-manual-merge-safe', {
+    stdin: `${manualPath}\ny\n`,
+    targetArg: 'manual',
+  });
+  expect(rc).toBe(0);
+  const written = JSON.parse(readFileSync(manualPath, 'utf8'));
+  expect(written.keepMe).toBe(true);
+  expect(written.mcpServers.other).toEqual({ command: 'x' });
+  expect(written.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
+});
+
+test('_install_run — unknown target arg fails without prompting or writing anything', () => {
+  const { rc } = runInstallRun('install-unknown-target', {
+    stdin: '',
+    targetArg: 'does-not-exist',
+  });
+  expect(rc).toBe(1);
 });
