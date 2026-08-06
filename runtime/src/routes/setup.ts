@@ -424,6 +424,16 @@ setupRouter.post('/enroll', async (c) => {
     ].join('\n');
 
     writeFileSync(envFile, envContent, { mode: 0o600 });
+    // { mode: 0o600 } above is a no-op when envFile already existed (Node/Bun
+    // only apply the mode on O_CREAT — an existing inode keeps whatever perms
+    // it had). install.sh:108 ALWAYS `touch`es .env before this handler ever
+    // runs, so the file is pre-existing on every real enrollment and the mode
+    // option above silently does nothing — the merged file (FOS_API_KEY, cert
+    // paths) can sit at umask-derived perms (e.g. 0644, world-readable).
+    // chmodSync is unconditional and idempotent — same pattern bin/hivemind's
+    // _seed_engram_mcp_config/_write_generic_mcp_config already use for
+    // .claude.json below.
+    chmodSync(envFile, 0o600);
 
     // 6. Merge-write $HIVEMIND_HOME/.claude/.claude.json — the only path
     // Claude Code v2.1.207 actually reads for user-scope MCP server discovery
@@ -484,6 +494,11 @@ setupRouter.post('/enroll', async (c) => {
     // secret), but matching the 600 posture already used for .env/.credentials
     // is the correct default for a file that may carry other people's secrets.
     writeFileSync(claudeConfigPath, JSON.stringify(mergedConfig, null, 2), { mode: 0o600 });
+    // Same gap as the .env write above: { mode: 0o600 } only applies on
+    // O_CREAT, and this path is realistically pre-existing too (re-enrollment,
+    // or Claude Code itself having already created it) — so chmod explicitly
+    // rather than trust the write option alone.
+    chmodSync(claudeConfigPath, 0o600);
 
     // Mark enrollment done for /setup/status poll.
     enrollmentDone = true;
