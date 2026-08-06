@@ -149,13 +149,19 @@ cp "${SCRIPT_DIR}/CLAUDE.md" "${HIVEMIND_HOME}/.claude/CLAUDE.md"
 # added on top of the shipped defaults (extra permissions.allow/deny entries
 # via /config, a custom hook, etc.), forcing full reconfiguration on every
 # re-install. Deep-merge via scripts/merge-settings-json.mjs instead: objects
-# merge key-by-key (the user's extra keys survive), arrays union with dedup
-# (template ∪ existing, so a user-added entry is never dropped), scalars
-# re-apply the freshly-templated value (statusLine command path, defaultMode,
-# hook command lines must track the shipped runtime, not a stale local edit).
-# A corrupted/non-object existing file is treated as absent — never aborts the
-# install; a fresh install (no pre-existing file) is just the templated
-# content, unchanged.
+# merge key-by-key (the user's extra keys survive), arrays are TEMPLATE-OWNED
+# WITH REVOCATION (code-review fix — the template's entries are always
+# present; an existing entry survives only if it's not already covered by the
+# template AND wasn't part of the PREVIOUS template shipment, tracked via a
+# sidecar `settings.json.template-snapshot.json` the script itself maintains
+# — so a permission/hook the template stops shipping is actually revoked on
+# the next install/re-install, while a genuinely user-added entry still
+# survives; see scripts/merge-settings-json.mjs's own docstring for the full
+# semantics), scalars re-apply the freshly-templated value (statusLine command
+# path, defaultMode, hook command lines must track the shipped runtime, not a
+# stale local edit). A corrupted/non-object existing file is treated as absent
+# — never aborts the install; a fresh install (no pre-existing file) is just
+# the templated content, unchanged.
 _templated_settings="$(mktemp)"
 sed "s|__HIVEMIND_HOME__|${HIVEMIND_HOME}|g" \
   "${SCRIPT_DIR}/.claude/settings.json" > "${_templated_settings}"
