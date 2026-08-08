@@ -2225,8 +2225,93 @@ cmd_resume() {
 # slugs/names) rather than an associative array, since bash 3.2-compatible
 # arrays are what the rest of the script already assumes.
 _install_target_catalog() {
-  _INSTALL_IDS=(cursor antigravity)
-  _INSTALL_LABELS=("Cursor" "Antigravity (Windows, via WSL)")
+  _INSTALL_IDS=(cursor antigravity cowork)
+  _INSTALL_LABELS=("Cursor" "Antigravity (Windows, via WSL)" "Cowork (Claude desktop, via device bridge)")
+}
+
+# _cowork_skills_dir: prints the Cowork (Claude desktop, MSIX) skills-plugin dir
+# this machine writes client-side skills to; returns non-zero if not found.
+# Cowork is the ONE target that gets skill FILES written (exception to decision
+# bee7f370): it reaches the engram via the device bridge, which proxies TOOLS
+# (fos_*) but NOT MCP prompts — so it cannot discover the served
+# /mcp__engram__boot|end-session prompts and needs thin-stub carriers that call
+# the fos_procedure TOOL.
+#
+# Cowork = MSIX build (package Claude_pzs8sxrjxfjjc). Skills live under an
+# account/org-scoped skills-plugin, folder-per-skill, inside the MSIX LocalCache
+# (the Windows-side AppData\Roaming\Claude is empty/logs-only). There is NO
+# native per-project scope — the desktop app applies one account plugin to every
+# session, so scope is effectively global-only.
+#
+# Overrides: COWORK_SKILLS_ROOT replaces the whole resolved path (mirrors
+# ANTIGRAVITY_WINDOWS_USERS_ROOT); COWORK_WINDOWS_USERS_ROOT replaces just the
+# /mnt/c/Users base (non-default Windows mount).
+_cowork_skills_dir() {
+  if [ -n "${COWORK_SKILLS_ROOT:-}" ]; then
+    echo "${COWORK_SKILLS_ROOT}"; return 0
+  fi
+  local _users="${COWORK_WINDOWS_USERS_ROOT:-/mnt/c/Users}"
+  local _pkg="Claude_pzs8sxrjxfjjc"
+  # Glob skills-plugin/<orgId>/<accountId>/skills across all Windows users.
+  local _hit
+  for _hit in "${_users}"/*/AppData/Local/Packages/"${_pkg}"/LocalCache/Roaming/Claude/local-agent-mode-sessions/skills-plugin/*/*/skills; do
+    [ -d "${_hit}" ] && { echo "${_hit}"; return 0; }
+  done
+  return 1  # Cowork not installed, or no local-agent session has created the plugin dir yet
+}
+
+# _install_cowork_skills: the Cowork exception to bee7f370. Writes the thin-stub
+# skill files (boot + end-session) from the repo into Cowork's skills dir — the
+# skills only CALL fos_procedure (the served body stays the single source of
+# truth; nothing is inlined). Copies from HIVEMIND_SOURCE_DIR/skills (the clone).
+# $1 = destination skills dir, $2 = label.
+_install_cowork_skills() {
+  local _dir="$1" _label="$2"
+  local _src="${HIVEMIND_SOURCE_DIR:-}/skills"
+  local -a _skills=(hivemind-boot.SKILL.md hivemind-end-session.SKILL.md)
+
+  local _s
+  for _s in "${_skills[@]}"; do
+    if [ ! -f "${_src}/${_s}" ]; then
+      echo "Erro: skill de origem não encontrada: ${_src}/${_s}" >&2
+      echo "      (esperada em HIVEMIND_SOURCE_DIR/skills — clone válido e atualizado?)" >&2
+      return 1
+    fi
+  done
+
+  echo "" >&2
+  echo "  Alvo:    ${_label}" >&2
+  echo "  Skills:  ${_skills[*]}" >&2
+  echo "  Destino: ${_dir}/" >&2
+  echo "  $(_dim "Cowork recebe skills client-side (thin-stub que busca fos_procedure) — exceção à bee7f370: a device bridge proxia tools, não os prompts MCP servidos.")" >&2
+  printf '  Confirma a escrita? [y/N]: ' >&2
+  local _confirm
+  if ! IFS= read -r _confirm; then echo "" >&2; return 130; fi
+  case "${_confirm}" in
+    y | Y | yes | YES | s | S | sim | SIM) ;;
+    *) echo "Cancelado — nada escrito." >&2; return 130 ;;
+  esac
+
+  if ! mkdir -p "${_dir}"; then
+    echo "  $(_err "✗") não foi possível criar ${_dir}" >&2
+    return 1
+  fi
+  # Cowork requires FOLDER-PER-SKILL: <dir>/<stem>/SKILL.md — a flat *.SKILL.md
+  # file is NOT discovered. Strip the ".SKILL.md" suffix to get the skill's
+  # directory name.
+  for _s in "${_skills[@]}"; do
+    local _stem="${_s%.SKILL.md}"
+    local _skdir="${_dir}/${_stem}"
+    if mkdir -p "${_skdir}" && cp "${_src}/${_s}" "${_skdir}/SKILL.md"; then
+      echo "  $(_ok "✓") ${_skdir}/SKILL.md" >&2
+    else
+      echo "  $(_err "✗") falha ao escrever ${_skdir}/SKILL.md" >&2
+      return 1
+    fi
+  done
+  echo "  $(_dim "Pronto. No Cowork: invoque a skill hivemind-boot para iniciar e hivemind-end-session para fechar.")" >&2
+  echo "  $(_dim "Nota: o [SkillsPlugin] do Cowork faz sync periódico e limpa 'órfãos' — se a skill sumir, rode 'hivemind install' de novo.")" >&2
+  return 0
 }
 
 # _install_detected: $1 = target id → prints 1 (detected) or 0 (not) on
@@ -2239,6 +2324,11 @@ _install_detected() {
       ;;
     antigravity)
       compgen -G "${ANTIGRAVITY_WINDOWS_USERS_ROOT}/*/.gemini/config" > /dev/null 2>&1 && echo 1 || echo 0
+      ;;
+    cowork)
+      # Detected if the MSIX skills-plugin dir resolves (or COWORK_SKILLS_ROOT is
+      # set). "not detected" only informs the human; it never narrows the picker.
+      _cowork_skills_dir > /dev/null 2>&1 && echo 1 || echo 0
       ;;
     *)
       echo 0
@@ -2406,6 +2496,21 @@ _install_run() {
         _paths=("${HOME}/.cursor/mcp.json")
       fi
       ;;
+    cowork)
+      # Cowork gets client-side skill FILES (not URL wiring) — see
+      # _install_cowork_skills / _cowork_skills_dir. Global-only (the MSIX desktop
+      # app applies one account plugin to every session — no per-project scope),
+      # so there is no scope to ask. The "path" is the skills-plugin DIRECTORY.
+      echo "" >&2
+      echo "  $(_dim "Cowork é global-only (o app desktop aplica um único plugin de conta a toda sessão — não há escopo por projeto).")" >&2
+      local _cw_dir
+      if ! _cw_dir="$(_cowork_skills_dir)"; then
+        echo "Erro: diretório de skills do Cowork não encontrado (app não instalado, ou nenhuma sessão local-agent criou o plugin ainda)." >&2
+        echo "      Se o caminho for não-padrão, defina COWORK_SKILLS_ROOT e rode de novo." >&2
+        return 1
+      fi
+      _paths=("${_cw_dir}")
+      ;;
     antigravity)
       # Global-only — a Windows-side per-user config, there is no
       # per-project equivalent crossing the WSL↔Windows boundary. Stated
@@ -2463,6 +2568,15 @@ _install_run() {
       fi
       printf '  ✗ Fora do intervalo.\n' >&2
     done
+  fi
+
+  # Cowork exception (bee7f370): this target writes a client-side skill FILE,
+  # not an mcpServers URL entry — so it bypasses the entire per-target proxy
+  # port + device_id + generic-MCP-config machinery below. Its own confirm +
+  # write lives in _install_cowork_skills.
+  if [ "${_chosen_id}" = "cowork" ]; then
+    _install_cowork_skills "${_final_path}" "${_chosen_label:-${_chosen_id}}"
+    return $?
   fi
 
   # Option 2 (fos_decision 1caee6a7, item 18cff9b7): a DEDICATED loopback
