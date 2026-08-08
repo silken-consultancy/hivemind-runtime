@@ -1140,9 +1140,9 @@ _maybe_auto_update() {
 # absent OR empty/corrupted file both regenerate rather than sticking as a
 # permanently-broken device_id.
 #
-# DR-6.3 — every caller here (_spawn_runtime, _open_session_spine,
-# _bootstrap_first_slug) already runs AFTER cmd_open's/cmd_start's
-# `_has_cert || _setup_mode` gate at the top of each command — measured, not
+# DR-6.3 — every caller here (_spawn_runtime, _open_session_spine) already
+# runs AFTER cmd_open's/cmd_start's `_has_cert || _setup_mode` gate at the
+# top of each command — measured, not
 # assumed: `_setup_mode` always `exit 0`s (no fallthrough), so control only
 # reaches _start_proxy/_spawn_runtime once a cert exists. Combined with
 # _spawn_runtime resolving device_id INLINE on the same line that launches
@@ -1413,6 +1413,22 @@ _list_slugs() {
   return 0
 }
 
+# _nondefault_slugs_raw: filter _SLUGS_RAW ("slug<TAB>name" lines, set by
+# _list_slugs) down to every row EXCEPT the deliberate `default` home (Phase
+# 2, H1/2.1). `default` is now ALWAYS a registry row (Phase 3 seed +
+# backfill), so a bare `-z "${_SLUGS_RAW}"` emptiness test would never fire
+# again — "does this owner have a REAL project yet" must exclude the home
+# row first. Echoes the filtered lines; empty output means "first-timer" (no
+# project besides `default`, or no project at all).
+_nondefault_slugs_raw() {
+  local _s _n
+  while IFS=$'\t' read -r _s _n; do
+    [ -n "${_s}" ] || continue
+    [ "${_s}" = "default" ] && continue
+    printf '%s\t%s\n' "${_s}" "${_n}"
+  done <<< "${_SLUGS_RAW}"
+}
+
 # ── Double-access lock (Fase 7, DR-7.A) ───────────────────────────────────────
 # Intentional feature, not a bug: a slug already held by a live session on
 # THIS device must never be opened a second time concurrently. The founder's
@@ -1586,88 +1602,17 @@ _pick_project() {
   return 0
 }
 
-# _bootstrap_first_slug — owner has ZERO projects (F3.2). Creates the FIRST
-# project EXPLICITLY: the name is always asked/confirmed from the human, NEVER
-# derived from basename(cwd) or any other heuristic (decision 6e14806d, founder
-# 2026-07-13 — the fos-web Project Hub is read-only, there is nothing to
-# mirror; this is the first create surface, not a mirror). Sets _BOOTSTRAP_SLUG
-# on success; leaves it empty + returns non-zero on decline/empty input.
-# $1 = slug from an explicit `hivemind <slug>` arg ("" when none was given).
+# _bootstrap_first_slug (the bare bash "type your first project's name" flow)
+# was REMOVED here (Phase 2, H2/2.2) — a first-timer (owner has no project
+# except `default`) no longer gets a client-side create prompt. Instead
+# cmd_open routes to `default` + `ENGRAM_STARTUP=1` (below), and the AGENT
+# runs the birth conversation and creates the first real project itself.
 #
-# ARCHITECTURAL NOTE (registered, not resolved here — out of scope):
-# creating a slug is a MUTATION. This is currently the ONLY client-side
-# slug-create surface. If the Project Hub ever grows a create
-# button, it MUST converge on this SAME fos_registry(action:upsert) call — not
-# a second, divergent create path.
-_bootstrap_first_slug() {
-  local _arg_slug="${1:-}"
-  _BOOTSTRAP_SLUG=""
-  local _name _slug _reply
-
-  echo "" >&2
-  echo "Nenhum projeto encontrado para esta conta." >&2
-
-  if [ -n "${_arg_slug}" ]; then
-    # Name already came from the human (the explicit arg) — only confirm.
-    printf 'Criar "%s" como seu primeiro projeto? [y/N] ' "${_arg_slug}" >&2
-    IFS= read -r _reply || return 1
-    case "${_reply}" in
-      y|Y|yes|YES|s|S|sim|SIM)
-        # code-review FIX 1: the arg was used VERBATIM as the slug — a
-        # human-typed arg with spaces/symbols (e.g. `hivemind "Foo Bar"`)
-        # produced a malformed, non-path/URL-safe slug ("Foo Bar"). Run the
-        # SAME normalization as the no-arg path (:909) over the slug only —
-        # `_name` stays the arg verbatim (what the human actually typed/
-        # confirmed), only the SLUG is ASCII-folded/validated.
-        _name="${_arg_slug}"
-        _slug="$(printf '%s' "${_arg_slug}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed -e 's/^-*//' -e 's/-*$//')"
-        if [ -z "${_slug}" ]; then
-          echo "Argumento não produz um slug válido (use letras/números) — nada criado." >&2
-          return 1
-        fi
-        ;;
-      *) echo "Cancelado — nada criado." >&2; return 1 ;;
-    esac
-  else
-    # No arg — ask the name from scratch, WITHOUT pre-filling/suggesting.
-    printf 'Como você quer chamar seu primeiro projeto? ' >&2
-    IFS= read -r _name || return 1
-    _name="$(printf '%s' "${_name}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    if [ -z "${_name}" ]; then
-      echo "Nome vazio — nada criado." >&2
-      return 1
-    fi
-    # Derive a filesystem/URL-safe slug from the typed name (lowercase, runs of
-    # non-alnum → single '-', trimmed). Mechanical normalization of the human's
-    # own input — not a suggested default. Shown before create for transparency.
-    _slug="$(printf '%s' "${_name}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed -e 's/^-*//' -e 's/-*$//')"
-    if [ -z "${_slug}" ]; then
-      echo "Nome não produz um slug válido (use letras/números) — nada criado." >&2
-      return 1
-    fi
-    printf 'Criando projeto "%s" (slug: %s)...\n' "${_name}" "${_slug}" >&2
-  fi
-
-  # Build the upsert args with bun so name/slug are JSON-escaped safely (a name
-  # with a quote/backslash would otherwise corrupt hand-built JSON).
-  local _dev _upsert_args
-  _dev="$(_resolve_device_id)"
-  _upsert_args="$(bun -e '
-    const [slug, name, dev] = process.argv.slice(1);
-    process.stdout.write(JSON.stringify({
-      action: "upsert", slug, name,
-      mode: "self-managed", kind: "product", status: "active",
-      device_id: dev, registry_upsert_confirmation: true,
-    }));
-  ' "${_slug}" "${_name}" "${_dev}" 2>/dev/null)"
-  if [ -z "${_upsert_args}" ]; then
-    echo "Erro: falha ao montar a requisição de criação — nada criado." >&2
-    return 1
-  fi
-  _mcp_call "fos_registry" "${_upsert_args}" 1 > /dev/null
-  _BOOTSTRAP_SLUG="${_slug}"
-  return 0
-}
+# ARCHITECTURAL NOTE (still true, ownership moved): creating a slug is a
+# MUTATION. The birth flow's create call MUST converge on the SAME
+# `fos_registry(action:upsert)` shape this function used to send — not a
+# second, divergent create path. If the Project Hub ever grows a create
+# button, it too must converge on that same call.
 
 # _seed_engram_mcp_config: re-assert mcpServers.engram in
 # $HIVEMIND_HOME/.claude/.claude.json at OPEN time (papercut d,
@@ -2004,48 +1949,50 @@ cmd_open() {
   _start_proxy
   _maybe_surface_install_candidates
 
-  # ── Resolve the project slug (F2.2 / F2.3 / F3) ──────────────────────────
+  # ── Resolve the project slug (F2.2 / F2.3 / F3, Phase 2 H1/H2) ───────────
   # The proxy is up now, so the owner-scoped registry is reachable for the
-  # picker/bootstrap. Order: explicit arg > interactive selection/bootstrap.
-  # There is deliberately NO basename(cwd) fallback (F2.3, founder-accepted
-  # fail-closed): silently opening a wrong slug is worse than a clear abort.
+  # picker/startup routing. Order: explicit arg > interactive selection/
+  # startup. There is deliberately NO basename(cwd) fallback (F2.3,
+  # founder-accepted fail-closed): silently opening a wrong slug is worse
+  # than a clear abort.
+  #
+  # H1/2.1 — `default` is now ALWAYS a registry row (Phase 3 seed +
+  # backfill), so a bare `-z "${_SLUGS_RAW}"` emptiness test would never fire
+  # again. "This owner has no project yet" now means "no row except
+  # `default`" — _nondefault_slugs_raw strips that row before the test.
+  #
+  # H2/2.2 — a first-timer (no project except `default`) no longer gets the
+  # old client-side bootstrap prompt. Instead the session opens on `default`
+  # itself (the session ALWAYS has a slug — `default` dissolves the
+  # slug-less case) and ENGRAM_STARTUP=1 is exported so the agent presents
+  # the startup contract instead of the normal boot; the agent runs the
+  # birth conversation and creates the first real project via the SAME
+  # fos_registry(action:upsert) shape the old bash bootstrap used to send.
   local _project_slug=""
   if [ -n "${_slug}" ]; then
-    # Explicit arg — NEVER show the picker. If this owner has no projects yet,
-    # offer to create THIS slug as the first one (F3.2, confirmed). Otherwise
-    # open it as-is (an unknown slug just degrades the session spine; it is
-    # never auto-created — F2.1).
+    # Explicit arg — NEVER show the picker. If this owner is a first-timer,
+    # the typed arg is superseded by the startup route below: the agent, not
+    # this script, runs the birth conversation. Otherwise open the arg as-is
+    # (an unknown slug just degrades the session spine; it is never
+    # auto-created — F2.1).
     _project_slug="${_slug}"
-    if [ -t 0 ] && [ -t 1 ] && _list_slugs && [ -z "${_SLUGS_RAW}" ]; then
-      # code-review FIX 2: a declined/cancelled/invalid bootstrap here used to
-      # be swallowed (`|| true`) and fall through to opening "${_project_slug}"
-      # (the raw arg) anyway — the user said "don't create" and the
-      # slug-ghost opened regardless (no registry row, degraded session).
-      # Explicit decline now aborts explicitly, matching the no-arg bootstrap
-      # path's behavior (:977-979) and decision 6e14806d's no-silent-creation
-      # discipline. On CONFIRM, _BOOTSTRAP_SLUG is the slugified value (FIX 1)
-      # — it may differ from the raw arg, so it replaces _project_slug.
-      if _bootstrap_first_slug "${_project_slug}"; then
-        _project_slug="${_BOOTSTRAP_SLUG}"
-      else
-        echo "Criação cancelada — nenhum projeto aberto." >&2
-        exit 1
-      fi
+    if [ -t 0 ] && [ -t 1 ] && _list_slugs && [ -z "$(_nondefault_slugs_raw)" ]; then
+      _project_slug="default"
+      export ENGRAM_STARTUP=1
     fi
   elif [ -t 0 ] && [ -t 1 ]; then
-    # No arg + interactive terminal: select an existing project, or bootstrap
-    # the very first one.
+    # No arg + interactive terminal: select an existing project, or route a
+    # first-timer to the startup path.
     if _list_slugs; then
-      if [ -z "${_SLUGS_RAW}" ]; then
-        # count:0 — a genuine empty registry for this owner → bootstrap (F3.2).
-        if _bootstrap_first_slug ""; then
-          _project_slug="${_BOOTSTRAP_SLUG}"
-        else
-          echo "Nenhum projeto criado — encerrando." >&2
-          exit 1
-        fi
+      if [ -z "$(_nondefault_slugs_raw)" ]; then
+        # No row except (or including) `default` → first-timer → startup
+        # path (H2/2.2), never the old client-side bootstrap.
+        _project_slug="default"
+        export ENGRAM_STARTUP=1
       else
-        # count>0 — normal interactive selection (F3.1).
+        # count>0 non-default rows — normal interactive selection (F3.1).
+        # `default` itself is still a selectable row here — a legitimate
+        # home project once the owner has others too.
         local _rc=0
         _pick_project || _rc=$?
         if [ "${_rc}" -eq 130 ]; then
@@ -2059,8 +2006,8 @@ cmd_open() {
       fi
     else
       # Registry UNREACHABLE — distinct from empty (F3.1). Do NOT guess or
-      # bootstrap: creating during a network blip could duplicate an existing
-      # project.
+      # route to startup: doing so during a network blip could duplicate an
+      # existing project via the birth flow.
       echo "Erro: não foi possível consultar o registry (rede/proxy indisponível?) —" >&2
       echo "      não é seguro selecionar ou criar um projeto às cegas. Verifique 'hivemind status'." >&2
       exit 1
