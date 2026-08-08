@@ -46,7 +46,7 @@ const schema = z.object({
   // MTLS_PROXY_PORT set without the 3 cert paths = proxy disabled + log warning.
   MTLS_PROXY_PORT: z.coerce.number().int().positive().optional(),
   // Product endpoint (host:port). Single source of truth; MTLS_UPSTREAM derives from it.
-  HIVEMIND_ENDPOINT: z.string().default('hivemind.silken.ia.br:4443'),
+  HIVEMIND_ENDPOINT: z.string().default('hivemind.ia.br:4443'),
   MTLS_UPSTREAM: z.string().url().optional(),
   MTLS_CERT_PATH: z.string().optional(),
   MTLS_KEY_PATH: z.string().optional(),

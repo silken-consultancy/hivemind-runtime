@@ -68,6 +68,27 @@ hivemind update     # atualização verificada, com rollback automático
 hivemind resume <slug>   # recuperação explícita após crash de sessão
 ```
 
+### Outros clientes locais (Cursor, Antigravity, Cowork)
+
+`hivemind install [<target>]` faz o guiado de conectar OUTRO cliente MCP local
+(além do próprio Claude Code) à mesma memória — detecta candidatos, pergunta o
+escopo, e confirma o caminho exato antes de escrever qualquer coisa (nunca um
+caminho padrão silencioso).
+
+**Clientes Windows-nativos sob WSL2 (Cursor, Cowork, Antigravity) já funcionam
+hoje, sem ponte/relay manual.** O runtime escreve uma URL de loopback
+(`https://127.0.0.1:<porta>/v1/mcp`) do lado Linux/WSL; um cliente rodando
+nativo no Windows alcança essa mesma URL porque o WSL2 já encaminha, por
+padrão, portas de loopback do lado Linux para o `localhost` do Windows
+(*localhost-forwarding*, comportamento padrão do WSL2, sem necessidade de
+`.wslconfig` ou configuração extra). Confirmado em teste real (Cursor e Claude
+Cowork, a partir do Windows, contra o proxy hospedado no WSL — founder,
+2026-08-08).
+
+Um instalador nativo do Windows (sem depender do WSL) é um artefato maior e
+distinto — fica fora deste arco, planejado para a camada Studio (Layer D), não
+para este guiado.
+
 ## O contrato MCP
 
 Toda interação com a memória passa pelas ferramentas MCP — memória **nasce** via tool,

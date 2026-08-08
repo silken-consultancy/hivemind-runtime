@@ -300,27 +300,18 @@ _setup_mode() {
 
   mkdir -p "$(dirname "${RUNTIME_LOG}")"
 
-  # A stale daemon from an earlier, interrupted enrollment holds ${RUNTIME_PORT}
-  # and would make the spawn below die on EADDRINUSE — with its output going to
-  # the log file the user never opens. Reap ours first (identity-guarded, never
-  # touches a foreign process).
-  #
-  # ...but NEVER when something HEALTHY is serving: a runtime answering healthz
-  # whose mTLS proxy is also up belongs to an owner who is already enrolled on
-  # this machine (the multi-owner case _has_cert's header describes — another
-  # owner's cert present, this owner's absent, so we land in setup). Killing it
-  # to make room for a first-run flow would take down a working session. Refuse
-  # loudly instead; that is also strictly clearer than the 15s EADDRINUSE
-  # timeout this case produced before. The MTLS_PROXY_PORT guard matters: with
-  # no .env yet (genuine first run) _proxy_ok short-circuits to OK, and without
-  # it a leftover setup daemon would read as "healthy" and never be reaped.
-  if [ -n "${MTLS_PROXY_PORT:-}" ] \
-    && curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1 \
-    && _proxy_ok; then
-    echo "Error: a HiveMind runtime is already running and healthy on port ${RUNTIME_PORT}." >&2
-    echo "       Enrollment needs that port. Close the other HiveMind session (or run 'hivemind stop') and try again." >&2
-    exit 1
-  fi
+  # A stale daemon from an earlier, interrupted enrollment (or a healthy,
+  # already-running daemon from a PRIOR enrollment on this machine) holds
+  # ${RUNTIME_PORT} and would make the spawn below die on EADDRINUSE — with
+  # its output going to the log file the user never opens. Reap it first
+  # (identity-guarded via _pid_is_hivemind_runtime, never touches a foreign
+  # process) unconditionally, healthy or not: re-enroll SUBSTITUTES the
+  # running daemon rather than refusing or requiring a manual `hivemind stop`
+  # first (single-owner-per-machine — decision
+  # decision_hivemind-single-owner-per-machine-and-re-enroll-replaces,
+  # founder 2026-08-07). The daemon this reaps only ever serves THIS
+  # machine's single owner, so replacing it is always safe; there is no
+  # multi-owner coexistence case to protect against here.
   _reap_stale_runtime
 
   _vecho "[hivemind] setup: runtime=${RUNTIME_BIN} port=${RUNTIME_PORT} log=${RUNTIME_LOG}"
@@ -406,6 +397,13 @@ _setup_mode() {
   rm -f "${SETUP_PID_FILE}"
   echo ""
   echo "Done. Run 'hivemind' in your project directory to start."
+  # Wizard-was-orphan fix (reinforcement_zero-friction-setup-is-product-law):
+  # proactively surface `hivemind install` right after a successful first
+  # enrollment for any detectable-but-unmapped client target — non-blocking,
+  # the offer itself is the discovery mechanism. One-time event (this
+  # function only runs once per enrollment), so unthrottled here, unlike the
+  # cmd_open/cmd_start call sites below.
+  _detect_unmapped_install_candidates
   exit 0
 }
 
@@ -673,6 +671,11 @@ cmd_help() {
   echo "  hivemind install [<target>]  Guided setup of another local MCP client (Cursor, Antigravity, ...)"
   echo "                         Interactive only — detects candidates, asks scope, confirms the exact"
   echo "                         path with you before writing anything. No default path, ever."
+  echo "                         Under WSL2 (this runtime's supported environment), a Windows-native"
+  echo "                         client (Cursor, Cowork, Antigravity) reaches the written"
+  echo "                         https://127.0.0.1:<port>/v1/mcp URL AS-IS — WSL2's own default"
+  echo "                         localhost-forwarding already bridges it to the Linux-side listener,"
+  echo "                         no extra relay/bridge setup needed (confirmed working, founder-tested)."
   echo "  hivemind --version    Print version"
   echo ""
   echo "  --verbose             Show startup/debug logs (default: quiet, GO/NO-GO + errors only)"
@@ -728,6 +731,7 @@ cmd_start() {
   if ! _has_cert; then _setup_mode; fi
   _start_proxy
   echo "[hivemind] proxy running on port ${PROXY_PORT}"
+  _maybe_surface_install_candidates
 }
 
 cmd_stop() {
@@ -904,26 +908,72 @@ _stage_build() {
   return 0
 }
 
-# _update_installed_binary / _rollback_installed_binary: the system-PATH copy
-# of bin/hivemind is outside $HIVEMIND_HOME, so it needs its own (small,
-# already-atomic) swap — cp-to-temp + rename, mirroring the staging pattern at
-# a smaller scale. Best-effort: if the installed path isn't writable, skip
-# (not fatal — the $HIVEMIND_HOME swap is the load-bearing part).
+# _all_installed_bins: every executable `hivemind` found across $PATH, not
+# just the first `command -v` match. A shadowed older copy earlier on PATH
+# than the "real"/newer one can otherwise stay invoked forever while
+# `hivemind update` reports success against a DIFFERENT, later-on-PATH copy
+# it silently never touches (measured on this dev machine, 2026-08-07:
+# ~/.local/bin/hivemind observed ~2 days stale while a newer copy existed
+# elsewhere on PATH). De-duplicated (`sort -u`) since the same directory can
+# legitimately appear more than once in $PATH.
+_all_installed_bins() {
+  local _d
+  IFS=: read -ra _dirs <<< "${PATH}"
+  for _d in "${_dirs[@]}"; do
+    [ -n "${_d}" ] && [ -x "${_d}/hivemind" ] && printf '%s\n' "${_d}/hivemind"
+  done | sort -u
+}
+
+# _update_installed_binary / _rollback_installed_binary: the system-PATH
+# copy(ies) of bin/hivemind are outside $HIVEMIND_HOME, so each needs its own
+# (small, already-atomic) swap — cp-to-temp + rename, mirroring the staging
+# pattern at a smaller scale. Best-effort per-binary: an unwritable path is
+# skipped, not fatal (not fatal overall — the $HIVEMIND_HOME swap is the
+# load-bearing part). Every distinct match on PATH is updated, not just the
+# first; if more than one distinct binary is found, warn once naming all of
+# them so the user can clean up the shadow instead of having it silently
+# patched forever.
 _update_installed_binary() {
-  local _installed_bin
-  _installed_bin="$(command -v hivemind 2>/dev/null || true)"
-  [ -n "${_installed_bin}" ] && [ -w "${_installed_bin}" ] || return 0
-  cp "${_installed_bin}" "${_installed_bin}.last-good" 2>/dev/null || true
-  cp "${HIVEMIND_SOURCE_DIR}/bin/hivemind" "${_installed_bin}.new" || return 1
-  chmod +x "${_installed_bin}.new"
-  mv "${_installed_bin}.new" "${_installed_bin}"
+  local _bins _installed_bin _count=0 _updated=0
+  _bins="$(_all_installed_bins)"
+  [ -n "${_bins}" ] || return 0
+
+  _count="$(printf '%s\n' "${_bins}" | wc -l)"
+  if [ "${_count}" -gt 1 ]; then
+    echo "Aviso: ${_count} binários 'hivemind' encontrados no PATH — atualizando todos:" >&2
+    printf '%s\n' "${_bins}" | while IFS= read -r _b; do echo "  - ${_b}" >&2; done
+  fi
+
+  while IFS= read -r _installed_bin; do
+    [ -n "${_installed_bin}" ] || continue
+    # Writability of the file itself isn't enough — the load-bearing ops
+    # below (cp …last-good, mv …new→bin) need to create/replace directory
+    # entries, which requires write access to the containing directory.
+    [ -w "${_installed_bin}" ] || continue
+    [ -w "$(dirname "${_installed_bin}")" ] || continue
+    cp "${_installed_bin}" "${_installed_bin}.last-good" 2>/dev/null || true
+    if cp "${HIVEMIND_SOURCE_DIR}/bin/hivemind" "${_installed_bin}.new"; then
+      chmod +x "${_installed_bin}.new"
+      mv "${_installed_bin}.new" "${_installed_bin}"
+      _updated=$((_updated + 1))
+    else
+      # Failed cp may still have left a partial/orphan .new behind — clean up.
+      rm -f "${_installed_bin}.new"
+    fi
+  done <<< "${_bins}"
+  [ "${_updated}" -gt 0 ] || return 1
+  return 0
 }
 _rollback_installed_binary() {
-  local _installed_bin
-  _installed_bin="$(command -v hivemind 2>/dev/null || true)"
-  if [ -n "${_installed_bin}" ] && [ -f "${_installed_bin}.last-good" ]; then
-    mv "${_installed_bin}.last-good" "${_installed_bin}"
-  fi
+  local _bins _installed_bin
+  _bins="$(_all_installed_bins)"
+  [ -n "${_bins}" ] || return 0
+  while IFS= read -r _installed_bin; do
+    [ -n "${_installed_bin}" ] || continue
+    if [ -f "${_installed_bin}.last-good" ]; then
+      mv "${_installed_bin}.last-good" "${_installed_bin}"
+    fi
+  done <<< "${_bins}"
 }
 
 cmd_update() {
@@ -1952,6 +2002,7 @@ cmd_open() {
 
   _maybe_auto_update
   _start_proxy
+  _maybe_surface_install_candidates
 
   # ── Resolve the project slug (F2.2 / F2.3 / F3) ──────────────────────────
   # The proxy is up now, so the owner-scoped registry is reachable for the
@@ -2260,6 +2311,62 @@ _cowork_skills_dir() {
   return 1  # Cowork not installed, or no local-agent session has created the plugin dir yet
 }
 
+# _detect_unmapped_install_candidates: the wizard-was-orphan fix
+# (reinforcement_zero-friction-setup-is-product-law's own named example:
+# "o wizard multi-client (hivemind install) existindo mas ÓRFÃO — nunca
+# oferecido."). Reuses the SAME detection `hivemind install` already has
+# (Antigravity via ANTIGRAVITY_WINDOWS_USERS_ROOT/*/.gemini/config, Cowork
+# via _cowork_skills_dir) to print a one-line, NON-BLOCKING advisory for any
+# target that is DETECTED on this machine but not yet wired — the offer
+# itself IS the discovery mechanism, no forced prompt, no hidden subcommand
+# to stumble onto. "Already wired" per target:
+#   - antigravity: its resolved mcp_config.json path already has a
+#     port-map.json entry (_port_map_lookup non-empty).
+#   - cowork: the boot skill file is already present at the detected
+#     skills-plugin dir (no port-map entry exists for this target — it gets
+#     client-side skill FILES, not URL wiring — see _install_cowork_skills).
+# Never touches disk, never prompts — read-only detection + echo only.
+_detect_unmapped_install_candidates() {
+  local _wp _unmapped_antigravity=0
+  for _wp in "${ANTIGRAVITY_WINDOWS_USERS_ROOT}"/*/.gemini/config; do
+    [ -d "${_wp}" ] || continue
+    if [ -z "$(_port_map_lookup "${_wp}/mcp_config.json")" ]; then
+      _unmapped_antigravity=1
+      break
+    fi
+  done
+  if [ "${_unmapped_antigravity}" -eq 1 ]; then
+    echo "  Detectado: Antigravity (Windows, via WSL) — conecte com: hivemind install antigravity" >&2
+  fi
+
+  local _cw_dir
+  if _cw_dir="$(_cowork_skills_dir)" && [ ! -f "${_cw_dir}/hivemind-boot/SKILL.md" ]; then
+    echo "  Detectado: Cowork (Claude desktop, via device bridge) — conecte com: hivemind install cowork" >&2
+  fi
+}
+
+# _maybe_surface_install_candidates: throttled wrapper around
+# _detect_unmapped_install_candidates for the ONGOING (post-enrollment)
+# surfaces — cmd_open/cmd_start — so a new candidate (e.g. Antigravity
+# installed after this machine already enrolled) still gets offered without
+# nagging on every single invocation. Gate: a lightweight date marker under
+# ~/.engram/cache/ — at most one nudge-check's worth of output per calendar
+# day. _setup_mode's own first-enrollment success path calls
+# _detect_unmapped_install_candidates directly (unthrottled — that is a
+# one-time event, not a repeated invocation to guard against).
+_maybe_surface_install_candidates() {
+  local _marker="${HOME}/.engram/cache/install-nudge-last-seen"
+  local _today
+  _today="$(date +%Y-%m-%d 2>/dev/null || echo '')"
+  [ -n "${_today}" ] || return 0
+  if [ -f "${_marker}" ] && [ "$(cat "${_marker}" 2>/dev/null || echo '')" = "${_today}" ]; then
+    return 0
+  fi
+  _detect_unmapped_install_candidates
+  mkdir -p "$(dirname "${_marker}")" 2>/dev/null || true
+  printf '%s' "${_today}" > "${_marker}" 2>/dev/null || true
+}
+
 # _install_cowork_skills: the Cowork exception to bee7f370. Writes the thin-stub
 # skill files (boot + end-session) from the repo into Cowork's skills dir — the
 # skills only CALL fos_procedure (the served body stays the single source of
@@ -2518,6 +2625,7 @@ _install_run() {
       # assumed" bar even where there is structurally only one scope.
       echo "" >&2
       echo "  $(_dim "Antigravity só suporta configuração global (não há escopo por projeto).")" >&2
+      echo "  $(_dim "Antigravity roda nativo no Windows; a URL abaixo (127.0.0.1) atravessa a fronteira WSL↔Windows via o localhost-forwarding PADRÃO do WSL2 — nenhuma ponte/relay adicional é necessária (confirmado em teste real do founder).")" >&2
       local _wp
       for _wp in "${ANTIGRAVITY_WINDOWS_USERS_ROOT}"/*/.gemini/config; do
         [ -d "${_wp}" ] || continue
@@ -2610,6 +2718,9 @@ _install_run() {
   echo "  Arquivo: ${_final_path}" >&2
   echo "  Porta dedicada: ${_preview_port}" >&2
   echo "  Entrada: mcpServers.engram = {type:\"http\", url:\"https://127.0.0.1:${_preview_port}/v1/mcp\"}" >&2
+  if [ "${_chosen_id}" = "antigravity" ] || [ "${_chosen_id}" = "cursor" ]; then
+    echo "  $(_dim "Se este cliente roda nativo no Windows (fora do WSL): a URL 127.0.0.1 acima funciona sem ajuste — o WSL2 já encaminha, por padrão, uma porta de loopback do lado Linux para o localhost do Windows (localhost-forwarding). Nenhuma ponte/relay manual é necessária; confirmado em teste real (Cursor + Cowork, founder, 2026-08-08).")" >&2
+  fi
   printf '  Confirma a escrita neste caminho? [y/N] ' >&2
   local _confirm
   if ! IFS= read -r _confirm; then

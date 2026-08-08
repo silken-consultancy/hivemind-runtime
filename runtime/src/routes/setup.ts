@@ -28,7 +28,7 @@ import { join } from 'node:path';
 
 // Product endpoint — parametrized (P0 fix). Set via HIVEMIND_ENDPOINT env
 // (written by install.sh --endpoint; preserved across enrollment).
-const ENDPOINT = process.env.HIVEMIND_ENDPOINT ?? 'hivemind.silken.ia.br:4443';
+const ENDPOINT = process.env.HIVEMIND_ENDPOINT ?? 'hivemind.ia.br:4443';
 
 // Enrollment (/ca/issue) goes over the public 443/Let's-Encrypt surface (Caddy →
 // auth-service), NOT the :4443 MCP mTLS port. Two reasons :4443 fails for enrollment:

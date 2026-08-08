@@ -93,13 +93,19 @@ echo "Instalando o HiveMind..."
 mkdir -p "${HIVEMIND_HOME}/.claude"
 mkdir -p "${HIVEMIND_HOME}/runtime"
 
+# _sed_escape_repl: escape sed REPLACEMENT-text specials (& = whole match,
+# \ = escape/backreference start) so an arbitrary value (a --endpoint flag,
+# a git-derived remote URL) can never corrupt the sed substitution below.
+_sed_escape_repl() { printf '%s' "$1" | sed -e 's/[\&]/\\&/g'; }
+
 # _set_env_kv: idempotent set-or-update of a KEY=value line in $HIVEMIND_HOME/.env.
 _set_env_kv() {
-  local _key="$1" _val="$2"
+  local _key="$1" _val
+  _val="$(_sed_escape_repl "$2")"
   if grep -q "^${_key}=" "${HIVEMIND_HOME}/.env"; then
     sed -i "s|^${_key}=.*|${_key}=${_val}|" "${HIVEMIND_HOME}/.env"
   else
-    printf '%s=%s\n' "${_key}" "${_val}" >> "${HIVEMIND_HOME}/.env"
+    printf '%s=%s\n' "${_key}" "$2" >> "${HIVEMIND_HOME}/.env"
   fi
 }
 
@@ -191,16 +197,27 @@ mkdir -p "${HIVEMIND_HOME}/.claude/hooks"
 # Stop event). settings.json is the single source of which hooks are registered.
 cp -r "${SCRIPT_DIR}/.claude/hooks/." "${HIVEMIND_HOME}/.claude/hooks/"
 
-# Copy the user's personal Claude Code credentials into the isolated CONFIG_DIR
-# (item 5.0, F0 auth) — best-effort. Absence is NOT an error: bin/hivemind's
-# cmd_open() has a fail-safe that triggers a login flow inside the same
-# isolated CONFIG_DIR on first launch if this file is missing (only ABSENCE is
-# handled here, not an EXPIRED credential — known limitation).
-if [ -f "${HOME}/.claude/.credentials.json" ]; then
-  cp "${HOME}/.claude/.credentials.json" "${HIVEMIND_HOME}/.claude/.credentials.json"
-  chmod 600 "${HIVEMIND_HOME}/.claude/.credentials.json"
-else
-  echo "Nota: nenhuma credencial do Claude Code encontrada em ~/.claude/.credentials.json — você fará login (isolado, dentro do runtime do HiveMind) na primeira execução."
+# Seed the isolated CONFIG_DIR's Claude Code credentials from the user's
+# personal ones ONLY when the isolated destination doesn't have one yet
+# (item 5.0, F0 auth) — best-effort, seed-on-absence by design. A live,
+# already-logged-in isolated credential must never be clobbered by a
+# possibly-stale personal copy on every (re)install/re-enroll — that was
+# measured to force a spurious logout on every reinstall. If neither exists,
+# bin/hivemind's cmd_open() has a fail-safe that triggers a login flow inside
+# the same isolated CONFIG_DIR on first launch (known limitation: an EXPIRED
+# credential is not detected here, only absence).
+if [ ! -f "${HIVEMIND_HOME}/.claude/.credentials.json" ]; then
+  if [ -f "${HOME}/.claude/.credentials.json" ]; then
+    cp "${HOME}/.claude/.credentials.json" "${HIVEMIND_HOME}/.claude/.credentials.json"
+    chmod 600 "${HIVEMIND_HOME}/.claude/.credentials.json"
+  else
+    # Genuinely no source AND no isolated credential yet — only case where
+    # the login-on-first-run note applies. When the isolated destination
+    # already has a (possibly live) credential, this whole block is skipped
+    # and nothing is printed — see the note above about not scaring a
+    # re-install with a false logout warning.
+    echo "Nota: nenhuma credencial do Claude Code encontrada em ~/.claude/.credentials.json — você fará login (isolado, dentro do runtime do HiveMind) na primeira execução."
+  fi
 fi
 
 # Copy runtime (preserve permissions; exclude node_modules if present).

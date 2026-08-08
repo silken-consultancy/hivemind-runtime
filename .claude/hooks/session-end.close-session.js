@@ -69,7 +69,7 @@
 
 'use strict';
 
-const http = require('node:http');
+const https = require('node:https');
 
 const SKIP_REASONS = new Set(['clear', 'logout']);
 
@@ -95,7 +95,10 @@ function main() {
       process.exit(0); // no spine opened this window — nothing to close.
     }
 
-    const port = process.env.MTLS_PROXY_PORT || '7779';
+    const port = process.env.MTLS_PROXY_PORT;
+    if (!port) {
+      process.exit(0); // proxy not configured this window — never guess a port number.
+    }
     const apiKey = process.env.FOS_API_KEY || '';
     if (!apiKey) {
       process.exit(0); // enrollment incomplete — same degrade posture as bin/hivemind.
@@ -139,12 +142,35 @@ function closeSession(port, apiKey, sessionId, reason, nextNote, done) {
     params: { name: 'fos_session', arguments: args },
   });
 
-  const req = http.request(
+  // mtls-proxy ALWAYS terminates TLS (bindProxyListener sets `tls:{cert,key}`
+  // unconditionally — runtime/src/lib/mtls-proxy.ts:307-310), so this MUST be
+  // https, verified against the same local trust anchor bin/hivemind computes
+  // (_trust_local_ca / LOCAL_HTTPS_CA — bin/hivemind:54). Never
+  // rejectUnauthorized:false — that would reopen a MITM-able hop for
+  // x-fos-key on loopback.
+  let ca;
+  try {
+    ca = require('node:fs').readFileSync(
+      require('node:path').join(
+        require('node:os').homedir(),
+        '.engram',
+        'mtls',
+        'local-https',
+        'ca.cert.pem',
+      ),
+    );
+  } catch {
+    done(null); // fail-open — no CA available, cannot verify, do not proceed insecurely.
+    return;
+  }
+
+  const req = https.request(
     {
       host: '127.0.0.1',
-      port: Number(port) || 7779,
+      port: Number(port),
       path: '/v1/mcp',
       method: 'POST',
+      ca,
       headers: {
         'x-fos-key': apiKey,
         'Content-Type': 'application/json',

@@ -146,6 +146,20 @@ jobs:
           rm -f "${key_file}"
           echo "==> Publicado (produto)."
 
+      - name: Verifica publish (produto) — leitura real de volta, não só exit 0 do ssh
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          trimmed_sha="$(printf '%s' "${SHA}" | tr -d '[:space:]')"
+          echo "==> Lendo https://hivemind.ia.br/hivemind/LATEST_SHA para confirmar o publish..."
+          observed_sha="$(curl -sf --max-time 10 https://hivemind.ia.br/hivemind/LATEST_SHA 2>/dev/null | tr -d '[:space:]' || true)"
+          if [ "${observed_sha}" != "${trimmed_sha}" ]; then
+            echo "::error::Verify FALHOU (produto): manifesto lido em https://hivemind.ia.br/hivemind/LATEST_SHA ('${observed_sha}') não bate com o sha publicado ('${trimmed_sha}'). O ssh retornou sucesso mas o manifesto público não reflete o valor esperado — investigar o receptor no host de produto."
+            exit 1
+          fi
+          echo "==> Verificado: manifesto de produto serve ${trimmed_sha:0:12}."
+
       - name: Nota de falha — produto
         if: failure()
         run: |
@@ -219,6 +233,20 @@ jobs:
 
           rm -f "${key_file}"
           echo "==> Publicado (lab)."
+
+      - name: Verifica publish (lab) — leitura real de volta, não só exit 0 do ssh
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          trimmed_sha="$(printf '%s' "${SHA}" | tr -d '[:space:]')"
+          echo "==> Lendo https://kernel.silken.ia.br/hivemind/LATEST_SHA para confirmar o publish..."
+          observed_sha="$(curl -sf --max-time 10 https://kernel.silken.ia.br/hivemind/LATEST_SHA 2>/dev/null | tr -d '[:space:]' || true)"
+          if [ "${observed_sha}" != "${trimmed_sha}" ]; then
+            echo "::error::Verify FALHOU (lab): manifesto lido em https://kernel.silken.ia.br/hivemind/LATEST_SHA ('${observed_sha}') não bate com o sha publicado ('${trimmed_sha}'). O ssh retornou sucesso mas o manifesto público não reflete o valor esperado — investigar o receptor no edge do lab."
+            exit 1
+          fi
+          echo "==> Verificado: manifesto do lab serve ${trimmed_sha:0:12}."
 
       - name: Nota de falha — lab
         if: failure()
