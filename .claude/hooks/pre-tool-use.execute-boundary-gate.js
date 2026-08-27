@@ -316,7 +316,97 @@ function selftest() {
     try { fs.unlinkSync(dispatchFile); } catch { /* best-effort cleanup */ }
   }
 
+  // ─── subagent-override-denial (PORTED, item B1.10 — single-harness port of
+  // §4 from the retired kernel/hooks/.test-fixtures/execute-boundary-parity.js;
+  // the lab-comparison premise is dead, but the isolation-boundary assertion
+  // itself is not comparative and was otherwise going untested anywhere in
+  // this repo). Proves the deny fires HERE, at the gate, via
+  // isSubagentContext + isOverrideCliInvocation (the reliable input.agent_id
+  // signal) — NOT via lib/execute-boundary-override.mjs's own
+  // CLAUDE_AGENT_NAME refusal, which is empty/unreliable for a dispatched
+  // subagent (see lib/execute-boundary-classifier.js's isSubagentContext
+  // header). CLAUDE_AGENT_NAME is deliberately deleted from every env below
+  // so a pass here cannot be silently riding on that unreliable signal.
+  const subagentSessionId = `selftest-subagent-${process.pid}-${Date.now()}`;
+  const subagentDispatchFile = stateFile('dispatch', subagentSessionId);
+
+  const runSubagentCase = (label, toolName, toolInput, expectDeny) => {
+    const env = { ...process.env, ENGRAM_EXECUTE_BOUNDARY_GATE: 'enforce' };
+    delete env.CLAUDE_AGENT_NAME; // the deny must not depend on this
+
+    const payload = JSON.stringify({
+      tool_name: toolName,
+      tool_input: toolInput,
+      session_id: subagentSessionId,
+      agent_id: 'sub-selftest',
+      agent_type: 'general-purpose',
+    });
+
+    const result = execFileSync(process.execPath, [__filename], {
+      input: payload,
+      env,
+      encoding: 'utf8',
+    });
+
+    let denied = false;
+    try {
+      const parsed = JSON.parse(result);
+      denied = !!(
+        parsed &&
+        parsed.hookSpecificOutput &&
+        parsed.hookSpecificOutput.permissionDecision === 'deny'
+      );
+    } catch {
+      /* not JSON → not a deny */
+    }
+
+    if (denied !== expectDeny) {
+      fail++;
+      console.error(`  FAIL (subagent: ${label} should ${expectDeny ? 'DENY' : 'allow'}): got stdout: ${result}`);
+    } else {
+      console.log(`  ok: subagent: ${label} → ${expectDeny ? 'DENY' : 'allow'}`);
+    }
+  };
+
+  try {
+    // count is at CEILING so (b) also proves subagent exemption holds even
+    // when the ceiling itself would otherwise deny a main-loop call.
+    fs.writeFileSync(subagentDispatchFile, JSON.stringify({ count: CEILING }));
+
+    // (a) subagent RUNNING the override CLI → DENY, structurally, even
+    // though subagents are otherwise exempt from the ceiling.
+    runSubagentCase(
+      'running the override CLI',
+      'Bash',
+      { command: "node .claude/hooks/lib/execute-boundary-override.mjs --ok 'x'" },
+      true
+    );
+
+    // (b) subagent doing ordinary mutating work (not the override CLI) stays
+    // EXEMPT (allow) even AT ceiling — regression guard so (a) isn't
+    // accidentally over-broad.
+    runSubagentCase(
+      'ordinary edit at ceiling',
+      'Edit',
+      { file_path: '/tmp/execute-boundary-gate.selftest' },
+      false
+    );
+
+    // (c) subagent Bash call that only MENTIONS the override CLI (grep) —
+    // the READONLY_LEAD exemption (product-only; see
+    // lib/execute-boundary-classifier.js), confirmed end-to-end through the
+    // real gate subprocess, not just the unit-level classifier call.
+    runSubagentCase(
+      'merely mentioning the override CLI (grep)',
+      'Bash',
+      { command: 'grep execute-boundary-override.mjs settings.json' },
+      false
+    );
+  } finally {
+    try { fs.unlinkSync(subagentDispatchFile); } catch { /* best-effort cleanup */ }
+  }
+
   if (fail) { console.error(`selftest: ${fail} FAILED`); process.exit(1); }
-  console.log('selftest: OK (unset/enforce/typo all enforce; only "off" is inert)');
+  console.log('selftest: OK (unset/enforce/typo all enforce, only "off" is inert; subagent override-CLI denial, exemption, and read-only-mention allow all confirmed end-to-end)');
   process.exit(0);
 }

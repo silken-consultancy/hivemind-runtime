@@ -242,6 +242,18 @@ function selftest() {
     'echo "x" > file.txt',
     'cat file | tee out.txt',
     `node -e "require('fs').writeFileSync('a','b')"`,
+    // ── PORTED (item B1.10 — single-harness port of the retired
+    // kernel/hooks/.test-fixtures/execute-boundary-parity.js §5, whose
+    // comparative corpus never exercised -c/truncate/dd/install or >>): the
+    // rest of the counted-set's write shapes, so this selftest — the only
+    // place isMutatingBash is exercised now that the second harness is
+    // gone — actually covers the FULL rule set, not just the 4 shapes that
+    // motivated the widening.
+    'python3 -c "print(1)"',
+    'echo "x" >> file.txt',
+    'truncate -s 0 file.txt',
+    'dd if=/dev/zero of=file.txt bs=1M count=1',
+    'install -m 644 file.txt /usr/local/bin/thing',
   ];
   const BASH_SHOULD_NOT = [
     'ls -la', 'cat file.txt', 'git status', 'git diff', 'git log',
@@ -255,6 +267,11 @@ function selftest() {
     'ls -la > /dev/null',
     'git status --short',
     'cat file.txt',
+    // ── PORTED (item B1.10, §5): stderr-merge (2>&1) must NOT be mistaken
+    // for a file-write redirect — the digit-lookbehind exclusion in the `>`
+    // rule was previously untested by this selftest (only the /dev/null
+    // exclusion above was covered).
+    'echo hi 2>&1',
   ];
 
   let fail = 0;
@@ -305,6 +322,14 @@ function selftest() {
   // isOverrideCliInvocation(toolName, toolInput) — must catch a real Bash run,
   // not a mention, and must not fire for a non-Bash tool (arity reconciled
   // 2026-08-27, item A2.3 — see the function's header comment).
+  //
+  // This table already carries the substance of §3 (isOverrideCliInvocation
+  // behavior parity) from the retired kernel/hooks/.test-fixtures/
+  // execute-boundary-parity.js — the real-invocation vs. mere-mention
+  // (READONLY_LEAD) distinction below, product-only, is that guard's
+  // DOCUMENTED_DIVERGENCES case with the lab side dropped (item B1.10: no
+  // lab twin left to diverge from — this repo's own behavior is now the
+  // whole contract). No new cases were needed here.
   const OVERRIDE_CLI_CASES = [
     ['Bash', 'node .claude/hooks/lib/execute-boundary-override.mjs --ok "x"', true],
     ['Bash', 'node __HIVEMIND_HOME__/.claude/hooks/lib/execute-boundary-override.mjs --ok "x"', true],
