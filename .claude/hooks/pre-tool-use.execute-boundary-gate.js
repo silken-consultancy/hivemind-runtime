@@ -42,15 +42,21 @@
 // appends a 'consumed' line to the SAME audit JSONL the grant used (imported
 // from lib/execute-boundary-override.mjs, not duplicated here).
 //
-// ⚠ ACTIVATION STATUS (2026-08-27, item A2.1): this hook is REGISTERED in
-//   .claude/settings.json but gated OFF by default via
-//   ENGRAM_EXECUTE_BOUNDARY_GATE (unset/anything-but-"enforce" → INERT).
-//   Enable-parity twin of the lab's FOS_EXECUTE_BOUNDARY_GATE gate
-//   (kernel/hooks/pre-tool-use.execute-boundary-gate.js) — same default-off
-//   posture, same early-exit-before-stdin ordering, product-convention var
-//   name (ENGRAM_* not FOS_*; do NOT rename the lab's var to match). Ships
-//   dark deliberately: flipping ENGRAM_EXECUTE_BOUNDARY_GATE to "enforce" is
-//   the founder's deploy act (OPEN-A), never a default this hook assumes.
+// ⚠ ACTIVATION STATUS (2026-08-27, item A2.1, revised same day for
+//   fail-safe default): this hook ENFORCES BY DEFAULT. Only the literal
+//   value "off" for ENGRAM_EXECUTE_BOUNDARY_GATE disables it — unset, the
+//   string "enforce", or any typo/unexpected value all fall through to
+//   enforcing. This is deliberate: a misspelled or absent override must
+//   never silently disable the gate. The key is intentionally NOT shipped
+//   in .claude/settings.json's "env" block — merge-settings-json.mjs treats
+//   template-defined env scalars as template-owned (the template value
+//   always wins on install/update), so if this key lived in the template,
+//   no tenant edit or shell export could durably override it. Leaving it
+//   absent from the template means a tenant can set
+//   ENGRAM_EXECUTE_BOUNDARY_GATE=off (in their own settings.json "env" block
+//   or via shell export) and have that override survive updates. Setting it
+//   to "off" is a deliberate kill-switch act, not a default this hook ships
+//   with.
 //
 // MANDATORY DISCIPLINES:
 //   - Parse error / no session id / unexpected error → fail-open, ALLOW. This
@@ -72,10 +78,10 @@ const {
   CEILING,
 } = require('./lib/execute-boundary-classifier');
 
-// Gate is INERT unless explicitly flipped to "enforce" — see ACTIVATION
-// STATUS above. Enable-parity with the lab's FOS_EXECUTE_BOUNDARY_GATE,
-// product-convention name.
-const MODE = (process.env.ENGRAM_EXECUTE_BOUNDARY_GATE || 'off').toLowerCase();
+// Gate ENFORCES by default. Only the literal "off" disables it — see
+// ACTIVATION STATUS above. Enable-parity with the lab's
+// FOS_EXECUTE_BOUNDARY_GATE, product-convention name.
+const MODE = (process.env.ENGRAM_EXECUTE_BOUNDARY_GATE || 'enforce').toLowerCase();
 
 if (require.main === module) {
   if (process.argv.includes('--selftest')) {
@@ -87,8 +93,10 @@ if (require.main === module) {
 
 async function main() {
   // Runs BEFORE stdin is even touched — a MODE=off gate never parses input,
-  // cheapest + safest (mirrors lab's ordering exactly).
-  if (MODE !== 'enforce') process.exit(0);
+  // cheapest + safest (mirrors lab's ordering exactly). Fail-safe guard:
+  // only the literal "off" disables. Unset, "enforce", or any typo all fall
+  // THROUGH to enforcing — this is the whole point (item A2.1 revision).
+  if (MODE === 'off') process.exit(0);
 
   let input;
   try {
@@ -135,11 +143,18 @@ async function main() {
       process.exit(0); // allow — override consumed for this call
     }
 
+    // Embed the RESOLVED sessionId (input.session_id-preferring — see
+    // header/blocker d85e3fb7) in the deny reason itself. The override CLI is
+    // a standalone process with no stdin/harness input, so --session here is
+    // the ONLY way it can learn this gate's actual state-file key — it must
+    // NOT fall back to guessing via ENGRAM_SESSION_ID alone, which can differ
+    // from input.session_id (measured live: harness session_id
+    // d6525965-... vs ENGRAM_SESSION_ID 06658549-... in the same turn).
     deny(
       `${count} hands-on/mutating commands in this turn — this is a FLOW, ` +
       'dispatch it to a subagent instead of continuing inline. If a founder OK ' +
       'for one more inline call was actually given, run: ' +
-      "node .claude/hooks/lib/execute-boundary-override.mjs --ok '<quote>' first."
+      `node .claude/hooks/lib/execute-boundary-override.mjs --ok '<quote>' --session ${sessionId} first.`
     );
   } catch (err) {
     process.stderr.write(`[execute-boundary-gate] WARN: ${err.message}\n`);
@@ -210,21 +225,30 @@ function deny(reason) {
 
 // ─── self-test (node pre-tool-use.execute-boundary-gate.js --selftest) ─────
 //
-// Asserts BOTH MODE branches (item A2.1 ACCEPTANCE) by re-spawning this same
-// file as a child process with crafted stdin + env, since MODE is read once
-// at module load. Craft: a CEILING-count dispatch state file + a mutating
-// Edit call, no override — this WOULD deny if MODE were 'enforce'.
-//   - MODE unset (default off): must exit silently, NO stdout at all — proves
-//     the early-exit runs before stdin is even read.
-//   - MODE=enforce: SAME input must DENY (unchanged prior/lab behavior).
+// Asserts ALL FOUR MODE cases (item A2.1 fail-safe revision) by re-spawning
+// this same file as a child process with crafted stdin + env, since MODE is
+// read once at module load. Craft: a CEILING-count dispatch state file + a
+// mutating Edit call, no override — this DENIES whenever MODE resolves to
+// enforcing.
+//   - unset            → ENFORCING (must DENY)
+//   - "off"             → inert (must be silent-allow, NO stdout)
+//   - "enforce"         → ENFORCING (must DENY)
+//   - "enforcce" (typo) → ENFORCING (must DENY) — this is the fail-safe
+//     case and the whole point of the revision: a typo must never silently
+//     disable the gate.
 function selftest() {
   const { execFileSync } = require('node:child_process');
   const sessionId = `selftest-${process.pid}-${Date.now()}`;
   const dispatchFile = stateFile('dispatch', sessionId);
   let fail = 0;
 
-  try {
-    fs.writeFileSync(dispatchFile, JSON.stringify({ count: CEILING }));
+  const runCase = (label, envValue, expectDeny) => {
+    const env = { ...process.env };
+    if (envValue === undefined) {
+      delete env.ENGRAM_EXECUTE_BOUNDARY_GATE;
+    } else {
+      env.ENGRAM_EXECUTE_BOUNDARY_GATE = envValue;
+    }
 
     const payload = JSON.stringify({
       tool_name: 'Edit',
@@ -232,44 +256,67 @@ function selftest() {
       session_id: sessionId,
     });
 
-    const offEnv = { ...process.env };
-    delete offEnv.ENGRAM_EXECUTE_BOUNDARY_GATE;
-    const offResult = execFileSync(process.execPath, [__filename], {
+    const result = execFileSync(process.execPath, [__filename], {
       input: payload,
-      env: offEnv,
+      env,
       encoding: 'utf8',
     });
-    if (offResult.trim() !== '') {
-      fail++;
-      console.error(`  FAIL (MODE=off/unset should be silent-allow): got stdout: ${offResult}`);
-    }
 
-    const enforceEnv = { ...process.env, ENGRAM_EXECUTE_BOUNDARY_GATE: 'enforce' };
-    const enforceResult = execFileSync(process.execPath, [__filename], {
-      input: payload,
-      env: enforceEnv,
-      encoding: 'utf8',
-    });
-    let parsed;
-    try {
-      parsed = JSON.parse(enforceResult);
-    } catch {
-      parsed = null;
+    if (expectDeny) {
+      let parsed;
+      try {
+        parsed = JSON.parse(result);
+      } catch {
+        parsed = null;
+      }
+      const denied = !!(
+        parsed &&
+        parsed.hookSpecificOutput &&
+        parsed.hookSpecificOutput.permissionDecision === 'deny'
+      );
+      if (!denied) {
+        fail++;
+        console.error(`  FAIL (${label} should DENY at CEILING): got stdout: ${result}`);
+      } else {
+        // Reconciliation check (blocker d85e3fb7): the override CLI runs as a
+        // standalone process with no stdin/harness input, so it can ONLY ever
+        // learn the gate's resolved sessionId if the gate hands it over. The
+        // deny reason IS that hand-over — it must embed `--session
+        // <sessionId>` so a copy-pasted override invocation targets the SAME
+        // state-file key this gate just read from, not whatever
+        // ENGRAM_SESSION_ID happens to be in the messenger's env (which may
+        // differ from input.session_id — the exact bug measured live this
+        // session).
+        const reason = (parsed && parsed.hookSpecificOutput && parsed.hookSpecificOutput.permissionDecisionReason) || '';
+        if (!reason.includes(`--session ${sessionId}`)) {
+          fail++;
+          console.error(`  FAIL (${label} deny reason must embed "--session ${sessionId}" for override-CLI reconciliation): ${reason}`);
+        } else {
+          console.log(`  ok: ${label} → DENY (enforcing), reason embeds --session ${sessionId}`);
+        }
+      }
+    } else {
+      if (result.trim() !== '') {
+        fail++;
+        console.error(`  FAIL (${label} should be silent-allow): got stdout: ${result}`);
+      } else {
+        console.log(`  ok: ${label} → silent-allow (inert)`);
+      }
     }
-    const denied = !!(
-      parsed &&
-      parsed.hookSpecificOutput &&
-      parsed.hookSpecificOutput.permissionDecision === 'deny'
-    );
-    if (!denied) {
-      fail++;
-      console.error(`  FAIL (MODE=enforce should DENY at CEILING): got stdout: ${enforceResult}`);
-    }
+  };
+
+  try {
+    fs.writeFileSync(dispatchFile, JSON.stringify({ count: CEILING }));
+
+    runCase('unset', undefined, true);
+    runCase('"off"', 'off', false);
+    runCase('"enforce"', 'enforce', true);
+    runCase('"enforcce" (typo)', 'enforcce', true);
   } finally {
     try { fs.unlinkSync(dispatchFile); } catch { /* best-effort cleanup */ }
   }
 
   if (fail) { console.error(`selftest: ${fail} FAILED`); process.exit(1); }
-  console.log('selftest: OK (MODE=off/unset silent-allow, MODE=enforce denies at CEILING)');
+  console.log('selftest: OK (unset/enforce/typo all enforce; only "off" is inert)');
   process.exit(0);
 }

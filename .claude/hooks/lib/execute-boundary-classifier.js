@@ -10,8 +10,19 @@
 //   hard gate's brief ("Edit/Write/Bash that mutates code or infra") requires
 //   ANY file mutation to count too — a run of bare Edit/Write calls with no
 //   Bash in between was previously invisible to the counter. isMutatingBash()
-//   below is unchanged (moved here verbatim); isMutatingToolCall() is the new
+//   below was originally moved here verbatim; isMutatingToolCall() is the
 //   entry point that also counts Edit/Write/MultiEdit unconditionally.
+//
+// WIDENED AGAIN (2026-08-27, MEASURED counted-set hole): isMutatingBash() was
+// pattern-matching the command string for known mutating SHAPES (ssh/scp/
+// docker/git/psql/sed -i/rm-mv-cp/curl) but had NO rule at all for plain file
+// writes — `>`/`>>` redirection, `tee`, or an interpreter (python/node/perl/
+// ruby) writing a file from inline code or a heredoc. Measured firsthand this
+// session: seven real file mutations via `python3 - <<'EOF' ...
+// open(p,'w').write(...) ... EOF` heredocs went uncounted while a `sed -i` in
+// the same turn counted correctly. See the bias note above isMutatingBash's
+// definition for why the added rules deliberately invert the function's
+// original noise-conservative default.
 //
 // NOT WIDENED: governed board/memory edits (fos_* tool calls — messenger
 // work) and reads (Read/Grep/Glob) are NEVER counted by either consumer —
@@ -44,6 +55,27 @@ const CEILING = 15;
 // Counts a Bash command as "hands-on/mutating" if the command STRING contains
 // an operation that changes state (local or remote) or runs remote work.
 // Deliberately CONSERVATIVE: when in doubt, do NOT count (fluidity > noise).
+//
+// BIAS RE-EXAMINED (2026-08-27, MEASURED — not theoretical): that "when in
+// doubt, don't count" bias was written against NOISE (an over-eager gate
+// nagging on harmless reads). It was never examined against the failure this
+// session actually measured firsthand: seven real source-file mutations in
+// one turn — via `python3 - <<'EOF' ... open(p,'w').write(...) ... EOF`
+// heredocs — landed ZERO counted hits, while a single `sed -i` in the same
+// turn correctly counted as 1. The gate is a COUNTED ceiling (CEILING=15);
+// an uncounted mutation doesn't just under-report, it silently VOIDS the
+// gate for exactly the shapes most likely to be used, because this harness's
+// own guidance tells the operator to prefer Bash/heredocs over Edit/Write.
+// That is under-counting, not noise, and under-counting a security-relevant
+// counter is strictly worse than over-counting one (a false nudge costs a
+// dispatch; a missed one costs the whole boundary). So for the WRITE-SHAPED
+// rules added below (redirection, tee, interpreter-inline-code/heredoc,
+// truncate/dd/install) the bias is DELIBERATELY INVERTED: when a command
+// plausibly writes a file, COUNT it, even at the cost of occasional
+// over-counting (e.g. a literal `>` inside a quoted string this classifier
+// can't fully parse). The pre-existing rules above (ssh/scp/docker/git/
+// psql/sed -i/rm-mv-cp/curl) are UNCHANGED and keep their original
+// noise-conservative bias — only the new write-shaped rules invert it.
 function isMutatingBash(rawCmd) {
   const cmd = String(rawCmd || '');
   if (!cmd.trim()) return false;
@@ -73,6 +105,38 @@ function isMutatingBash(rawCmd) {
 
   // curl mutating (POST/PUT/DELETE/PATCH or a body). GET does not count.
   if (/\bcurl\b/.test(cmd) && /(-X\s*(POST|PUT|DELETE|PATCH)\b|--data\b|--data-\w+|(^|\s)-d\s|\s--upload-file\b)/i.test(cmd)) return true;
+
+  // ── WRITE-SHAPED RULES (2026-08-27, item: execute-boundary counted-set
+  // hole) — bias INVERTED here vs. the rules above (see header note): count
+  // when a command PLAUSIBLY writes a file, accepting some over-counting.
+
+  // Shell redirection to a file: `>` / `>>` used as an actual redirect
+  // operator. Excludes stderr-merge forms (`2>&1`, `&>`, `>&2`) and
+  // /dev/null sinks — those don't write a real file. Known limitation
+  // (accepted, not "fixed" — see bias note): a literal `>` inside a quoted
+  // string or a `[[ a > b ]]` comparison is not distinguished from a real
+  // redirect and WILL over-count; that's the accepted tradeoff for closing
+  // the under-counting hole.
+  if (/(?<![\d&>])>{1,2}(?!&|\s*\/dev\/null\b)/.test(cmd)) return true;
+
+  // tee — writes stdin to a file (with or without -a/--append).
+  if (/\btee\b/.test(cmd)) return true;
+
+  // Interpreter invoked with inline code or fed via stdin/heredoc:
+  // python/python3/node/perl/ruby with -c/-e, a bare trailing `-` (read
+  // script from stdin), or any heredoc (`<<`) in the command line. This is
+  // the exact shape measured this session (`python3 - <<'EOF' ...
+  // open(p,'w').write(...) ... EOF`) — the file write happens INSIDE the
+  // interpreted script, invisible to any redirect-based rule.
+  if (/\b(python3?|node|perl|ruby)\b/.test(cmd) &&
+      (/(^|\s)-[ce](\s|$)/.test(cmd) ||
+       /(^|\s)-(\s|$)/.test(cmd) ||
+       /<<[-~]?\s*['"]?\w+/.test(cmd))) return true;
+
+  // truncate / dd with an output file / install — direct file-write utilities.
+  if (/\btruncate\b/.test(cmd)) return true;
+  if (/\bdd\b/.test(cmd) && /\bof=/.test(cmd)) return true;
+  if (/\binstall\b/.test(cmd)) return true;
 
   return false;
 }
@@ -171,6 +235,13 @@ function selftest() {
     'psql -c "INSERT INTO foo VALUES (1)"', 'sed -i "s/a/b/" file.txt',
     'rm -rf /tmp/x', 'mv a.txt b.txt', 'cp a.txt b.txt',
     'curl -X POST https://x', 'curl --data "x=1" https://x',
+    // ── write-shaped rules (2026-08-27, MEASURED counted-set hole) — each of
+    // these 4 is a real command shape from the session that measured the
+    // hole first-hand.
+    "python3 - <<'EOF'\np='x.ts'\nopen(p,'w').write(s)\nEOF",
+    'echo "x" > file.txt',
+    'cat file | tee out.txt',
+    `node -e "require('fs').writeFileSync('a','b')"`,
   ];
   const BASH_SHOULD_NOT = [
     'ls -la', 'cat file.txt', 'git status', 'git diff', 'git log',
@@ -179,6 +250,11 @@ function selftest() {
     // the override CLI invocation itself must never self-block (pitfall from
     // items 3.3/4.3: a bare `node <path>` must not match any classifier row).
     'node .claude/hooks/lib/execute-boundary-override.mjs --ok "founder said go"',
+    // ── noise guards for the write-shaped rules above — must NOT count.
+    'grep -rn "foo" src/ 2>/dev/null',
+    'ls -la > /dev/null',
+    'git status --short',
+    'cat file.txt',
   ];
 
   let fail = 0;
