@@ -42,6 +42,16 @@
 // appends a 'consumed' line to the SAME audit JSONL the grant used (imported
 // from lib/execute-boundary-override.mjs, not duplicated here).
 //
+// ⚠ ACTIVATION STATUS (2026-08-27, item A2.1): this hook is REGISTERED in
+//   .claude/settings.json but gated OFF by default via
+//   ENGRAM_EXECUTE_BOUNDARY_GATE (unset/anything-but-"enforce" → INERT).
+//   Enable-parity twin of the lab's FOS_EXECUTE_BOUNDARY_GATE gate
+//   (kernel/hooks/pre-tool-use.execute-boundary-gate.js) — same default-off
+//   posture, same early-exit-before-stdin ordering, product-convention var
+//   name (ENGRAM_* not FOS_*; do NOT rename the lab's var to match). Ships
+//   dark deliberately: flipping ENGRAM_EXECUTE_BOUNDARY_GATE to "enforce" is
+//   the founder's deploy act (OPEN-A), never a default this hook assumes.
+//
 // MANDATORY DISCIPLINES:
 //   - Parse error / no session id / unexpected error → fail-open, ALLOW. This
 //     gate must never accidentally deny due to a bug in itself — that would be
@@ -62,9 +72,24 @@ const {
   CEILING,
 } = require('./lib/execute-boundary-classifier');
 
-main();
+// Gate is INERT unless explicitly flipped to "enforce" — see ACTIVATION
+// STATUS above. Enable-parity with the lab's FOS_EXECUTE_BOUNDARY_GATE,
+// product-convention name.
+const MODE = (process.env.ENGRAM_EXECUTE_BOUNDARY_GATE || 'off').toLowerCase();
+
+if (require.main === module) {
+  if (process.argv.includes('--selftest')) {
+    selftest();
+  } else {
+    main();
+  }
+}
 
 async function main() {
+  // Runs BEFORE stdin is even touched — a MODE=off gate never parses input,
+  // cheapest + safest (mirrors lab's ordering exactly).
+  if (MODE !== 'enforce') process.exit(0);
+
   let input;
   try {
     input = JSON.parse(fs.readFileSync(0, 'utf8') || '{}');
@@ -82,7 +107,7 @@ async function main() {
       // that ONE invocation outright, structurally, using the reliable
       // agent_id signal (the CLI's own env-based refusal is not reliable
       // for a subagent — see header).
-      if (toolName === 'Bash' && isOverrideCliInvocation(toolInput.command || '')) {
+      if (isOverrideCliInvocation(toolName, toolInput)) {
         deny(
           'Subagents cannot invoke the execute-boundary override CLI — this override is ' +
           'messenger-only, structurally, regardless of the (env-unreliable for subagents) ' +
@@ -180,5 +205,71 @@ function deny(reason) {
     },
   };
   process.stdout.write(JSON.stringify(out) + '\n');
+  process.exit(0);
+}
+
+// ─── self-test (node pre-tool-use.execute-boundary-gate.js --selftest) ─────
+//
+// Asserts BOTH MODE branches (item A2.1 ACCEPTANCE) by re-spawning this same
+// file as a child process with crafted stdin + env, since MODE is read once
+// at module load. Craft: a CEILING-count dispatch state file + a mutating
+// Edit call, no override — this WOULD deny if MODE were 'enforce'.
+//   - MODE unset (default off): must exit silently, NO stdout at all — proves
+//     the early-exit runs before stdin is even read.
+//   - MODE=enforce: SAME input must DENY (unchanged prior/lab behavior).
+function selftest() {
+  const { execFileSync } = require('node:child_process');
+  const sessionId = `selftest-${process.pid}-${Date.now()}`;
+  const dispatchFile = stateFile('dispatch', sessionId);
+  let fail = 0;
+
+  try {
+    fs.writeFileSync(dispatchFile, JSON.stringify({ count: CEILING }));
+
+    const payload = JSON.stringify({
+      tool_name: 'Edit',
+      tool_input: { file_path: '/tmp/execute-boundary-gate.selftest' },
+      session_id: sessionId,
+    });
+
+    const offEnv = { ...process.env };
+    delete offEnv.ENGRAM_EXECUTE_BOUNDARY_GATE;
+    const offResult = execFileSync(process.execPath, [__filename], {
+      input: payload,
+      env: offEnv,
+      encoding: 'utf8',
+    });
+    if (offResult.trim() !== '') {
+      fail++;
+      console.error(`  FAIL (MODE=off/unset should be silent-allow): got stdout: ${offResult}`);
+    }
+
+    const enforceEnv = { ...process.env, ENGRAM_EXECUTE_BOUNDARY_GATE: 'enforce' };
+    const enforceResult = execFileSync(process.execPath, [__filename], {
+      input: payload,
+      env: enforceEnv,
+      encoding: 'utf8',
+    });
+    let parsed;
+    try {
+      parsed = JSON.parse(enforceResult);
+    } catch {
+      parsed = null;
+    }
+    const denied = !!(
+      parsed &&
+      parsed.hookSpecificOutput &&
+      parsed.hookSpecificOutput.permissionDecision === 'deny'
+    );
+    if (!denied) {
+      fail++;
+      console.error(`  FAIL (MODE=enforce should DENY at CEILING): got stdout: ${enforceResult}`);
+    }
+  } finally {
+    try { fs.unlinkSync(dispatchFile); } catch { /* best-effort cleanup */ }
+  }
+
+  if (fail) { console.error(`selftest: ${fail} FAILED`); process.exit(1); }
+  console.log('selftest: OK (MODE=off/unset silent-allow, MODE=enforce denies at CEILING)');
   process.exit(0);
 }

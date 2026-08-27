@@ -216,5 +216,8 @@
     "command": "python3 __HIVEMIND_HOME__/bin/hivemind-statusline.py",
     "padding": 0
   },
+  "env": {
+    "ENGRAM_EXECUTE_BOUNDARY_GATE": "off"
+  },
   "skipDangerousModePermissionPrompt": true
 }

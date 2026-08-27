@@ -105,7 +105,7 @@ function isSubagentContext(input) {
   return !!(input && input.agent_id != null);
 }
 
-// ─── isOverrideCliInvocation(cmd) — closes the gap the measurement found ───
+// ─── isOverrideCliInvocation(toolName, toolInput) — closes the gap the measurement found ──
 //
 // lib/execute-boundary-override.mjs's own CLAUDE_AGENT_NAME refusal is
 // UNRELIABLE for subagents (env is empty for them — see isSubagentContext
@@ -115,11 +115,38 @@ function isSubagentContext(input) {
 // override.mjs remains as belt-and-suspenders (harmless, just not sufficient
 // alone). READONLY_LEAD guards against a false deny on a command that only
 // MENTIONS the file (grep/cat of the script), not one that RUNS it.
+//
+// ARITY — reconciled 2026-08-27 (item A2.3, follow-up to 5.1): this used to
+// take a single `rawCmd` string, with the caller (the gate) responsible for
+// checking `toolName === 'Bash'` first. The lab twin
+// (kernel/hooks/lib/execute-boundary-classifier.js) always took
+// `(toolName, toolInput)` and did the Bash-check internally — the same shape
+// every other exported classifier here uses (isMutatingToolCall). Reconciled
+// to that 2-arg shape so both twins now have an IDENTICAL signature and an
+// IDENTICAL call-site pattern (`isOverrideCliInvocation(toolName, toolInput)`)
+// — a future arity drift is caught by the parity guard
+// (kernel/hooks/.test-fixtures/execute-boundary-parity.js, Function.length
+// check). This is a calling-convention fix ONLY — the classification RESULT
+// for every existing input is unchanged (verify: for a Bash command string
+// `cmd`, old `isOverrideCliInvocation(cmd)` === new
+// `isOverrideCliInvocation('Bash', {command: cmd})`; any non-Bash tool now
+// correctly returns false, which the old signature could never even express).
+//
+// DELIBERATE, DOCUMENTED DIVERGENCE FROM THE LAB TWIN (kept, not "fixed"
+// here — SENSITIVITY: do not change enforcement behavior, contract_ship §5):
+// READONLY_LEAD is PRODUCT-ONLY. The lab's isOverrideCliInvocation has no
+// such exemption — a subagent Bash call that only MENTIONS the override CLI
+// (e.g. `grep execute-boundary-override.mjs settings.json`) is DENIED on the
+// lab side, ALLOWED on the product side. Pinned explicitly by the parity
+// guard's DOCUMENTED_DIVERGENCES table so this doesn't silently drift further
+// (either side "fixed" without the guard being updated) — see the guard file
+// for the recorded rationale.
 const READONLY_LEAD = /^\s*(grep|rg|ag|cat|echo|ls|head|tail|less|awk|sed|find)\b/;
-function isOverrideCliInvocation(rawCmd) {
-  const cmd = String(rawCmd || '');
+function isOverrideCliInvocation(toolName, toolInput) {
+  if (String(toolName || '') !== 'Bash') return false;
+  const cmd = String((toolInput && toolInput.command) || '');
   if (!/execute-boundary-override\.mjs/.test(cmd)) return false;
-  if (READONLY_LEAD.test(cmd)) return false; // mentions it, doesn't run it
+  if (READONLY_LEAD.test(cmd)) return false; // mentions it, doesn't run it — PRODUCT-ONLY, see above
   return true;
 }
 
@@ -199,19 +226,24 @@ function selftest() {
     }
   }
 
-  // isOverrideCliInvocation — must catch a real run, not a mention.
+  // isOverrideCliInvocation(toolName, toolInput) — must catch a real Bash run,
+  // not a mention, and must not fire for a non-Bash tool (arity reconciled
+  // 2026-08-27, item A2.3 — see the function's header comment).
   const OVERRIDE_CLI_CASES = [
-    ['node .claude/hooks/lib/execute-boundary-override.mjs --ok "x"', true],
-    ['node __HIVEMIND_HOME__/.claude/hooks/lib/execute-boundary-override.mjs --ok "x"', true],
-    ['grep execute-boundary-override.mjs settings.json', false],
-    ['cat .claude/hooks/lib/execute-boundary-override.mjs', false],
-    ['git status', false],
+    ['Bash', 'node .claude/hooks/lib/execute-boundary-override.mjs --ok "x"', true],
+    ['Bash', 'node __HIVEMIND_HOME__/.claude/hooks/lib/execute-boundary-override.mjs --ok "x"', true],
+    ['Bash', 'grep execute-boundary-override.mjs settings.json', false],
+    ['Bash', 'cat .claude/hooks/lib/execute-boundary-override.mjs', false],
+    ['Bash', 'git status', false],
+    // non-Bash tool never counts, even if the path matches (only the 2-arg
+    // shape can express this — the old 1-arg shape had no toolName to check).
+    ['Edit', '.claude/hooks/lib/execute-boundary-override.mjs', false],
   ];
-  for (const [cmd, expected] of OVERRIDE_CLI_CASES) {
-    const got = isOverrideCliInvocation(cmd);
+  for (const [toolName, cmd, expected] of OVERRIDE_CLI_CASES) {
+    const got = isOverrideCliInvocation(toolName, { command: cmd, file_path: cmd });
     if (got !== expected) {
       fail++;
-      console.error(`  FAIL isOverrideCliInvocation(${cmd}): expected ${expected}, got ${got}`);
+      console.error(`  FAIL isOverrideCliInvocation(${toolName}, ${cmd}): expected ${expected}, got ${got}`);
     }
   }
 
