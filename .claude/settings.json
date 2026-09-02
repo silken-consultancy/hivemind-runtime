@@ -191,6 +191,33 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "mcp__engram__fos_memory|mcp__engram__fos_recall",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f __HIVEMIND_HOME__/.claude/hooks/post-tool-use.self-savepoint.js ]; then exec node __HIVEMIND_HOME__/.claude/hooks/post-tool-use.self-savepoint.js; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__engram__fos_delivery|mcp__engram__fos_implementation_phase|mcp__engram__fos_session|mcp__engram__fos_blocker|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f __HIVEMIND_HOME__/.claude/hooks/post-tool-use.savepoint-nudge.js ]; then exec node __HIVEMIND_HOME__/.claude/hooks/post-tool-use.savepoint-nudge.js; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__engram__fos_decision|mcp__engram__fos_implementation|mcp__engram__fos_implementation_phase|mcp__engram__fos_delivery|mcp__engram__fos_session|mcp__engram__fos_recall|mcp__engram__fos_memory|mcp__engram__fos_blocker|mcp__engram__fos_phase_item|Edit|Write|MultiEdit|Bash|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f __HIVEMIND_HOME__/.claude/hooks/post-tool-use.resonance-nudge.js ]; then exec node __HIVEMIND_HOME__/.claude/hooks/post-tool-use.resonance-nudge.js; fi"
+          }
+        ]
+      },
+      {
         "matcher": "Edit|Write|MultiEdit|Bash",
         "hooks": [
           {
