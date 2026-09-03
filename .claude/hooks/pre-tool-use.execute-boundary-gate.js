@@ -79,8 +79,8 @@ const {
 } = require('./lib/execute-boundary-classifier');
 
 // Gate ENFORCES by default. Only the literal "off" disables it — see
-// ACTIVATION STATUS above. Enable-parity with the lab's
-// FOS_EXECUTE_BOUNDARY_GATE, product-convention name.
+// ACTIVATION STATUS above. The one and only enable/disable key is
+// ENGRAM_EXECUTE_BOUNDARY_GATE.
 const MODE = (process.env.ENGRAM_EXECUTE_BOUNDARY_GATE || 'enforce').toLowerCase();
 
 if (require.main === module) {
@@ -392,21 +392,35 @@ function selftest() {
       false
     );
 
-    // (c) subagent Bash call that only MENTIONS the override CLI (grep) —
-    // the READONLY_LEAD exemption (product-only; see
-    // lib/execute-boundary-classifier.js), confirmed end-to-end through the
-    // real gate subprocess, not just the unit-level classifier call.
+    // (c) subagent Bash call that only MENTIONS the override CLI — allowed
+    // because no command SEGMENT actually RUNS it (invocation-shape test, see
+    // lib/execute-boundary-classifier.js's isOverrideCliInvocation). The
+    // COMPOUND form (`cd … && grep …`) is the exact B1.8 false positive: its
+    // lead token is `cd`, so the old ^-anchored READONLY_LEAD exemption
+    // wrongly denied it. Confirmed end-to-end through the real gate subprocess,
+    // not just the unit-level classifier call.
     runSubagentCase(
-      'merely mentioning the override CLI (grep)',
+      'merely mentioning the override CLI in a compound read (cd && grep)',
       'Bash',
-      { command: 'grep execute-boundary-override.mjs settings.json' },
+      { command: 'cd repo && grep -n founder .claude/hooks/lib/execute-boundary-override.mjs' },
       false
+    );
+
+    // (d) subagent running the override CLI behind a shell -c wrapper — the
+    // false-negative a runtime-enumeration detector let through (item B1.8
+    // 🔴 fix). The pure-read allow-list denies it: the segment names the path
+    // and its lead word (`bash`) is not a read verb. Proven end-to-end here.
+    runSubagentCase(
+      'running the override CLI behind a bash -c wrapper',
+      'Bash',
+      { command: 'bash -c "node .claude/hooks/lib/execute-boundary-override.mjs --ok x"' },
+      true
     );
   } finally {
     try { fs.unlinkSync(subagentDispatchFile); } catch { /* best-effort cleanup */ }
   }
 
   if (fail) { console.error(`selftest: ${fail} FAILED`); process.exit(1); }
-  console.log('selftest: OK (unset/enforce/typo all enforce, only "off" is inert; subagent override-CLI denial, exemption, and read-only-mention allow all confirmed end-to-end)');
+  console.log('selftest: OK (unset/enforce/typo all enforce, only "off" is inert; subagent override-CLI denial (direct + bash -c wrapper), exemption, and compound read-only-mention allow all confirmed end-to-end)');
   process.exit(0);
 }

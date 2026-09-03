@@ -1,0 +1,44 @@
+# hooks-tests.yml — regression tests for the execute-boundary hook family.
+#
+# WHY: the execute-boundary classifier and its override loop are pattern-based
+# and security-relevant — a counted-set hole silently VOIDS the gate, and the
+# session-key mismatch was invisible to static reading. These tests (item B1.5
+# counted-set, B1.8 override-CLI false positive, B2.4 override round-trip) are
+# the mechanically-checked properties that keep a future edit from loosening
+# the gate unnoticed. They run here on every change to the hooks, not only
+# on-demand via each file's own --selftest.
+#
+# No deps, no install: the hooks are plain Node and the tests use the built-in
+# node:test runner. Just a Node runtime.
+
+name: hooks-tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.claude/hooks/**'
+      - '.github/workflows/hooks-tests.yml'
+  pull_request:
+    paths:
+      - '.claude/hooks/**'
+      - '.github/workflows/hooks-tests.yml'
+
+jobs:
+  execute-boundary:
+    name: execute-boundary regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Standalone regression suite (node:test)
+        run: node --test .claude/hooks/test/*.test.js .claude/hooks/test/*.test.mjs
+
+      - name: In-file selftests (belt-and-suspenders)
+        run: |
+          node .claude/hooks/lib/execute-boundary-classifier.js --selftest
+          node .claude/hooks/pre-tool-use.execute-boundary-gate.js --selftest

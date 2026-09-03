@@ -174,44 +174,102 @@ function isSubagentContext(input) {
 // lib/execute-boundary-override.mjs's own CLAUDE_AGENT_NAME refusal is
 // UNRELIABLE for subagents (env is empty for them — see isSubagentContext
 // above). The REAL protection lives at the GATE: it denies a subagent's Bash
-// call outright when that call would run the override CLI, using the
-// reliable agent_id signal instead. The CLAUDE_AGENT_NAME check inside
-// override.mjs remains as belt-and-suspenders (harmless, just not sufficient
-// alone). READONLY_LEAD guards against a false deny on a command that only
-// MENTIONS the file (grep/cat of the script), not one that RUNS it.
+// call outright when that call would RUN the override CLI, using the reliable
+// agent_id signal instead. The CLAUDE_AGENT_NAME check inside override.mjs
+// remains as belt-and-suspenders (harmless, just not sufficient alone).
 //
-// ARITY — reconciled 2026-08-27 (item A2.3, follow-up to 5.1): this used to
-// take a single `rawCmd` string, with the caller (the gate) responsible for
-// checking `toolName === 'Bash'` first. The lab twin
-// (kernel/hooks/lib/execute-boundary-classifier.js) always took
-// `(toolName, toolInput)` and did the Bash-check internally — the same shape
-// every other exported classifier here uses (isMutatingToolCall). Reconciled
-// to that 2-arg shape so both twins now have an IDENTICAL signature and an
-// IDENTICAL call-site pattern (`isOverrideCliInvocation(toolName, toolInput)`)
-// — a future arity drift is caught by the parity guard
-// (kernel/hooks/.test-fixtures/execute-boundary-parity.js, Function.length
-// check). This is a calling-convention fix ONLY — the classification RESULT
-// for every existing input is unchanged (verify: for a Bash command string
-// `cmd`, old `isOverrideCliInvocation(cmd)` === new
-// `isOverrideCliInvocation('Bash', {command: cmd})`; any non-Bash tool now
-// correctly returns false, which the old signature could never even express).
+// ARITY: (toolName, toolInput) — the same 2-arg shape every other exported
+// classifier here uses (isMutatingToolCall). A non-Bash tool returns false;
+// only a Bash command string is ever inspected.
 //
-// DELIBERATE, DOCUMENTED DIVERGENCE FROM THE LAB TWIN (kept, not "fixed"
-// here — SENSITIVITY: do not change enforcement behavior, contract_ship §5):
-// READONLY_LEAD is PRODUCT-ONLY. The lab's isOverrideCliInvocation has no
-// such exemption — a subagent Bash call that only MENTIONS the override CLI
-// (e.g. `grep execute-boundary-override.mjs settings.json`) is DENIED on the
-// lab side, ALLOWED on the product side. Pinned explicitly by the parity
-// guard's DOCUMENTED_DIVERGENCES table so this doesn't silently drift further
-// (either side "fixed" without the guard being updated) — see the guard file
-// for the recorded rationale.
-const READONLY_LEAD = /^\s*(grep|rg|ag|cat|echo|ls|head|tail|less|awk|sed|find)\b/;
+// ALLOW-LIST OF PURE READS, NOT AN ENUMERATION OF RUNTIMES (2026-08-27, item
+// B1.8 — fix for a MEASURED false positive AND the false negative that a first
+// runtime-enumeration attempt opened): this gate is the SOLE barrier against a
+// subagent self-granting the override (the CLI's own CLAUDE_AGENT_NAME refusal
+// is useless for subagents — env is empty for them), so the safe default MUST
+// be DENY, with exemption only for shapes provably harmless.
+//
+//   HISTORY 1 — the original bug: exemption was a ^-anchored READONLY_LEAD
+//   (grep|cat|…). Because it anchored to the FIRST token of the WHOLE command,
+//   a compound read whose lead token was anything else — `cd <dir> && grep …
+//   override.mjs`, `A=1 grep … override.mjs` — lost the exemption and a plain
+//   read was DENIED. A live false positive.
+//
+//   HISTORY 2 — the trap to avoid: "fixing" it by POSITIVELY matching a JS
+//   runtime (node/npx/…) as the lead token opened a FALSE NEGATIVE — a
+//   subagent could self-grant via any shape whose lead token is not a listed
+//   runtime: `bash -c "node …override.mjs"`, `timeout 10 node …override.mjs`,
+//   `stdbuf -oL node …`, `A=1 timeout 5 node …`, `echo $(node …)`, backticks,
+//   `… override.mjs | xargs node`. Enumerating executors is a losing game.
+//
+// THE MODEL (inverted, allow-list): split the command into SEGMENTS on
+// statement separators ONLY — `; && || \n`, deliberately NOT the pipe `|`
+// (a pipe can route the path into an executor: `echo …override.mjs | xargs
+// node`, so a pipeline is judged as ONE segment). DENY (return true) if ANY
+// segment that NAMES the override path is not a provable pure read. A segment
+// is a pure read only when BOTH hold:
+//   1. it contains no routing-to-executor construct — no pipe `|`, no command
+//      substitution `$( )` / backticks, no process substitution `<( )` `>( )`,
+//      no `find -exec/-execdir/-ok/-okdir`; and
+//   2. after stripping leading env-assignments (VAR=val) and benign wrappers
+//      (env/sudo/command/exec/nice/nohup), its lead command word is a known
+//      pure-read verb (grep|rg|ag|cat|echo|ls|head|tail|less|find — NOT
+//      awk/sed, which can shell out via system()/the `e` command).
+// Everything else that names the path — bare `node …`, `bash -c …`, a wrapper,
+// a substitution, a pipe — falls to DENY. `cd x && grep …override.mjs` stays
+// ALLOWED (the grep segment leads with a read verb, the cd segment names no
+// path); `bash -c`, `timeout node`, `$(…)`, backticks and `| xargs node` all
+// DENY.
+//
+// BIAS (deliberate, safe direction): the pipe/substitution guard over-denies a
+// few harmless piped reads (`grep "a|b" …override.mjs`, `cat …override.mjs |
+// grep foo`) — accepted. Over-denying a subagent's read costs nothing; MISSING
+// a real self-grant reopens the isolation hole. The earlier second harness is
+// retired — there is no twin to diverge from; this repo's behavior is the
+// whole contract.
+const OVERRIDE_CLI_PATH = /execute-boundary-override\.mjs/;
+// Statement separators only — the pipe `|` is intentionally absent (see model).
+const SEGMENT_SPLIT = /&&|\|\||[;\n]/;
+// The ONLY lead verbs that can exempt a path-naming segment from denial.
+// awk and sed are DELIBERATELY EXCLUDED — they are not pure reads: awk's
+// system() and GNU sed's `e` command execute arbitrary shell (e.g.
+// `awk 'BEGIN{system("node …override.mjs …")}'`, `sed 'e node …override.mjs' /dev/null`)
+// with no pipe/$()/backtick for ROUTES_TO_EXECUTOR to catch. A subagent's
+// legitimate read of the path is still covered by grep/cat/ls/head/tail/less/
+// echo/rg/ag/find; an awk/sed read simply falls to DENY (harmless — over-
+// denying a read costs nothing).
+const READ_VERBS = /^(?:grep|rg|ag|cat|echo|ls|head|tail|less|find)$/;
+const ENV_ASSIGNMENT = /^\w+=/;
+const BENIGN_WRAPPER = /^(?:env|sudo|command|exec|nice|nohup)$/;
+// Any of these inside a segment can hand the path to a command other than the
+// segment's lead verb — a path-naming segment containing one is never a pure
+// read: pipe, command/process substitution, backticks, find's exec actions.
+const ROUTES_TO_EXECUTOR = /[|`]|\$\(|<\(|>\(|\s-(?:exec|execdir|ok|okdir)\b/;
+
+function segmentIsPureReadOfPath(segment) {
+  // Precondition: the caller has confirmed the segment names the override path.
+  if (ROUTES_TO_EXECUTOR.test(segment)) return false; // pipe / $() / `` / <() / -exec
+  const tokens = String(segment).trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  // Skip leading `VAR=val` assignments and benign wrappers so the real command
+  // word is found even behind `A=1 …` or `env … grep …`. Executors (node,
+  // bash, timeout, stdbuf, xargs, …) are deliberately NOT stripped — their
+  // lead word simply is not a READ_VERB, so the segment falls to DENY.
+  while (i < tokens.length && (ENV_ASSIGNMENT.test(tokens[i]) || BENIGN_WRAPPER.test(tokens[i]))) i++;
+  const lead = tokens[i];
+  if (!lead) return false;
+  const base = lead.replace(/^.*\//, ''); // basename: /bin/grep → grep
+  return READ_VERBS.test(base);
+}
+
 function isOverrideCliInvocation(toolName, toolInput) {
   if (String(toolName || '') !== 'Bash') return false;
   const cmd = String((toolInput && toolInput.command) || '');
-  if (!/execute-boundary-override\.mjs/.test(cmd)) return false;
-  if (READONLY_LEAD.test(cmd)) return false; // mentions it, doesn't run it — PRODUCT-ONLY, see above
-  return true;
+  if (!OVERRIDE_CLI_PATH.test(cmd)) return false;
+  // DENY unless EVERY segment that names the override path is a pure read.
+  return cmd.split(SEGMENT_SPLIT).some(
+    (seg) => OVERRIDE_CLI_PATH.test(seg) && !segmentIsPureReadOfPath(seg),
+  );
 }
 
 // ─── stateFile(kind, sessionId) — shared path-builder ──────────────────────
@@ -319,25 +377,40 @@ function selftest() {
     }
   }
 
-  // isOverrideCliInvocation(toolName, toolInput) — must catch a real Bash run,
-  // not a mention, and must not fire for a non-Bash tool (arity reconciled
-  // 2026-08-27, item A2.3 — see the function's header comment).
-  //
-  // This table already carries the substance of §3 (isOverrideCliInvocation
-  // behavior parity) from the retired kernel/hooks/.test-fixtures/
-  // execute-boundary-parity.js — the real-invocation vs. mere-mention
-  // (READONLY_LEAD) distinction below, product-only, is that guard's
-  // DOCUMENTED_DIVERGENCES case with the lab side dropped (item B1.10: no
-  // lab twin left to diverge from — this repo's own behavior is now the
-  // whole contract). No new cases were needed here.
+  // isOverrideCliInvocation(toolName, toolInput) — DENY (true) any Bash command
+  // that RUNS the override CLI; ALLOW (false) a pure read that only names it,
+  // and never fire for a non-Bash tool. Pure-read allow-list model (item B1.8 —
+  // see the function's header comment). Rows below lock down BOTH failure
+  // directions: the false POSITIVE the old ^-anchored READONLY_LEAD caused
+  // (compound reads → must ALLOW) and the false NEGATIVE a runtime-enumeration
+  // attempt opened (wrapper / sh -c / substitution / pipe / env-prefix → must
+  // DENY).
   const OVERRIDE_CLI_CASES = [
     ['Bash', 'node .claude/hooks/lib/execute-boundary-override.mjs --ok "x"', true],
     ['Bash', 'node __HIVEMIND_HOME__/.claude/hooks/lib/execute-boundary-override.mjs --ok "x"', true],
     ['Bash', 'grep execute-boundary-override.mjs settings.json', false],
     ['Bash', 'cat .claude/hooks/lib/execute-boundary-override.mjs', false],
     ['Bash', 'git status', false],
+    // ── false-POSITIVE cures (must ALLOW): compound reads whose lead token is
+    // not the FIRST token of the whole command.
+    ['Bash', 'cd repo && grep -n founder .claude/hooks/lib/execute-boundary-override.mjs', false],
+    ['Bash', 'A=1 grep -n founder execute-boundary-override.mjs', false],
+    // ── false-NEGATIVE closures (must DENY): a real run behind a wrapper,
+    // shell -c, substitution, pipe, or env-prefix.
+    ['Bash', "cd repo && node .claude/hooks/lib/execute-boundary-override.mjs --ok 'go'", true],
+    ['Bash', 'bash -c "node .claude/hooks/lib/execute-boundary-override.mjs --ok x"', true],
+    ['Bash', 'sh -c "node .claude/hooks/lib/execute-boundary-override.mjs --ok x"', true],
+    ['Bash', 'timeout 10 node .claude/hooks/lib/execute-boundary-override.mjs --ok x', true],
+    ['Bash', 'stdbuf -oL node .claude/hooks/lib/execute-boundary-override.mjs --ok x', true],
+    ['Bash', 'A=1 timeout 5 node .claude/hooks/lib/execute-boundary-override.mjs --ok x', true],
+    ['Bash', 'echo $(node .claude/hooks/lib/execute-boundary-override.mjs --ok x)', true],
+    ['Bash', 'echo `node .claude/hooks/lib/execute-boundary-override.mjs --ok x`', true],
+    ['Bash', 'echo .claude/hooks/lib/execute-boundary-override.mjs | xargs node', true],
+    // awk/sed are NOT pure reads — they shell out (system() / GNU sed `e`).
+    ['Bash', `awk 'BEGIN{system("node .claude/hooks/lib/execute-boundary-override.mjs --ok x")}'`, true],
+    ['Bash', "sed 'e node .claude/hooks/lib/execute-boundary-override.mjs --ok x' /dev/null", true],
     // non-Bash tool never counts, even if the path matches (only the 2-arg
-    // shape can express this — the old 1-arg shape had no toolName to check).
+    // shape can express this — a 1-arg command string has no toolName to check).
     ['Edit', '.claude/hooks/lib/execute-boundary-override.mjs', false],
   ];
   for (const [toolName, cmd, expected] of OVERRIDE_CLI_CASES) {
