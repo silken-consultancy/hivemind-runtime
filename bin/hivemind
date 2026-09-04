@@ -2109,8 +2109,16 @@ cmd_open() {
   # is the scalpel that suppresses project-scoped settings/CLAUDE.md/.mcp.json
   # while keeping the product's user-scoped config intact — intentional, not
   # a side effect (re-measure if the embedded CLI version changes).
+  #
+  # CLAUDE_CODE_NO_FLICKER=1 forces the fullscreen renderer AT START (mouse +
+  # copy-on-select + wheel scroll). Needed because `--setting-sources` above is
+  # a "restriction the CLI can't pass to a relaunch", so `/tui fullscreen`
+  # mid-session is REFUSED (docs: code.claude.com/docs/en/fullscreen) — the env
+  # var is the only path into fullscreen alongside --setting-sources. Drop this
+  # line to fall back to the classic renderer.
   exec env \
     CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" \
+    CLAUDE_CODE_NO_FLICKER=1 \
     ENGRAM_SLUG="${_project_slug}" \
     ENGRAM_SESSION_ID="${ENGRAM_SESSION_ID}" \
     ENGRAM_DEVICE_ID="${ENGRAM_DEVICE_ID}" \
