@@ -28,10 +28,14 @@
 //   fos_session after the FIRST assistant response, while the process (and
 //   the conversation) keeps going for every turn after that. That is not a
 //   cosmetic bug: `active_sessions` would show `closed_at` set while the
-//   window is still live, which (a) frees the DR-7.A per-slug lock early,
-//   letting a second `hivemind open` for the same slug run CONCURRENTLY
-//   against a session that is actually still in use, and (b) breaks any later
-//   in-window continuity that assumes the session is still open. This is a
+//   window is still live, which breaks any later in-window continuity that
+//   assumes the session is still open, and marks a still-active lane as
+//   closed/handed-off before it truly ended. (Historically this comment also
+//   cited a per-slug open() lock freed too early; that harness slug-lock was
+//   removed in P4 / impl 989cb79b — concurrent sessions per slug are now
+//   intended and made safe by the engram's lane-safe open() guard — so that
+//   particular rationale no longer applies, but the continuity one still
+//   does.) This is a
 //   deliberate, flagged omission — see the delivery report for this phase —
 //   not an oversight. If a Stop-based safety net is still wanted, it needs a
 //   DIFFERENT design (Claude Code's Stop hook input carries no "is this
