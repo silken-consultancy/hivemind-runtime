@@ -113,14 +113,18 @@ function main() {
     // step 2) win, per sessions.service.ts's own precedence rules.
     closeSession(port, apiKey, sessionId, reason, undefined, (result) => {
       if (result && result._err === 'next_note_required') {
-        // No valid WIP:/NEXT: note exists anywhere for this session — retry
+        // No valid WIP:/NEXT:/LANE: note exists anywhere for this session — retry
         // with a distinct, machine-attributable floor note (mirrors the
-        // watchdog's '[watchdog-orphan: ...]' floor format/spirit), shaped to
-        // satisfy validateNextNote's WIP:/NEXT: requirement directly (no
-        // force:true needed).
+        // watchdog's floor format/spirit + buildFloorNextNote's synthetic LANE),
+        // shaped to satisfy validateNextNote's WIP:/NEXT:/LANE: requirement
+        // directly (no force:true needed). The 'LANE: <auto:hook>' marks a
+        // machine-closer (no vessel/model in the loop) for signed-lane rehydration —
+        // REQUIRED since the engram backend now enforces a LANE: line (impl 989cb79b
+        // P3.8); without it this auto-close would be rejected and continuity break.
         const floor =
           'WIP: [auto-close: SessionEnd hook — no explicit /end-session handoff was recorded]\n' +
-          'NEXT: run /end-session at the start of the next session for a deliberate handoff note';
+          'NEXT: run /end-session at the start of the next session for a deliberate handoff note\n' +
+          'LANE: <auto:hook>';
         closeSession(port, apiKey, sessionId, reason, floor, () => process.exit(0));
         return;
       }
