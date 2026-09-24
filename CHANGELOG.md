@@ -30,10 +30,18 @@ not be merged until that constraint holds.
   `_resolve_project_slug` so the tests can run it directly.
 - The registry-unreachable abort is unchanged. It runs before the onboarding check.
 
-**RELEASE ORDERING (P3-2):** merge this to `main` only **after engram Phase 2
-(`fos_onboarding` + `owner_onboarding` migration + backfill) is live** on the target
-engram: LAB first, then prod. Until then this change is safe but gives no benefit.
-Version skew is covered in both directions:
+**RELEASE ORDERING (P3-2):** merge this to `main` only after **all three** of these
+hold on the target engram (LAB first, then prod):
+
+1. **Phase 2 is live**: `fos_onboarding` deployed, the `owner_onboarding` migration
+   applied, its RLS applied, and the backfill run.
+2. **The served startup contract is active**, so a session opened with
+   `ENGRAM_STARTUP=1` has a served law that runs onboarding and completes it.
+3. **Boot Step 2b is live** in the served boot procedure (the
+   `skeleton.onboarding_completed === false` re-check).
+
+Before Phase 2 is live, this change is safe but gives no benefit. Version skew is
+covered in both directions:
 
 - New runtime + old engram: tool-not-found → `legacy`, which is exactly today's
   behaviour. Tested in `runtime/src/hivemind-cli.test.ts`, "older engram (tool-not-found)"
@@ -47,3 +55,10 @@ only ever takes the `legacy` path against it. And the runtime trusts whatever
 `onboarding_completed` the engram reports, so the Phase 2 runbook (P2-6: migrate,
 deploy, backfill, verify) must be finished on that engram first. An owner whose row
 is missing reads `completed`.
+
+Why Phase 2 alone is not enough: once Phase 2 is live, the new runtime routes every
+`pending` owner to `default` + `ENGRAM_STARTUP=1`. That env var does nothing by itself.
+If the served startup contract and boot Step 2b are not active, nothing in the session
+acts on it, so onboarding is never completed and the owner stays `pending`. A pending
+owner who already has projects then loses the project picker on every no-arg launch,
+with no way out.
