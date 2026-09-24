@@ -1429,6 +1429,94 @@ _nondefault_slugs_raw() {
   done <<< "${_SLUGS_RAW}"
 }
 
+# ── First-timer = the per-owner onboarding field (impl 4e978e9c, P3-1) ──────
+# "Is this owner a first-timer?" is answered by the engram's per-owner
+# onboarding flag (fos_onboarding(action:get) → {onboarding_completed:
+# true|false|null}), NOT by counting projects. Project count stopped being a
+# valid proxy once projects can be created from the web: a brand-new owner
+# may already have web-created projects (still pending → must get startup),
+# and a finished owner may have archived every project (completed → must NOT
+# be re-onboarded).
+#
+# _onboarding_probe: ONE fos_onboarding(get) call, classified. Echoes exactly
+# one of:
+#   completed — onboarding_completed === true  (a missing row reads true
+#               server-side, so pre-existing owners land here)
+#   pending   — onboarding_completed === false
+#   legacy    — the engram answered "Tool fos_onboarding not found": an OLDER
+#               engram without Phase 2 (version skew). Deterministic, so no
+#               retry — the caller falls back to the project-count heuristic.
+#   unknown   — anything else: transport failure/timeout (empty response),
+#               unparseable payload, a tool error (role/owner/etc), or
+#               onboarding_completed:null (server could not read the store —
+#               e.g. table missing mid-deploy). Never read as "completed" or
+#               "pending": unknown is not a verdict.
+# Tool-not-found is recognised in BOTH shapes the MCP SDK has used: a result
+# with isError:true whose text carries "Tool <name> not found" (SDK ≥1.2x,
+# what engram ships today), and a JSON-RPC top-level error envelope (older
+# SDKs). Bounded by _mcp_call's own --max-time. Never trips errexit.
+_onboarding_probe() {
+  [ -n "${FOS_API_KEY:-}" ] || { echo unknown; return 0; }
+  local _resp _state
+  _resp="$(_mcp_call "fos_onboarding" '{"action":"get"}' 1)"
+  [ -n "${_resp}" ] || { echo unknown; return 0; }
+  _state="$(bun -e '
+    const notFound = (s) => typeof s === "string" && /Tool fos_onboarding not found/i.test(s);
+    try {
+      const env = JSON.parse(process.argv[1]);
+      if (env && env.error) { console.log(notFound(env.error.message) ? "legacy" : "unknown"); process.exit(0); }
+      const res = env && env.result;
+      const text = res && Array.isArray(res.content) && res.content[0] ? res.content[0].text : undefined;
+      if (res && res.isError) { console.log(notFound(text) ? "legacy" : "unknown"); process.exit(0); }
+      const inner = JSON.parse(text);
+      const v = inner ? inner.onboarding_completed : undefined;
+      console.log(v === true ? "completed" : v === false ? "pending" : "unknown");
+    } catch { console.log("unknown"); }
+  ' "${_resp}" 2>/dev/null)" || _state=""
+  case "${_state}" in
+    completed|pending|legacy) echo "${_state}" ;;
+    *) echo unknown ;;
+  esac
+}
+
+# _onboarding_state: sets _ONBOARDING ∈ completed|pending|legacy.
+# unknown → retry ONCE (a transient blip should not cost the user the right
+# route); still unknown → degrade to `legacy` with a one-line stderr notice.
+# This function NEVER blocks the launch and never traps the user: the worst
+# case is two bounded _mcp_call timeouts, then today's heuristic.
+#
+# WHY the legacy fallback does not reintroduce the web-created-projects bug:
+# `legacy` is reachable only during engram/runtime version skew or a
+# transient failure, and the served boot procedure (P4-2) re-checks
+# skeleton.onboarding_completed===false in EVERY vessel — a pending owner the
+# runtime missed here is still caught at boot.
+_onboarding_state() {
+  _ONBOARDING="$(_onboarding_probe)"
+  if [ "${_ONBOARDING}" = "unknown" ]; then
+    _ONBOARDING="$(_onboarding_probe)"
+  fi
+  if [ "${_ONBOARDING}" = "unknown" ]; then
+    echo "[hivemind] aviso: estado de onboarding indisponível — usando a heurística por contagem de projetos." >&2
+    _ONBOARDING="legacy"
+  fi
+  return 0
+}
+
+# _is_first_timer: 0 = route to `default` + ENGRAM_STARTUP=1, 1 = normal flow.
+# Requires _SLUGS_RAW already populated by a SUCCESSFUL _list_slugs (the
+# registry-unreachable abort stays the caller's job and happens first).
+#   pending   → first-timer, regardless of how many projects exist
+#   completed → never a first-timer, even with zero non-default projects
+#   legacy    → the pre-onboarding heuristic: no project except `default`
+_is_first_timer() {
+  _onboarding_state
+  case "${_ONBOARDING}" in
+    pending)   return 0 ;;
+    completed) return 1 ;;
+    *)         [ -z "$(_nondefault_slugs_raw)" ] ;;
+  esac
+}
+
 # NOTE (P4 — impl 989cb79b): the double-access slug-lock (formerly "Fase 7 /
 # DR-7.A": _fetch_lock_table + _lock_state_for_slug + a pre-open refuse in
 # cmd_open) was REMOVED here. It was a Claude-Code-harness-only lock that
@@ -1511,16 +1599,18 @@ _pick_project() {
 }
 
 # _bootstrap_first_slug (the bare bash "type your first project's name" flow)
-# was REMOVED here (Phase 2, H2/2.2) — a first-timer (owner has no project
-# except `default`) no longer gets a client-side create prompt. Instead
+# was REMOVED here (Phase 2, H2/2.2) — a first-timer (onboarding pending per
+# _is_first_timer; project count only as the legacy fallback) no longer gets
+# a client-side create prompt. Instead
 # cmd_open routes to `default` + `ENGRAM_STARTUP=1` (below), and the AGENT
 # runs the birth conversation and creates the first real project itself.
 #
 # ARCHITECTURAL NOTE (still true, ownership moved): creating a slug is a
-# MUTATION. The birth flow's create call MUST converge on the SAME
-# `fos_registry(action:upsert)` shape this function used to send — not a
-# second, divergent create path. If the Project Hub ever grows a create
-# button, it too must converge on that same call.
+# MUTATION. The birth flow's create call MUST converge on the engram's ONE
+# create rule (RegistryService — fos_registry(action:create) / POST
+# /v1/registry, impl 4e978e9c Phase 1: create-only + max_projects on every
+# path) — not a second, divergent create path. The web apps' create buttons
+# already converge on that same rule.
 
 # _seed_engram_mcp_config: re-assert mcpServers.engram in
 # $HIVEMIND_HOME/.claude/.claude.json at OPEN time (papercut d,
@@ -1841,22 +1931,26 @@ _preview_target_port() {
   _allocate_target_port
 }
 
-# cmd_open: start proxy + exec claude.
-# $1 = slug (optional); remaining $@ passed to claude.
-cmd_open() {
+# _resolve_project_slug: resolve the slug cmd_open opens and set _RESOLVED_SLUG
+# (exporting ENGRAM_STARTUP=1 on the startup route). Extracted from cmd_open
+# (impl 4e978e9c P3 fix-loop) so the routing is unit-testable; it calls
+# `exit` on the same abort paths cmd_open always had. $1 = typed slug or "".
+# The tty test goes through _is_interactive so tests can shadow it.
+_is_interactive() { [ -t 0 ] && [ -t 1 ]; }
+
+# _slug_in_registry: 0 when $1 is a row of _SLUGS_RAW (set by a successful
+# _list_slugs — active rows only, `default` included).
+_slug_in_registry() {
+  local _s _n
+  while IFS=$'\t' read -r _s _n; do
+    [ -n "${_s}" ] && [ "${_s}" = "$1" ] && return 0
+  done <<< "${_SLUGS_RAW}"
+  return 1
+}
+
+_resolve_project_slug() {
   local _slug="${1:-}"
-  if [ $# -gt 0 ]; then shift; fi
-
-  if ! _has_cert; then
-    _setup_mode
-  else
-    _brand_header
-  fi
-
-  _maybe_auto_update
-  _start_proxy
-  _maybe_surface_install_candidates
-
+  _RESOLVED_SLUG=""
   # ── Resolve the project slug (F2.2 / F2.3 / F3, Phase 2 H1/H2) ───────────
   # The proxy is up now, so the owner-scoped registry is reachable for the
   # picker/startup routing. Order: explicit arg > interactive selection/
@@ -1864,39 +1958,59 @@ cmd_open() {
   # founder-accepted fail-closed): silently opening a wrong slug is worse
   # than a clear abort.
   #
-  # H1/2.1 — `default` is now ALWAYS a registry row (Phase 3 seed +
-  # backfill), so a bare `-z "${_SLUGS_RAW}"` emptiness test would never fire
-  # again. "This owner has no project yet" now means "no row except
-  # `default`" — _nondefault_slugs_raw strips that row before the test.
+  # FIRST-TIMER = the per-owner ONBOARDING FIELD, not project count (impl
+  # 4e978e9c P3-1 — _is_first_timer). Projects can now be created from the
+  # web, so "no project except `default`" no longer means "never onboarded":
+  #   pending   → `default` + ENGRAM_STARTUP=1 even with web-created projects
+  #   completed → normal flow even with ZERO non-default projects (opens
+  #               `default` directly, no startup, no single-row picker)
+  #   legacy    → older engram / unreachable onboarding store: the previous
+  #               heuristic (no row except `default` → startup). Always bounded,
+  #               never blocks the launch; the served boot re-checks the
+  #               skeleton's onboarding_completed in every vessel (P4-2).
+  # `default` is ALWAYS a registry row (Phase 3 seed + backfill), which is why
+  # the legacy heuristic tests _nondefault_slugs_raw, not bare emptiness.
   #
-  # H2/2.2 — a first-timer (no project except `default`) no longer gets the
-  # old client-side bootstrap prompt. Instead the session opens on `default`
-  # itself (the session ALWAYS has a slug — `default` dissolves the
-  # slug-less case) and ENGRAM_STARTUP=1 is exported so the agent presents
-  # the startup contract instead of the normal boot; the agent runs the
-  # birth conversation and creates the first real project via the SAME
-  # fos_registry(action:upsert) shape the old bash bootstrap used to send.
-  local _project_slug=""
+  # H2/2.2 — a first-timer no longer gets a client-side bootstrap prompt. The
+  # session opens on `default` itself (the session ALWAYS has a slug —
+  # `default` dissolves the slug-less case) and ENGRAM_STARTUP=1 is exported
+  # so the agent presents the startup contract instead of the normal boot;
+  # the agent runs the birth conversation, adopts or creates the first real
+  # project (fos_registry(action:create)) and completes onboarding.
   if [ -n "${_slug}" ]; then
-    # Explicit arg — NEVER show the picker. If this owner is a first-timer,
-    # the typed arg is superseded by the startup route below: the agent, not
-    # this script, runs the birth conversation. Otherwise open the arg as-is
-    # (an unknown slug just degrades the session spine; it is never
-    # auto-created — F2.1).
-    _project_slug="${_slug}"
-    if [ -t 0 ] && [ -t 1 ] && _list_slugs && [ -z "$(_nondefault_slugs_raw)" ]; then
-      _project_slug="default"
-      export ENGRAM_STARTUP=1
+    # Explicit arg — NEVER show the picker. Open the arg as-is (an unknown
+    # slug just degrades the session spine; it is never auto-created — F2.1),
+    # with ONE first-timer exception:
+    #   - onboarding `pending` + typed slug that EXISTS in this owner's
+    #     registry → honoured: a typed work session is never hijacked
+    #     silently (plan rule P4-2 — move to `default` only with the user's
+    #     OK). One stderr notice points at the no-arg launch; the served boot
+    #     (P4-2) makes the in-session offer.
+    #   - any other first-timer (typed slug that does NOT exist, or the
+    #     `legacy` heuristic) → startup route (`default` + ENGRAM_STARTUP=1),
+    #     unchanged from before: the agent runs the birth conversation.
+    _RESOLVED_SLUG="${_slug}"
+    if _is_interactive && _list_slugs && _is_first_timer; then
+      if [ "${_ONBOARDING:-}" = "pending" ] && _slug_in_registry "${_slug}"; then
+        echo "[hivemind] seu onboarding ainda está pendente — rode \`hivemind\` sem argumentos para concluí-lo." >&2
+      else
+        _RESOLVED_SLUG="default"
+        export ENGRAM_STARTUP=1
+      fi
     fi
-  elif [ -t 0 ] && [ -t 1 ]; then
+  elif _is_interactive; then
     # No arg + interactive terminal: select an existing project, or route a
     # first-timer to the startup path.
     if _list_slugs; then
-      if [ -z "$(_nondefault_slugs_raw)" ]; then
-        # No row except (or including) `default` → first-timer → startup
-        # path (H2/2.2), never the old client-side bootstrap.
-        _project_slug="default"
+      if _is_first_timer; then
+        # Onboarding pending (or, legacy only: no row except `default`) →
+        # startup path (H2/2.2), never the old client-side bootstrap.
+        _RESOLVED_SLUG="default"
         export ENGRAM_STARTUP=1
+      elif [ -z "$(_nondefault_slugs_raw)" ]; then
+        # Onboarded owner with no project besides `default` (e.g. archived
+        # them all) → open the home directly. NO startup: onboarding is done.
+        _RESOLVED_SLUG="default"
       else
         # count>0 non-default rows — normal interactive selection (F3.1).
         # `default` itself is still a selectable row here — a legitimate
@@ -1910,7 +2024,7 @@ cmd_open() {
           echo "Erro: falha ao selecionar o projeto." >&2
           exit 1
         fi
-        _project_slug="${_PICKED_SLUG}"
+        _RESOLVED_SLUG="${_PICKED_SLUG}"
       fi
     else
       # Registry UNREACHABLE — distinct from empty (F3.1). Do NOT guess or
@@ -1927,6 +2041,26 @@ cmd_open() {
     echo "      Rode 'hivemind <slug>' explicitamente em contexto não-interativo." >&2
     exit 1
   fi
+}
+
+# cmd_open: start proxy + exec claude.
+# $1 = slug (optional); remaining $@ passed to claude.
+cmd_open() {
+  local _slug="${1:-}"
+  if [ $# -gt 0 ]; then shift; fi
+
+  if ! _has_cert; then
+    _setup_mode
+  else
+    _brand_header
+  fi
+
+  _maybe_auto_update
+  _start_proxy
+  _maybe_surface_install_candidates
+
+  _resolve_project_slug "${_slug}"
+  local _project_slug="${_RESOLVED_SLUG}"
 
   if [ -z "${_project_slug}" ]; then
     echo "Erro: nenhum projeto resolvido — encerrando." >&2
