@@ -828,3 +828,255 @@ _seed_engram_mcp_config
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
   expect(config.mcpServers.engram).toEqual({ type: 'http', url: 'https://127.0.0.1:7779/v1/mcp' });
 });
+
+// ── P3-1 (impl 4e978e9c): first-timer from the onboarding field ─────────────
+//
+// _mcp_call is shadowed AFTER sourcing (a later function definition wins), so
+// no case talks to a proxy or an engram. Each stub logs one line per call to
+// $HOME/calls so the retry-once contract is measured, not assumed. The
+// transport-level cases instead shadow `curl` and keep the REAL _mcp_call, so
+// the SSE `data:` extraction is exercised too.
+
+// Envelopes exactly as the engram emits them (McpService handler: content[0]
+// .text = JSON.stringify(result); SDK 1.29 unknown tool → isError result).
+const ENV_COMPLETED = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ onboarding_completed: true, completed_at: '2026-09-01T00:00:00Z' }) }] } });
+const ENV_PENDING = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ onboarding_completed: false, completed_at: null }) }] } });
+const ENV_NULL = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ onboarding_completed: null, completed_at: null }) }] } });
+const ENV_NOT_FOUND = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: 'MCP error -32602: Tool fos_onboarding not found' }], isError: true } });
+const ENV_NOT_FOUND_RPC = JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32602, message: 'MCP error -32602: Tool fos_onboarding not found' } });
+const ENV_TOOL_ERROR = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'role_insufficient' }) }], isError: true } });
+
+// Single-quoted bash literal of a JSON string (no single quotes in the fixtures).
+const q = (s: string) => `'${s}'`;
+
+// Registry rows: `default` only, vs `default` + a web-created project.
+const ONLY_DEFAULT = `_SLUGS_RAW=$'default\\tdefault'`;
+const WITH_PROJECTS = `_SLUGS_RAW=$'default\\tdefault\\nweb-proj\\tWeb Project'`;
+
+// Stub that answers the Nth call with the Nth envelope (last one repeats).
+function stubSeq(...envs: string[]): string {
+  const arms = envs.map((e, i) => `    ${i + 1}) printf '%s' ${q(e)} ;;`).join('\n');
+  return `
+export FOS_API_KEY=test-key
+_mcp_call() {
+  echo "$1" >> "\${HOME}/calls"
+  local n; n="$(wc -l < "\${HOME}/calls")"
+  case "$n" in
+${arms}
+    *) printf '%s' ${q(envs[envs.length - 1])} ;;
+  esac
+}
+_calls() { [ -f "\${HOME}/calls" ] && wc -l < "\${HOME}/calls" | tr -d ' ' || echo 0; }
+_ft() { if _is_first_timer 2>"\${HOME}/stderr"; then echo startup; else echo normal; fi; }
+`;
+}
+
+test('_onboarding_probe classifies every engram answer (completed/pending/legacy x2/unknown x3)', () => {
+  const out = sh('onb-probe-classify', `
+export FOS_API_KEY=test-key
+_probe_with() { _mcp_call() { printf '%s' "$_ENV"; }; _ENV="$1" _onboarding_probe; }
+_assert completed  "$(_probe_with ${q(ENV_COMPLETED)})" completed
+_assert pending    "$(_probe_with ${q(ENV_PENDING)})" pending
+_assert nf-result  "$(_probe_with ${q(ENV_NOT_FOUND)})" legacy
+_assert nf-rpc     "$(_probe_with ${q(ENV_NOT_FOUND_RPC)})" legacy
+_assert null-field "$(_probe_with ${q(ENV_NULL)})" unknown
+_assert tool-error "$(_probe_with ${q(ENV_TOOL_ERROR)})" unknown
+_assert garbage    "$(_probe_with 'not json')" unknown
+_assert empty      "$(_probe_with '')" unknown
+unset FOS_API_KEY
+_assert no-key     "$(_onboarding_probe)" unknown
+`);
+  expect(out).not.toContain('not ok');
+  expect(out.match(/^ok /gm)?.length).toBe(9);
+});
+
+test('pending owner WITH web-created projects → startup (the bug this phase fixes)', () => {
+  const out = sh('onb-pending-with-projects', `${stubSeq(ENV_PENDING)}
+${WITH_PROJECTS}
+_assert route "$(_ft)" startup
+_assert calls "$(_calls)" 1
+`);
+  expect(out).not.toContain('not ok');
+});
+
+test('completed owner with ZERO non-default projects → normal flow, no startup', () => {
+  const out = sh('onb-completed-zero', `${stubSeq(ENV_COMPLETED)}
+${ONLY_DEFAULT}
+_assert route "$(_ft)" normal
+_assert calls "$(_calls)" 1
+_assert quiet "$(cat "\${HOME}/stderr")" ""
+`);
+  expect(out).not.toContain('not ok');
+});
+
+test('older engram (tool-not-found) → legacy heuristic, NO retry, NO notice — both directions', () => {
+  const out = sh('onb-legacy-tool-not-found', `${stubSeq(ENV_NOT_FOUND)}
+${ONLY_DEFAULT}
+_assert route-empty "$(_ft)" startup
+_assert calls-empty "$(_calls)" 1
+_assert quiet "$(cat "\${HOME}/stderr")" ""
+${WITH_PROJECTS}
+_assert route-projects "$(_ft)" normal
+_assert calls-total "$(_calls)" 2
+`);
+  expect(out).not.toContain('not ok');
+});
+
+test('FAILURE PATH: onboarding call fails twice → retried once, degrades to legacy with a one-line notice, never blocks', () => {
+  const out = sh('onb-unknown-degrade', `${stubSeq('')}
+${WITH_PROJECTS}
+_assert route "$(_ft)" normal
+_assert calls "$(_calls)" 2
+_assert notice-lines "$(wc -l < "\${HOME}/stderr" | tr -d ' ')" 1
+_assert notice-text "$(grep -c 'heurística' "\${HOME}/stderr")" 1
+: > "\${HOME}/calls"
+${ONLY_DEFAULT}
+_assert route-empty "$(_ft)" startup
+`);
+  expect(out).not.toContain('not ok');
+});
+
+test('onboarding_completed:null (store unreadable) → retry; a good second answer wins', () => {
+  const out = sh('onb-null-then-pending', `${stubSeq(ENV_NULL, ENV_PENDING)}
+${WITH_PROJECTS}
+_assert route "$(_ft)" startup
+_assert calls "$(_calls)" 2
+_assert quiet "$(cat "\${HOME}/stderr")" ""
+`);
+  expect(out).not.toContain('not ok');
+});
+
+test('FAILURE PATH (real _mcp_call): proxy unreachable (curl fails) → legacy + notice, returns promptly', () => {
+  const out = sh('onb-curl-down', `
+export FOS_API_KEY=test-key
+curl() { echo "$*" >> "\${HOME}/curl-calls"; return 7; }
+${ONLY_DEFAULT}
+if _is_first_timer 2>"\${HOME}/stderr"; then r=startup; else r=normal; fi
+_assert route "$r" startup
+_assert curl-calls "$(wc -l < "\${HOME}/curl-calls" | tr -d ' ')" 2
+_assert tool-name "$(grep -c '"name":"fos_onboarding"' "\${HOME}/curl-calls")" 2
+_assert notice "$(grep -c 'heurística' "\${HOME}/stderr")" 1
+`);
+  expect(out).not.toContain('not ok');
+});
+
+test('real _mcp_call SSE extraction: tool-not-found over the wire → legacy', () => {
+  const out = sh('onb-curl-sse-not-found', `
+export FOS_API_KEY=test-key
+curl() { printf 'event: message\\ndata: %s\\n\\n' ${q(ENV_NOT_FOUND)}; }
+_assert state "$(_onboarding_probe)" legacy
+curl() { printf 'event: message\\ndata: %s\\n\\n' ${q(ENV_PENDING)}; }
+_assert state-pending "$(_onboarding_probe)" pending
+`);
+  expect(out).not.toContain('not ok');
+});
+
+// ── P3 fix-loop (impl 4e978e9c): cmd_open slug routing (_resolve_project_slug) ──
+//
+// cmd_open's slug resolution lives in _resolve_project_slug so it can run here
+// without a proxy or an exec. _mcp_call is shadowed per tool name (registry vs
+// onboarding), _is_interactive is shadowed to "a tty", and _pick_project is
+// shadowed to a recorder — no network, no picker, no claude.
+const regEnv = (...slugs: string[]) =>
+  JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ items: slugs.map((s) => ({ slug: s, name: s, status: 'active' })), count: slugs.length }) }] } });
+
+function routeStub(onboardingEnv: string, registryEnv: string): string {
+  return `
+export FOS_API_KEY=test-key
+unset ENGRAM_STARTUP
+_mcp_call() {
+  case "$1" in
+    fos_registry)   printf '%s' ${q(registryEnv)} ;;
+    fos_onboarding) printf '%s' ${q(onboardingEnv)} ;;
+    *) return 1 ;;
+  esac
+}
+_is_interactive() { return 0; }
+_pick_project() { echo picked >> "\${HOME}/picker"; _PICKED_SLUG="picked-proj"; return 0; }
+# _route <typed-slug>: runs the resolver in THIS shell (it sets globals) and
+# records slug / startup flag / stderr lines / picker use.
+_route() {
+  unset ENGRAM_STARTUP
+  : > "\${HOME}/stderr"; rm -f "\${HOME}/picker"
+  _resolve_project_slug "$1" 2>"\${HOME}/stderr"
+  R_SLUG="\${_RESOLVED_SLUG}"
+  R_STARTUP="\${ENGRAM_STARTUP:-}"
+  R_ERR_LINES="$(grep -c . "\${HOME}/stderr" || true)"
+  R_PICKED="$([ -f "\${HOME}/picker" ] && echo yes || echo no)"
+}
+`;
+}
+
+test('route (a): onboarding pending + NO slug → default + ENGRAM_STARTUP=1', () => {
+  const out = sh('route-a-pending-noslug', `${routeStub(ENV_PENDING, regEnv('default', 'web-proj'))}
+_route ""
+_assert slug "$R_SLUG" default
+_assert startup "$R_STARTUP" 1
+_assert picker "$R_PICKED" no
+_assert quiet "$R_ERR_LINES" 0
+`);
+  expect(out).not.toContain('not ok');
+});
+
+test('route (b): onboarding pending + typed EXISTING slug → that slug, NO startup, exactly one pt-br notice', () => {
+  const out = sh('route-b-pending-typed-existing', `${routeStub(ENV_PENDING, regEnv('default', 'web-proj'))}
+_route web-proj
+_assert slug "$R_SLUG" web-proj
+_assert startup "$R_STARTUP" ""
+_assert picker "$R_PICKED" no
+_assert notice-lines "$R_ERR_LINES" 1
+_assert notice-text "$(grep -c 'onboarding ainda está pendente' "\${HOME}/stderr")" 1
+_route default
+_assert slug-default "$R_SLUG" default
+_assert startup-default "$R_STARTUP" ""
+_assert notice-default "$R_ERR_LINES" 1
+`);
+  expect(out).not.toContain('not ok');
+});
+
+test('route: onboarding pending + typed NON-EXISTENT slug → unchanged: default + ENGRAM_STARTUP=1, no notice', () => {
+  const out = sh('route-pending-typed-missing', `${routeStub(ENV_PENDING, regEnv('default', 'web-proj'))}
+_route no-such-proj
+_assert slug "$R_SLUG" default
+_assert startup "$R_STARTUP" 1
+_assert quiet "$R_ERR_LINES" 0
+`);
+  expect(out).not.toContain('not ok');
+});
+
+test('route (c): onboarding completed + zero non-default projects + NO slug → default, no startup, no picker', () => {
+  const out = sh('route-c-completed-zero', `${routeStub(ENV_COMPLETED, regEnv('default'))}
+_route ""
+_assert slug "$R_SLUG" default
+_assert startup "$R_STARTUP" ""
+_assert picker "$R_PICKED" no
+_assert quiet "$R_ERR_LINES" 0
+_route anything
+_assert typed-completed "$R_SLUG" anything
+_assert typed-completed-startup "$R_STARTUP" ""
+`);
+  expect(out).not.toContain('not ok');
+});
+
+test('route (d): legacy engram (tool-not-found) → pre-onboarding heuristic unchanged', () => {
+  const out = sh('route-d-legacy', `${routeStub(ENV_NOT_FOUND, regEnv('default'))}
+_route ""
+_assert only-default-slug "$R_SLUG" default
+_assert only-default-startup "$R_STARTUP" 1
+_assert only-default-quiet "$R_ERR_LINES" 0
+_route default
+_assert typed-default-slug "$R_SLUG" default
+_assert typed-default-startup "$R_STARTUP" 1
+_assert typed-default-quiet "$R_ERR_LINES" 0
+${routeStub(ENV_NOT_FOUND, regEnv('default', 'web-proj'))}
+_route ""
+_assert projects-slug "$R_SLUG" picked-proj
+_assert projects-startup "$R_STARTUP" ""
+_assert projects-picker "$R_PICKED" yes
+_route web-proj
+_assert typed-slug "$R_SLUG" web-proj
+_assert typed-startup "$R_STARTUP" ""
+_assert typed-quiet "$R_ERR_LINES" 0
+`);
+  expect(out).not.toContain('not ok');
+});
