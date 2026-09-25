@@ -149,6 +149,108 @@ _assert setup-pidfile-cleared "\$([ -f "\${SETUP_PID_FILE}" ] && echo present ||
   expect(out).not.toContain('not ok');
 });
 
+// ── F2 R2 (security impl 9658277f): the one-shot setup nonce ─────────────────
+// _setup_mode must mint a fresh 64-hex nonce, hand it to the setup daemon via
+// the process ENVIRONMENT (not argv, not disk), put the SAME value in the
+// browser URL, and never write it to RUNTIME_LOG. `bun`, `curl` and
+// `xdg-open` are shadowed with shell functions: nothing binds a port, nothing
+// touches the network, no browser opens.
+test('_setup_mode mints a one-shot nonce: daemon env + browser URL carry the same 64-hex value; never argv, never the log', () => {
+  const out = sh('setup-nonce', `
+mkdir -p "\$(dirname "\${RUNTIME_BIN}")"
+printf '// stand-in\\n' > "\${RUNTIME_BIN}"
+_CASE="\$HOME"
+# Stand-in daemon: records its REAL exported environment (via /usr/bin/env,
+# so a non-exported shell variable would NOT show up) and its argv.
+bun() {
+  /usr/bin/env | sed -n 's/^HIVEMIND_SETUP_NONCE=//p' > "\${_CASE}/daemon-nonce"
+  printf '%s\\n' "\$*" > "\${_CASE}/daemon-argv"
+  exec sleep 20
+}
+curl() {
+  case "\$*" in
+    *setup/status*) echo '{"done":true}' ;;
+    *) return 0 ;;
+  esac
+}
+xdg-open() { printf '%s' "\$1" > "\${_CASE}/opened-url"; }
+_reap_stale_runtime() { :; }
+_detect_unmapped_install_candidates() { :; }
+
+( _setup_mode ) > "\${_CASE}/setup-out.txt" 2>&1
+_rc=\$?
+for _i in 1 2 3 4 5 6 7 8 9 10; do [ -s "\${_CASE}/opened-url" ] && break; sleep 0.2; done
+
+_nonce="\$(cat "\${_CASE}/daemon-nonce")"
+_assert setup-exit-0 "\${_rc}" 0
+_assert nonce-is-64-hex "\$(printf '%s' "\${_nonce}" | grep -Ec '^[0-9a-f]{64}\$')" 1
+_assert url-carries-same-nonce "\$(cat "\${_CASE}/opened-url")" "http://localhost:\${RUNTIME_PORT}/setup?nonce=\${_nonce}"
+_assert nonce-not-in-argv "\$(grep -qs "\${_nonce}" "\${_CASE}/daemon-argv" && echo leaked || echo clean)" clean
+_assert nonce-not-in-runtime-log "\$(grep -qs "\${_nonce}" "\${RUNTIME_LOG}" && echo leaked || echo clean)" clean
+_assert nonce-not-left-in-caller-env "\${HIVEMIND_SETUP_NONCE:-unset}" unset
+
+# A second run mints a DIFFERENT nonce (one-shot, not a fixed per-install secret).
+rm -f "\${_CASE}/opened-url"
+( _setup_mode ) > /dev/null 2>&1
+for _i in 1 2 3 4 5 6 7 8 9 10; do [ -s "\${_CASE}/opened-url" ] && break; sleep 0.2; done
+_nonce2="\$(cat "\${_CASE}/daemon-nonce")"
+_assert second-run-fresh-nonce "\$([ -n "\${_nonce2}" ] && [ "\${_nonce2}" != "\${_nonce}" ] && echo fresh || echo reused)" fresh
+`);
+  expect(out).toContain('ok setup-exit-0');
+  expect(out).toContain('ok nonce-is-64-hex');
+  expect(out).toContain('ok url-carries-same-nonce');
+  expect(out).toContain('ok nonce-not-in-argv');
+  expect(out).toContain('ok nonce-not-in-runtime-log');
+  expect(out).toContain('ok nonce-not-left-in-caller-env');
+  expect(out).toContain('ok second-run-fresh-nonce');
+  expect(out).not.toContain('not ok');
+}, 30_000);
+
+// ── Round 3: a setup daemon that died must fail fast, not time out ───────────
+// EADDRINUSE shape: our --setup-only daemon exits at once because a FOREIGN
+// process holds RUNTIME_PORT — and that foreign process may even answer
+// /healthz. Before the fix, _setup_mode took the foreign healthz as ours and
+// then polled /setup/status for the full 5 minutes. `timeout` bounds each run
+// so the RED version shows up as rc 124 instead of hanging the suite.
+test('_setup_mode fails fast (exit 1, clear port-in-use message) when its setup daemon dies — at the healthz wait AND during the status poll', () => {
+  const out = sh('setup-daemon-died', `
+mkdir -p "\$(dirname "\${RUNTIME_BIN}")"
+printf '// stand-in\\n' > "\${RUNTIME_BIN}"
+# bin/hivemind runs under set -e; a case that EXPECTS exit 1 must not abort here.
+set +e
+cat > "\$HOME/run.sh" <<'CASE'
+source "\$1"
+_reap_stale_runtime() { :; }
+_detect_unmapped_install_candidates() { :; }
+xdg-open() { :; }
+# A foreign process answers healthz; /setup/status never reports done.
+curl() { case "\$*" in *setup/status*) echo '{"done":false}' ;; *) return 0 ;; esac; }
+case "\$2" in
+  dies-at-once)  bun() { exit 1; } ;;
+  dies-later)    bun() { exec sleep 2; } ;;
+esac
+_setup_mode
+CASE
+for _mode in dies-at-once dies-later; do
+  _start=\$(date +%s)
+  timeout 20 bash "\$HOME/run.sh" "\$HOME/../lib.sh" "\${_mode}" > "\$HOME/\${_mode}.out" 2>&1
+  _rc=\$?
+  _took=\$(( \$(date +%s) - _start ))
+  _assert "\${_mode}-exit-1" "\${_rc}" 1
+  _assert "\${_mode}-fast" "\$([ "\${_took}" -le 10 ] && echo fast || echo slow)" fast
+  _assert "\${_mode}-message" "\$(grep -q 'already in use' "\$HOME/\${_mode}.out" && echo yes || echo no)" yes
+  _assert "\${_mode}-pidfile-cleared" "\$([ -f "\${SETUP_PID_FILE}" ] && echo present || echo absent)" absent
+done
+`);
+  for (const m of ['dies-at-once', 'dies-later']) {
+    expect(out).toContain(`ok ${m}-exit-1`);
+    expect(out).toContain(`ok ${m}-fast`);
+    expect(out).toContain(`ok ${m}-message`);
+    expect(out).toContain(`ok ${m}-pidfile-cleared`);
+  }
+  expect(out).not.toContain('not ok');
+}, 60_000);
+
 test('_reap_stale_runtime reaps an orphan runtime that NO pidfile records', () => {
   // A daemon whose pidfile was never written (_spawn_runtime writes it only
   // after healthz answers) or was already removed is invisible to both the

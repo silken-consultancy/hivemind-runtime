@@ -21,7 +21,8 @@
 // used for all subsequent mTLS connections, and the SAME api_key is the x-fos-
 // key (Path B) for the MCP.
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync, renameSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -65,8 +66,24 @@ const TENANT_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 // silently misses the bare-CN form (caught in review; a multi-RDN fixture had
 // hidden it), and matching without any boundary would happily read the `CN` out
 // of an unrelated RDN value.
+// childEnv — the environment for every child this setup path spawns.
+// Bun.spawnSync WITHOUT an explicit `env` hands the child the env snapshot this
+// process STARTED with, not the live process.env (measured, Bun 1.4.0): the
+// `delete process.env.HIVEMIND_SETUP_NONCE` in server.ts alone did NOT keep
+// the nonce out of openssl's environment. So every spawn here passes `env`
+// explicitly, built from the live process.env, and strips the nonce key again
+// in case a caller never deleted it.
+function childEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && k !== 'HIVEMIND_SETUP_NONCE') out[k] = v;
+  }
+  return out;
+}
+
 function certSubjectCN(certPem: string): string | undefined {
   const result = Bun.spawnSync(['openssl', 'x509', '-noout', '-subject'], {
+    env: childEnv(),
     stdin: Buffer.from(certPem),
     stdout: 'pipe',
     stderr: 'ignore',
@@ -106,16 +123,93 @@ function resolveTenant(responseTenant: string | undefined, certPem: string): str
   return undefined;
 }
 
-export const setupRouter = new Hono();
+// ── Setup nonce (F2, security impl 9658277f, R2) ─────────────────────────────
+//
+// The origin guard (lib/request-guard.ts) stops web pages; it cannot stop a
+// local process that simply omits Origin. So /enroll also requires a one-shot
+// nonce that only the launcher knows: bin/hivemind's _setup_mode mints it
+// (openssl rand -hex 32), hands it to this process via HIVEMIND_SETUP_NONCE
+// (process env only, never on disk) and appends it to the browser URL it
+// opens (/setup?nonce=<hex>). The page echoes it back as `x-setup-nonce`.
+// A successful enrollment burns it; the nonce is never logged.
+const NONCE_RE = /^[0-9a-f]{64}$/;
 
-// In-memory flag: true once enrollment completes in this server lifetime.
-// Used by GET /setup/status for the CLI to poll.
-let enrollmentDone = false;
+// Constant-time compare that is length-agnostic (hash both sides first —
+// timingSafeEqual itself throws on a length mismatch).
+function nonceMatches(expected: string, presented: string): boolean {
+  const a = createHash('sha256').update(expected).digest();
+  const b = createHash('sha256').update(presented).digest();
+  return timingSafeEqual(a, b);
+}
+
+// createSetupRouter — one instance per setup-mode daemon (server.ts mounts it
+// ONLY under --setup-only). State is per-instance, in memory:
+//  - nonce:          the launcher's one-shot secret; null once burned, or if
+//                    the daemon was started without one (fail closed: every
+//                    /enroll is then 403).
+//  - enrolling:      an enroll is in flight — a concurrent second one is 409
+//                    (both could otherwise pass the nonce check).
+//  - enrollmentDone: true once enrollment succeeded — GET /status (polled by
+//                    bin/hivemind) reports it, and any later /enroll is 409.
+export function createSetupRouter(opts: { nonce?: string | null } = {}): Hono {
+  const router = new Hono();
+  let nonce: string | null = opts.nonce && opts.nonce.length > 0 ? opts.nonce : null;
+  let enrolling = false;
+  let enrollmentDone = false;
+
+  router.use('*', async (c, next) => {
+    await next();
+    // The nonce sits in this page's URL; keep it out of any Referer.
+    c.header('Referrer-Policy', 'no-referrer');
+  });
+
+  router.get('/', (c) => {
+    // Embed ONLY a well-formed nonce from the query — never the server's own
+    // (the page must be opened via the launcher's URL), and never arbitrary
+    // query text (no script injection).
+    const q = c.req.query('nonce') ?? '';
+    return c.html(renderSetupPage(NONCE_RE.test(q) ? q : ''));
+  });
+
+  router.post('/enroll', async (c) => {
+    if (enrollmentDone) {
+      return c.json({ ok: false, error: 'already_enrolled', message: 'A inscrição já foi concluída nesta sessão de configuração.' }, 409);
+    }
+    const presented = c.req.header('x-setup-nonce') ?? '';
+    if (nonce === null || !nonceMatches(nonce, presented)) {
+      return c.json({ ok: false, error: 'invalid_setup_nonce', message: 'Sessão de configuração inválida ou expirada. Reabra o link completo (com ?nonce=...) exibido no terminal onde você rodou `hivemind` — ou rode `hivemind` de novo para gerar um novo.' }, 403);
+    }
+    if (enrolling) {
+      return c.json({ ok: false, error: 'enroll_in_progress', message: 'Uma inscrição já está em andamento.' }, 409);
+    }
+    enrolling = true;
+    try {
+      const res = await handleEnroll(c);
+      if (res.status === 200) {
+        // Burn: the nonce is single-use; a failed attempt (bad key, CA down)
+        // leaves it intact so the user can retry from the same page.
+        nonce = null;
+        enrollmentDone = true;
+      }
+      return res;
+    } finally {
+      enrolling = false;
+    }
+  });
+
+  // ── GET /setup/status — poll endpoint for CLI ────────────────────────────────
+  // The CLI polls this until { done: true } before shutting down the setup server.
+  router.get('/status', (c) => c.json({ done: enrollmentDone }));
+
+  return router;
+}
 
 // ── GET /setup — HTML enrollment form ─────────────────────────────────────────
 
-setupRouter.get('/', (c) => {
-  const html = `<!DOCTYPE html>
+function renderSetupPage(pageNonce: string): string {
+  // pageNonce is '' or exactly 64 lowercase hex chars (checked by the caller),
+  // so JSON.stringify is enough to embed it safely in the inline script.
+  return `<!DOCTYPE html>
 <html lang="pt-br">
 <head>
   <meta charset="UTF-8">
@@ -151,6 +245,17 @@ setupRouter.get('/', (c) => {
     <div id="log"></div>
   </div>
   <script>
+    // The nonce arrives in the URL (?nonce=), is kept in THIS TAB's
+    // sessionStorage (per-tab, per-origin, gone when the tab closes) so an F5
+    // after the address bar is cleaned still works, and is removed on success.
+    const NONCE_KEY = 'hivemind-setup-nonce';
+    let SETUP_NONCE = ${JSON.stringify(pageNonce)};
+    try {
+      if (SETUP_NONCE) sessionStorage.setItem(NONCE_KEY, SETUP_NONCE);
+      else SETUP_NONCE = sessionStorage.getItem(NONCE_KEY) || '';
+    } catch (e) {}
+    // Drop the nonce from the address bar / history once it is in memory.
+    try { history.replaceState(null, '', location.pathname); } catch (e) {}
     async function enroll() {
       const apiKey = document.getElementById('apikey').value.trim();
       const log = document.getElementById('log');
@@ -162,11 +267,12 @@ setupRouter.get('/', (c) => {
       try {
         const res = await fetch('/setup/enroll', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'x-setup-nonce': SETUP_NONCE },
           body: JSON.stringify({ api_key: apiKey })
         });
         const data = await res.json();
         if (data.ok) {
+          try { sessionStorage.removeItem(NONCE_KEY); } catch (e) {}
           step('Par de chaves gerado (RSA 2048)', 'ok');
           step('CSR enviado para a CA', 'ok');
           step('Certificado recebido e salvo', 'ok');
@@ -194,8 +300,7 @@ setupRouter.get('/', (c) => {
   </script>
 </body>
 </html>`;
-  return c.html(html);
-});
+}
 
 // ── POST /setup/enroll — enrollment handler ────────────────────────────────────
 //
@@ -214,8 +319,11 @@ setupRouter.get('/', (c) => {
 //     user-scope MCP discovery (measured, CLI v2.1.207; ~/.claude/mcp.json and
 //     ~/.mcp.json are dead paths, never read — item 5.1/F1 fix)
 //  7. Return { ok: true, tenant }
+//
+// Reached only through createSetupRouter's /enroll wrapper (nonce checked,
+// single-flight, burn-on-success).
 
-setupRouter.post('/enroll', async (c) => {
+async function handleEnroll(c: Context): Promise<Response> {
   let body: { api_key?: string };
   try {
     body = await c.req.json();
@@ -273,6 +381,7 @@ setupRouter.post('/enroll', async (c) => {
       '-out', csrPath,
       '-subj', `/CN=${tempId}`,
     ], {
+      env: childEnv(),
       stdout: 'ignore',
       stderr: 'pipe',
     });
@@ -500,9 +609,8 @@ setupRouter.post('/enroll', async (c) => {
     // rather than trust the write option alone.
     chmodSync(claudeConfigPath, 0o600);
 
-    // Mark enrollment done for /setup/status poll.
-    enrollmentDone = true;
-
+    // enrollmentDone (for the /setup/status poll) is set by the wrapper in
+    // createSetupRouter on this 200.
     return c.json({ ok: true, tenant });
 
   } catch (err: unknown) {
@@ -511,11 +619,4 @@ setupRouter.post('/enroll', async (c) => {
     console.error('[setup/enroll] error:', msg);
     return c.json({ ok: false, message: `Erro na inscrição: ${msg.slice(0, 300)}` }, 500);
   }
-});
-
-// ── GET /setup/status — poll endpoint for CLI ──────────────────────────────────
-// The CLI polls this until { done: true } before shutting down the setup server.
-
-setupRouter.get('/status', (c) => {
-  return c.json({ done: enrollmentDone });
-});
+}

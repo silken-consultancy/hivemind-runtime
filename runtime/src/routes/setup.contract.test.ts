@@ -100,7 +100,24 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
 // Import AFTER the node:os mock + fetch mock are installed — setup.ts's
 // module-level `const ENDPOINT = process.env.HIVEMIND_ENDPOINT ?? ...` reads
 // the env var set above at import time.
-const { setupRouter } = await import('./setup.js');
+const { createSetupRouter } = await import('./setup.js');
+
+// R2 (F2): /enroll now requires the launcher's one-shot nonce and burns it on
+// success, so a single router instance accepts exactly ONE successful enroll.
+// The contract cases below each model an independent enrollment (several run
+// /enroll more than once to prove merge/idempotency of the WRITES), so this
+// shim hands every request a FRESH router minted with a known nonce and
+// presents that nonce — i.e. each call is one legit launcher session. The
+// nonce/burn behaviour itself is pinned by the dedicated R2 tests at the end
+// of this file, against a single shared router.
+const TEST_NONCE = 'c'.repeat(64);
+const setupRouter = {
+  request: (path: string, init: RequestInit = {}) =>
+    createSetupRouter({ nonce: TEST_NONCE }).request(path, {
+      ...init,
+      headers: { ...(init.headers as Record<string, string> | undefined), 'x-setup-nonce': TEST_NONCE },
+    }),
+};
 
 afterAll(() => {
   globalThis.fetch = originalFetch;
@@ -591,4 +608,160 @@ test('POST /enroll does not crash on an unparseable pre-existing .env (fail-open
   const data = (await res.json()) as { ok: boolean };
   expect(data.ok).toBe(true);
   expect(readFileSync(envPath, 'utf8')).toContain(`HIVEMIND_OWNER=${FAKE_TENANT}`);
+});
+
+// ── R2 (F2, security impl 9658277f): one-shot setup nonce ─────────────────────
+// These use ONE router instance (not the per-request shim above), because
+// the property under test is exactly the per-instance state: the nonce gate
+// and its burn-on-success.
+
+const R2_NONCE = 'd'.repeat(64);
+const r2Post = (router: ReturnType<typeof createSetupRouter>, headers: Record<string, string>) =>
+  router.request('/enroll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ api_key: API_KEY }),
+  });
+
+test('R2: POST /enroll WITHOUT the setup nonce is 403 and never reaches the CA', async () => {
+  const router = createSetupRouter({ nonce: R2_NONCE });
+  capturedUrl = undefined;
+  const res = await r2Post(router, {});
+  expect(res.status).toBe(403);
+  expect(((await res.json()) as { error?: string }).error).toBe('invalid_setup_nonce');
+  expect(capturedUrl).toBeUndefined();
+});
+
+test('R2: POST /enroll with a WRONG nonce (incl. a different length) is 403 and never reaches the CA', async () => {
+  const router = createSetupRouter({ nonce: R2_NONCE });
+  capturedUrl = undefined;
+  expect((await r2Post(router, { 'x-setup-nonce': 'e'.repeat(64) })).status).toBe(403);
+  expect((await r2Post(router, { 'x-setup-nonce': 'd' })).status).toBe(403);
+  expect(capturedUrl).toBeUndefined();
+});
+
+test('R2: a router created without a nonce fails closed — even an empty presented nonce is 403', async () => {
+  const router = createSetupRouter({});
+  capturedUrl = undefined;
+  expect((await r2Post(router, { 'x-setup-nonce': '' })).status).toBe(403);
+  expect(capturedUrl).toBeUndefined();
+});
+
+test('R2: the nonce is single-use — a second /enroll after a successful one is 409 already_enrolled, and never reaches the CA', async () => {
+  FAKE_TENANT = 'r2-burn-tenant';
+  const router = createSetupRouter({ nonce: R2_NONCE });
+  const first = await r2Post(router, { 'x-setup-nonce': R2_NONCE });
+  expect(first.status).toBe(200);
+  expect(await (await router.request('/status')).json()).toEqual({ done: true });
+
+  capturedUrl = undefined;
+  const second = await r2Post(router, { 'x-setup-nonce': R2_NONCE });
+  expect(second.status).toBe(409);
+  expect(((await second.json()) as { error?: string }).error).toBe('already_enrolled');
+  expect(capturedUrl).toBeUndefined();
+});
+
+test('R2: a FAILED enroll (CA rejects) does not burn the nonce — the user can retry from the same page', async () => {
+  const router = createSetupRouter({ nonce: R2_NONCE });
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('{"error":"bad key"}', { status: 401 })) as unknown as typeof fetch;
+  try {
+    const failed = await r2Post(router, { 'x-setup-nonce': R2_NONCE });
+    expect(failed.status).not.toBe(200);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+  expect(await (await router.request('/status')).json()).toEqual({ done: false });
+  FAKE_TENANT = 'r2-retry-tenant';
+  const retry = await r2Post(router, { 'x-setup-nonce': R2_NONCE });
+  expect(retry.status).toBe(200);
+});
+
+test('R2: GET / embeds a well-formed query nonce into the page fetch, and drops a malformed one', async () => {
+  const router = createSetupRouter({ nonce: R2_NONCE });
+  const good = await (await router.request(`/?nonce=${R2_NONCE}`)).text();
+  expect(good).toContain(`let SETUP_NONCE = "${R2_NONCE}";`);
+  expect(good).toContain("'x-setup-nonce': SETUP_NONCE");
+  const bad = await (await router.request('/?nonce=%22%3B%20alert(1)%3B%20%22')).text();
+  expect(bad).toContain('let SETUP_NONCE = "";');
+  expect(bad).not.toContain('alert(1)');
+  // Without a query nonce the page never falls back to the server's own.
+  const none = await (await router.request('/')).text();
+  expect(none).not.toContain(R2_NONCE);
+});
+
+// ── Round 3: page reload (F5) + the 403 message ───────────────────────────────
+
+test('round 3: the 403 for a missing/bad nonce tells the user to reopen the link printed in the terminal', async () => {
+  const router = createSetupRouter({ nonce: R2_NONCE });
+  const res = await r2Post(router, {});
+  expect(res.status).toBe(403);
+  const { message } = (await res.json()) as { message: string };
+  expect(message).toContain('terminal');
+  expect(message).toContain('?nonce=');
+});
+
+// Runs the page's real inline <script> against a minimal fake DOM, so the
+// first-load / F5 / success behaviour of the nonce is exercised as code, not
+// grepped as text. `storage` persists across "loads" like a tab's
+// sessionStorage does across a reload.
+function loadPage(html: string, storage: Map<string, string>, fetchImpl: (url: string, init: RequestInit) => Promise<Response>) {
+  const script = html.slice(html.indexOf('<script>') + '<script>'.length, html.indexOf('</script>'));
+  const replaced: string[] = [];
+  const el = () => ({ value: 'user-api-key-123456', disabled: false, innerHTML: '', className: '', textContent: '', appendChild() {} });
+  const nodes: Record<string, ReturnType<typeof el>> = { apikey: el(), log: el(), btn: el() };
+  const document = { getElementById: (id: string) => nodes[id], createElement: () => el() };
+  const history = { replaceState: (_a: unknown, _b: string, url: string) => { replaced.push(url); } };
+  const location = { pathname: '/setup' };
+  const sessionStorage = {
+    getItem: (k: string) => storage.get(k) ?? null,
+    setItem: (k: string, v: string) => { storage.set(k, v); },
+    removeItem: (k: string) => { storage.delete(k); },
+  };
+  const api = new Function('document', 'history', 'location', 'sessionStorage', 'fetch',
+    `${script}\nreturn { enroll, nonce: () => SETUP_NONCE };`,
+  )(document, history, location, sessionStorage, fetchImpl) as { enroll: () => Promise<void>; nonce: () => string };
+  return { ...api, replaced, nodes };
+}
+
+test('round 3: the page keeps the nonce in this tab\'s sessionStorage, so an F5 after the URL is cleaned still enrolls — and removes it on success', async () => {
+  FAKE_TENANT = 'r3-reload-tenant';
+  const router = createSetupRouter({ nonce: R2_NONCE });
+  const storage = new Map<string, string>();
+  const sent: string[] = [];
+  const pageFetch = async (url: string, init: RequestInit) => {
+    sent.push((init.headers as Record<string, string>)['x-setup-nonce']);
+    return router.request(url.replace(/^\/setup/, ''), init);
+  };
+
+  // First load, from the launcher's URL: nonce stored, address bar cleaned.
+  const first = loadPage(await (await router.request(`/?nonce=${R2_NONCE}`)).text(), storage, pageFetch);
+  expect(first.nonce()).toBe(R2_NONCE);
+  expect(first.replaced).toEqual(['/setup']);
+  expect(storage.get('hivemind-setup-nonce')).toBe(R2_NONCE);
+
+  // F5: the cleaned URL has no ?nonce= — the page recovers it from sessionStorage.
+  const reloaded = loadPage(await (await router.request('/')).text(), storage, pageFetch);
+  expect(reloaded.nonce()).toBe(R2_NONCE);
+  await reloaded.enroll();
+  expect(sent).toEqual([R2_NONCE]);
+  expect(await (await router.request('/status')).json()).toEqual({ done: true });
+  // Burned server-side AND forgotten client-side.
+  expect(storage.has('hivemind-setup-nonce')).toBe(false);
+});
+
+test('round 3: a fresh tab with no ?nonce= and nothing stored sends an empty nonce (→ 403 with the terminal hint)', async () => {
+  const router = createSetupRouter({ nonce: R2_NONCE });
+  const page = loadPage(await (await router.request('/')).text(), new Map(), async (url, init) => router.request(url.replace(/^\/setup/, ''), init));
+  expect(page.nonce()).toBe('');
+});
+
+test('round 3 edge: two CONCURRENT enrolls with the valid nonce → exactly one 200 and one 409', async () => {
+  FAKE_TENANT = 'r3-concurrent-tenant';
+  const router = createSetupRouter({ nonce: R2_NONCE });
+  const [a, b] = await Promise.all([
+    r2Post(router, { 'x-setup-nonce': R2_NONCE }),
+    r2Post(router, { 'x-setup-nonce': R2_NONCE }),
+  ]);
+  expect([a.status, b.status].sort()).toEqual([200, 409]);
 });
