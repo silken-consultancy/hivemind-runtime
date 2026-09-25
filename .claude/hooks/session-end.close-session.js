@@ -42,13 +42,28 @@
 //   really the last turn" signal to build one safely on).
 //
 // SessionEnd `reason` filtering (also load-bearing): SessionEnd fires for
-// reasons OTHER than real termination too — specifically "clear" (the user
-// ran /clear; the process and the product session are still very much alive)
-// and, to be conservative, "logout" (re-auth, not necessarily process exit).
-// Closing the real fos_session on those would reproduce the exact Stop
-// problem above through a side door. Only "prompt_input_exit" and "other"
-// (and anything unrecognized, fail-open toward the plan's actual goal) close
-// the session; "clear" and "logout" are explicitly skipped.
+// reasons OTHER than real termination too. Claude Code's reason enum (read
+// from the 2.1.281/282 binary) is
+// ["clear","resume","logout","prompt_input_exit","other"]. "clear" (/clear)
+// and "resume" (/resume) swap the conversation IN-PROCESS — SessionEnd fires
+// for the conversation being left while the window, the process and the
+// product session are all still alive; "logout" is re-auth, not necessarily
+// process exit. Closing the real fos_session on those reproduces the exact
+// Stop problem above through a side door — MEASURED: session 82f9f738 closed
+// 1 s after the founder typed /resume (history 10:29:24.361 UTC → closed_at
+// 10:29:25) under the old skip-list, which only knew clear/logout.
+//
+// Hence an ALLOWLIST, not a skip-list: only "prompt_input_exit" and "other"
+// close the session. Everything else — clear, resume, logout, any reason a
+// future Claude Code adds, or an empty/missing reason — exits 0 with NO
+// network call. An unknown future in-process reason must fail toward leaving
+// the session OPEN: a real orphan is reclaimed by the engram's server-side
+// watchdog (WatchdogService, ~60 min idle), whereas closing a live window's
+// session is silent corruption of continuity with no backstop.
+//
+// The raw reason is forwarded to the engram as
+// `session-end-hook:<reason>` (close_reason), so a close can be attributed
+// to the exact SessionEnd reason that triggered it.
 //
 // MANDATORY DISCIPLINES (fail-open, same posture as the other 3 hooks here):
 //   - Any error (parse, missing env, network) → exit 0, NEVER blocks/errors
@@ -75,7 +90,9 @@
 
 const https = require('node:https');
 
-const SKIP_REASONS = new Set(['clear', 'logout']);
+// Allowlist — see "SessionEnd `reason` filtering" above. Anything not in this
+// set (including unknown/future reasons and an empty reason) never closes.
+const CLOSE_REASONS = new Set(['prompt_input_exit', 'other']);
 
 main();
 
@@ -90,8 +107,8 @@ function main() {
 
   try {
     const reason = String(input.reason || '');
-    if (SKIP_REASONS.has(reason)) {
-      process.exit(0); // /clear or /logout — process still alive, do not close.
+    if (!CLOSE_REASONS.has(reason)) {
+      process.exit(0); // clear/resume/logout/unknown/empty — window may be alive, do not close.
     }
 
     const sessionId = process.env.ENGRAM_SESSION_ID || '';
@@ -140,7 +157,13 @@ function main() {
 // through the local mTLS proxy — same shape as bin/hivemind's `_mcp_call`.
 // Fail-open on any network/parse error (calls `done(null)`); never throws.
 function closeSession(port, apiKey, sessionId, reason, nextNote, done) {
-  const args = { action: 'close', session_id: sessionId, reason: 'session-end-hook' };
+  // Forward the raw SessionEnd reason (both attempts, incl. the floor-note
+  // retry) so close_reason attributes the close to what triggered it.
+  const args = {
+    action: 'close',
+    session_id: sessionId,
+    reason: `session-end-hook:${reason}`, // reason is always in CLOSE_REASONS here
+  };
   if (nextNote) args.next_note = nextNote;
 
   const body = JSON.stringify({

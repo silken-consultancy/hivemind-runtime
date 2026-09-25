@@ -9,6 +9,19 @@ not be merged until that constraint holds.
 
 ## Unreleased
 
+### SessionEnd hook closes the session only on real process exit
+
+- `.claude/hooks/session-end.close-session.js`: the reason filter is now an allowlist.
+  The hook closes the fos_session only on `prompt_input_exit` and `other`. `clear`,
+  `resume`, `logout`, unknown reasons and an empty reason exit 0 with no network call.
+  Before this, `/resume` (an in-process conversation swap) closed the live window's
+  session. Measured on session 82f9f738, which closed 1 s after `/resume`. A real orphan
+  is still reclaimed by the engram watchdog.
+- The raw reason is forwarded as `close_reason = session-end-hook:<reason>` (was the fixed
+  string `session-end-hook`). No engram consumer matches the old exact string.
+- New regression test `.claude/hooks/test/session-end-reasons.regression.test.js`. It runs
+  the real hook against a stub HTTPS server and needs `openssl` on PATH.
+
 ### First-timer routing reads the onboarding field (impl 4e978e9c, Phase 3)
 
 - `bin/hivemind`: `_onboarding_probe` / `_onboarding_state` / `_is_first_timer`.

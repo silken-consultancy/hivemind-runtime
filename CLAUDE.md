@@ -79,13 +79,18 @@ Option B device-identity):
 - **`bin/hivemind` (the CLI you are most likely running under):** opens the session
   itself, **before** `exec claude` — `_open_session_spine` calls `fos_session(action:
   "open", { slug, device_id, ... })` pre-flight and exports the result as
-  `ENGRAM_SESSION_ID`/`ENGRAM_DEVICE_ID`. By the time `/boot` runs, the session already
-  exists — `/boot` never opens one itself.
+  `ENGRAM_SESSION_ID`/`ENGRAM_DEVICE_ID`. `/boot` does not trust that id blindly: it
+  **verifies** the env session is still open (`fos_session(action: "state", ...)`) and
+  re-opens (`fos_session(action: "open", ...)`) **only** if it finds it closed (e.g. a
+  server-side close while the window stayed alive). After a re-open, the **new** session
+  id is the one used for the rest of the conversation, not the stale env value.
 - **A foreign client (Cursor, Antigravity, Cowork, or any MCP client not wrapped by
   `bin/hivemind`):** has no pre-flight opener and no `ENGRAM_SESSION_ID` in its
   environment. In that case, **you** (the agent) are the opener: once your slug is known
   (env, or the conversational fallback), call `fos_session(action: "open", { slug,
-  device_id })` yourself, using the `device_id` the boot fetch gave you (below). This is
+  device_id })` yourself, using the `device_id` the boot fetch gave you (below). Apart
+  from `/boot`'s re-open of a session it found closed (above) and `/end-session`'s
+  carrier open (a session opened only to land the handoff, then closed at once), this is
   the **only** case where an agent opens its own session — `fos_session(action:"open")`
   stays the single opener either way, never raced between the CLI and the agent.
 
@@ -106,7 +111,9 @@ race between the two).
 `bin/hivemind` opens a real session before this window starts and exports its id as
 `ENGRAM_SESSION_ID`. That session now closes **automatically** when this window really
 ends — a `SessionEnd` hook (`.claude/hooks/session-end.close-session.js`) fires without
-you typing anything. `/end-session` (`.claude/commands/end-session.md`) remains available
+you typing anything. The hook closes **only on real process exit** (SessionEnd reason
+`prompt_input_exit`/`other`): `/clear`, `/resume` and logout swap or re-auth in-process
+and leave the session open. `/end-session` (`.claude/commands/end-session.md`) remains available
 and is still the **preferred** way to end deliberately: it does the one thing the hook
 cannot do — judgment-quality memory consolidation of what happened this session — before
 closing with a real handoff note. The hook is the safety net for continuity of the close
