@@ -276,6 +276,20 @@ _kill_wait_escalate() {
   fi
 }
 
+# ── _setup_daemon_died: fail-fast exit for _setup_mode ───────────────────────
+# Called when the --setup-only daemon _setup_mode spawned is no longer alive
+# (kill -0 fails). The usual cause is EADDRINUSE: something that is NOT a
+# hivemind runtime holds ${RUNTIME_PORT}, so _reap_stale_runtime (identity-
+# guarded) left it alone and our daemon could not bind. Exits 1.
+_setup_daemon_died() {
+  echo "Error: the setup server exited unexpectedly (pid ${_SETUP_PID})." >&2
+  echo "       Most likely port ${RUNTIME_PORT} is already in use by another program." >&2
+  echo "       Check: lsof -i :${RUNTIME_PORT}   (or set AR_PORT to a free port)" >&2
+  echo "       Log:   ${RUNTIME_LOG}" >&2
+  rm -f "${SETUP_PID_FILE}"
+  exit 1
+}
+
 # ── _setup_mode: first-login flow ─────────────────────────────────────────────
 # Starts server in setup-only mode, opens browser, polls /setup/status until done.
 _setup_mode() {
@@ -314,6 +328,24 @@ _setup_mode() {
   # multi-owner coexistence case to protect against here.
   _reap_stale_runtime
 
+  # One-shot setup nonce (F2, security impl 9658277f, R2). The setup daemon's
+  # POST /setup/enroll rewrites this machine's FOS_API_KEY/HIVEMIND_OWNER/cert,
+  # so it only accepts a request carrying this secret: handed to the daemon
+  # via the process environment ONLY (never written to disk, never passed on
+  # argv where `ps` would show it, never logged — not even under --verbose)
+  # and to the browser via the URL it opens below. The daemon burns it on the
+  # first successful enroll. openssl is already a hard requirement (checked
+  # above; the enroll handler shells out to it for the keypair/CSR).
+  local _setup_nonce
+  _setup_nonce="$(openssl rand -hex 32 2>/dev/null)" || _setup_nonce=''
+  case "${_setup_nonce}" in
+    *[!0-9a-f]*|'') _setup_nonce='' ;;
+  esac
+  if [ "${#_setup_nonce}" -ne 64 ]; then
+    echo "Error: could not generate the setup nonce (openssl rand failed)." >&2
+    exit 1
+  fi
+
   _vecho "[hivemind] setup: runtime=${RUNTIME_BIN} port=${RUNTIME_PORT} log=${RUNTIME_LOG}"
   _vecho "[hivemind] setup: endpoint=${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443} (enrollment goes to the 443/LE surface of this host)"
   if [ "${_VERBOSE:-0}" = "1" ]; then
@@ -325,9 +357,9 @@ _setup_mode() {
     # LAST command (tee), so _SETUP_PID would stop pointing at bun and every
     # kill below — including cmd_stop's leftover cleanup — would miss the
     # daemon. With `> >(...)`, `$!` is still bun.
-    bun run "${RUNTIME_BIN}" --setup-only > >(tee -a "${RUNTIME_LOG}" >&2) 2>&1 &
+    HIVEMIND_SETUP_NONCE="${_setup_nonce}" bun run "${RUNTIME_BIN}" --setup-only > >(tee -a "${RUNTIME_LOG}" >&2) 2>&1 &
   else
-    bun run "${RUNTIME_BIN}" --setup-only >> "${RUNTIME_LOG}" 2>&1 &
+    HIVEMIND_SETUP_NONCE="${_setup_nonce}" bun run "${RUNTIME_BIN}" --setup-only >> "${RUNTIME_LOG}" 2>&1 &
   fi
   _SETUP_PID=$!
   mkdir -p "$(dirname "${SETUP_PID_FILE}")"
@@ -335,8 +367,16 @@ _setup_mode() {
   _vecho "[hivemind] setup: daemon spawned (pid=${_SETUP_PID}) — waiting for healthz"
 
   # Poll until setup server ready (timeout 15s).
+  # Liveness check each tick: if OUR setup daemon already died (typically
+  # EADDRINUSE — a foreign process holds ${RUNTIME_PORT}), fail fast with the
+  # reason instead of polling a port it never bound. This also stops a
+  # FOREIGN daemon's /healthz on that port from being mistaken for ours.
   _TRIES=0
-  until curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; do
+  until kill -0 "${_SETUP_PID}" 2>/dev/null \
+      && curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; do
+    if ! kill -0 "${_SETUP_PID}" 2>/dev/null; then
+      _setup_daemon_died
+    fi
     _TRIES=$((_TRIES + 1))
     if [ "${_TRIES}" -ge 15 ]; then
       echo "Error: setup server did not start after 15s. Check: ${RUNTIME_LOG}" >&2
@@ -348,7 +388,12 @@ _setup_mode() {
   done
   _vecho "[hivemind] setup: daemon answering healthz on ${RUNTIME_PORT}"
 
-  local _SETUP_URL="http://localhost:${RUNTIME_PORT}/setup"
+  # The nonce rides in the URL so the page can present it back as
+  # x-setup-nonce (the page then strips it from the address bar). This URL is
+  # printed to the user's own terminal — deliberately, so it can be opened by
+  # hand when xdg-open/open does nothing (WSL, headless) — but it never goes to
+  # RUNTIME_LOG or through _vecho. It is single-use and dies with this daemon.
+  local _SETUP_URL="http://localhost:${RUNTIME_PORT}/setup?nonce=${_setup_nonce}"
   echo "Opening browser: ${_SETUP_URL}"
 
   if command -v xdg-open > /dev/null 2>&1; then
@@ -371,6 +416,11 @@ _setup_mode() {
   # count-vs-exit-code mismatch to trip over.
   _TRIES=0
   while :; do
+    # Same liveness check as the healthz wait: a setup daemon that died
+    # mid-enrollment must not cost the user the full 5-minute timeout.
+    if ! kill -0 "${_SETUP_PID}" 2>/dev/null; then
+      _setup_daemon_died
+    fi
     if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/setup/status" 2>/dev/null \
       | grep -q '"done":true'; then
       break
@@ -2696,7 +2746,11 @@ _install_run() {
     # 46d0eeed's POST /internal/proxy/reload). NOT a hard dependency — if
     # the daemon isn't running (or this call fails for any reason), the
     # next _start_proxy spawn reads the full port-map.json at boot anyway.
-    curl -sf --max-time 3 -X POST "http://127.0.0.1:${RUNTIME_PORT}/internal/proxy/reload" > /dev/null 2>&1 || true
+    # JSON content-type + empty object body: the daemon's global request guard
+    # (F2, runtime/src/lib/request-guard.ts) answers 415 to any POST that is
+    # not application/json. Harmless to an older daemon, which ignores both.
+    curl -sf --max-time 3 -X POST -H "Content-Type: application/json" -d '{}' \
+      "http://127.0.0.1:${RUNTIME_PORT}/internal/proxy/reload" > /dev/null 2>&1 || true
   else
     echo "  $(_err "✗") falha ao gravar ${_final_path}" >&2
     # code-review fix: surface the real reason (permission denied, disk

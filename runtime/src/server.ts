@@ -9,16 +9,19 @@
 //
 // Modes:
 //   Normal:     mTLS proxy starts (cert present in env), serves /healthz +
-//               /setup + /sessions, runs reconcileOnStartup()
+//               /sessions, runs reconcileOnStartup(). /setup is NOT mounted
+//               (F2: enrollment rewrites FOS_API_KEY/HIVEMIND_OWNER/cert, so
+//               it must not be reachable on a long-lived daemon).
 //   Setup-only: proxy + sessions reconcile skipped (no cert yet), serves
 //               /healthz + /setup for enrollment. Activated by --setup-only
-//               argv flag (bin/hivemind first-login flow).
+//               argv flag (bin/hivemind first-login flow), which also hands
+//               this process a one-shot HIVEMIND_SETUP_NONCE (R2).
 
 import { Hono } from 'hono';
-import { cors } from 'hono/cors';
 import { env } from './lib/env.ts';
 import { health } from './routes/health.ts';
-import { setupRouter } from './routes/setup.ts';
+import { createSetupRouter } from './routes/setup.ts';
+import { localOriginGuard } from './lib/request-guard.ts';
 import { sessions, reconcileOnStartup, shutdownSessions } from './routes/sessions.ts';
 import { startAllMtlsProxies, reloadNewProxyListeners } from './lib/mtls-proxy.ts';
 import { VERSION } from './version.ts';
@@ -27,15 +30,34 @@ const isSetupOnly = process.argv.includes('--setup-only');
 
 const app = new Hono();
 
-// CORS for all routes — server listens on 127.0.0.1 only, wildcard origin safe.
-const publicCors = cors({ origin: '*', allowMethods: ['GET', 'POST', 'OPTIONS'] });
-app.use('/*', publicCors);
+// Browser boundary (F2, R1). NO CORS middleware: the wildcard `origin: '*'`
+// that used to sit here let any web page drive (and read) this daemon — the
+// loopback bind keeps other machines out, not the user's own browser tabs.
+// The setup page is served same-origin by this daemon, so it never needed
+// CORS. The guard rejects a foreign Origin (403) and a non-JSON POST (415) on
+// every route, including /sessions/adopt and /internal/proxy/reload.
+app.use('*', localOriginGuard(env.AR_PORT));
 
 // Routes.
 app.route('/healthz', health);
-app.route('/setup', setupRouter);
+if (isSetupOnly) {
+  // One-shot enrollment nonce minted by bin/hivemind's _setup_mode (R2). Read
+  // once, then removed from process.env. Never logged. Absent → the router
+  // fails closed (every /enroll is 403) — see createSetupRouter.
+  // NOTE: this delete alone does NOT keep the nonce out of child processes —
+  // Bun.spawnSync without an explicit `env` passes the env snapshot the
+  // process started with (measured, Bun 1.4.0). The openssl spawns in
+  // routes/setup.ts therefore pass `env: childEnv()` explicitly, which also
+  // strips the key; server-origin.test.ts proves a spawned child never sees it.
+  const setupNonce = process.env.HIVEMIND_SETUP_NONCE;
+  delete process.env.HIVEMIND_SETUP_NONCE;
+  if (!setupNonce) {
+    console.error('[hivemind-runtime] setup mode started WITHOUT HIVEMIND_SETUP_NONCE — enrollment is disabled (launch it via `hivemind`)');
+  }
+  app.route('/setup', createSetupRouter({ nonce: setupNonce }));
+}
 // Session pid registry (Fase 2) — POST /sessions/adopt + GET /sessions.
-// Public, localhost-only bind — same bypass as /healthz and /setup.
+// Localhost-only bind + the Origin/Content-Type guard above.
 app.route('/sessions', sessions);
 
 // POST /internal/proxy/reload — Option 2 hot-add (item 46d0eeed). Lets a
