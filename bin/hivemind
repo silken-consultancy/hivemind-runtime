@@ -3564,6 +3564,33 @@ _install_ask_scope() {
   done
 }
 
+# _install_abs_path <typed>: the manual target's typed path as an absolute
+# path on stdout (I9). A leading `~` / `~/` expands to $HOME; a relative path
+# resolves against the cwd (the same base the Cursor "project" scope uses);
+# `.`/`..` segments and duplicate slashes are normalized lexically — symlinks
+# are NOT resolved, so a healthy absolute path is kept as typed. Returns 1
+# (prints nothing) for an empty path or a `~user` form (not expanded here).
+# A bare `~` expands to $HOME — a directory, which the caller refuses (an
+# existing directory is never a config file) before anything is recorded.
+_install_abs_path() {
+  local _p="$1"
+  [ -n "${_p}" ] || return 1
+  case "${_p}" in
+    "~") _p="${HOME}" ;;
+    "~/"*) _p="${HOME}/${_p#\~/}" ;;
+    "~"*) return 1 ;;
+  esac
+  case "${_p}" in
+    /*) ;;
+    *) _p="${PWD%/}/${_p}" ;;
+  esac
+  local _n
+  if _n="$(realpath -m -s -- "${_p}" 2>/dev/null)" && [ -n "${_n}" ]; then
+    _p="${_n}"
+  fi
+  printf '%s\n' "${_p}"
+}
+
 # _install_run: the guided flow itself, WITHOUT the TTY gate (that lives in
 # cmd_install, its only caller in production) — kept separate so a test can
 # drive it directly with piped stdin ("mock the interactive prompts") without
@@ -3611,7 +3638,7 @@ _install_run() {
   local -a _paths=()
   case "${_chosen_id}" in
     manual)
-      printf 'Caminho completo do arquivo de configuração (ex: /home/voce/.algum-cliente/mcp.json): ' >&2
+      printf 'Caminho do arquivo de configuração (absoluto, ~/... ou relativo ao diretório atual; ex: ~/.algum-cliente/mcp.json): ' >&2
       local _typed
       if ! IFS= read -r _typed; then
         echo "" >&2
@@ -3622,7 +3649,23 @@ _install_run() {
         echo "Caminho vazio — nada instalado." >&2
         return 1
       fi
-      _paths=("${_typed}")
+      # I9: never use the typed text as-is (it was written to $PWD/~/... and
+      # recorded relative in port-map.json, so uninstall from another cwd
+      # missed it). Normalized to an absolute path before the preview.
+      local _abs
+      if ! _abs="$(_install_abs_path "${_typed}")"; then
+        echo "Erro: informe um caminho absoluto, ~/... ou relativo ao diretório atual (não suportado: '${_typed}') — nada instalado." >&2
+        return 1
+      fi
+      # I9 review: a directory (bare `~` = $HOME, or any existing dir) can
+      # never be the config file — refuse it HERE, before the preview and
+      # before _resolve_target_port_and_device_id records a port-map entry
+      # that the failing write would leave behind.
+      if [ -d "${_abs}" ]; then
+        echo "Erro: ${_abs} é um diretório — informe o caminho do ARQUIVO de configuração (ex: ~/.algum-cliente/mcp.json). Nada instalado." >&2
+        return 1
+      fi
+      _paths=("${_abs}")
       ;;
     cursor)
       local _rc=0
@@ -4200,6 +4243,26 @@ _uninstall_targets() {
         local _port _path _res _status _msg
         while IFS=$'\t' read -r _port _path; do
           [ -n "${_path}" ] || continue
+          # I9: a pre-I9 `install manual` recorded the typed path verbatim, so
+          # an entry may be RELATIVE (`~/x/mcp.json`, `x/mcp.json`) — relative
+          # to the cwd of that install, which was never recorded, with a
+          # leading `~` NOT expanded. Resolving it against today's cwd could
+          # edit the wrong file, so it is never touched: a visible warning
+          # names it and the step fails (F8 — wiring left behind). Its
+          # port-map entry is NOT kept: port-map.json goes with ~/.engram (or
+          # explicitly under --keep-certs) in _uninstall_proxy, which frees
+          # the port; the path survives only in this warning.
+          case "${_path}" in
+            /*) ;;
+            *)
+              echo "  ! ${_path}: recorded as a RELATIVE path by an older 'hivemind install manual' (port ${_port})." >&2
+              echo "    It was written relative to the directory that install ran from (not recorded; a leading '~' was" >&2
+              echo "    NOT expanded — e.g. <that dir>/~/x/mcp.json), so it cannot be located reliably and was not touched." >&2
+              echo "    Find that file and remove mcpServers.engram from it by hand." >&2
+              _UNINSTALL_FAILED=1
+              continue
+              ;;
+          esac
           if _res="$(_uninstall_unwire_target "${_path}" "${_port}")"; then
             _status="${_res%%$'\t'*}"; _msg="${_res#*$'\t'}"
           else
@@ -4419,7 +4482,11 @@ _uninstall_plan() {
     if [ -n "${_entries}" ]; then
       echo "    mcpServers.engram (only if still pointing at its HiveMind port; other keys kept) in:"
       while IFS=$'\t' read -r _port _path; do
-        [ -n "${_path}" ] && echo "      ${_path} (port ${_port})"
+        [ -n "${_path}" ] || continue
+        case "${_path}" in
+          /*) echo "      ${_path} (port ${_port})" ;;
+          *)  echo "      ${_path} (port ${_port}) — relative (older install): remove by hand" ;;
+        esac
       done <<< "${_entries}"
     fi
   fi
