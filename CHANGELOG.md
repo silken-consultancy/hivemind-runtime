@@ -1,15 +1,26 @@
 # Changelog — hivemind-runtime
 
 Installed clients detect new `main` commits through `_maybe_auto_update`, which compares
-`git ls-remote` against the local HEAD. `LATEST_SHA` (published on every merge by
-`.github/workflows/publish-dist.yml`, which replaced `publish-latest-sha.yml`: with the
-repo variable `DIST_ENABLED` unset it publishes the dev commit exactly as before — the
-legacy behaviour; with `DIST_ENABLED=true` it publishes the dist repo HEAD) is not the trigger: it is the integrity
+`git ls-remote` against the local HEAD. `LATEST_SHA` (the dist repo `main` HEAD, pulled every
+2 minutes by a timer on each box — silken-ops `product-vps/manifest-cd/`; GitHub no longer
+SSHes into the boxes, and `.github/workflows/publish-dist.yml` only pushes the dist) is not the trigger: it is the integrity
 fallback `_verify_commit_integrity` uses for unsigned commits. **Merging to `main` is
 shipping to every client.** Entries below that carry a release-ordering constraint must
 not be merged until that constraint holds.
 
 ## Unreleased
+
+### LATEST_SHA manifests are pull-based; the SSH publish is gone (impl 3e2c90da, D11)
+
+- `.github/workflows/publish-dist.yml` keeps `build-and-guard` + `push-dist` only. The
+  `resolve-sha` / `publish-prod` / `publish-lab` jobs and every use of
+  `PROD_MANIFEST_SSH_*` / `LAB_MANIFEST_SSH_*` are removed. With `DIST_ENABLED` unset the
+  workflow publishes nothing; the legacy "dev commit to the manifest" path is gone.
+- The manifests on `hivemind.ia.br` and `kernel.silken.ia.br` are written by a pull timer on
+  each box (silken-ops `product-vps/manifest-cd/`), which reads the dist `main` HEAD.
+  **Release-ordering constraint:** merge this only after both boxes' timers are installed
+  and proven to track the dist. Otherwise the manifests freeze and clients without GPG stop
+  updating.
 
 ### Daemon survives Ctrl+C in the launching terminal (impl 3e2c90da, I8 + A6)
 

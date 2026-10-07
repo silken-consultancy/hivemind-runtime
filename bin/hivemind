@@ -1571,7 +1571,7 @@ cmd_autostart() {
 # manifest published on a channel separate from git itself (the product HTTPS
 # domain, not the repo host) — fallback for when no signer is configured.
 # The manifest endpoint (https://<host>/hivemind/LATEST_SHA) is LIVE — it is
-# auto-published on every push by the publish-dist workflow (ex publish-latest-sha), so the (b)
+# kept equal to the dist main HEAD by a pull timer on each box (silken-ops manifest-cd), so the (b)
 # path resolves normally. If the fetch fails (endpoint unreachable / empty),
 # this still fails closed for unsigned commits, which is the correct fail-safe
 # default (spec: "se a verificação falhar → NÃO aplica"), not a bug.
