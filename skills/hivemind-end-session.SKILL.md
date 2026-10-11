@@ -19,9 +19,8 @@ Do this now, in order:
 2. **Fetch the procedure:** call `fos_procedure({ id: "end-session" })`.
 
 3. **Execute the returned `body` verbatim and in full.** It consolidates the session's memories
-   and closes the session with a mandatory `next_note`, resolving the session by cascade and —
-   if no open session is found — opening one solely to carry the handoff, so continuity is
-   ALWAYS guaranteed. Follow it exactly.
+   and closes the session with the continuity handoff. Make exactly the calls it prescribes and
+   nothing else: no other close recipe runs alongside it.
 
 **FAIL-CLOSED.** If the `fos_procedure` call errors, returns an empty body, or the engram is
 unreachable, **STOP** and say plainly that the close could not be served — do not fake a close

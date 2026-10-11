@@ -182,8 +182,7 @@ nativo no Windows alcança essa mesma URL porque o WSL2 já encaminha, por
 padrão, portas de loopback do lado Linux para o `localhost` do Windows
 (*localhost-forwarding*, comportamento padrão do WSL2, sem necessidade de
 `.wslconfig` ou configuração extra). Confirmado em teste real (Cursor e Claude
-Cowork, a partir do Windows, contra o proxy hospedado no WSL — founder,
-2026-08-08).
+Cowork, a partir do Windows, contra o proxy hospedado no WSL).
 
 Para rodar o proxy direto no Windows, sem WSL, use o `install.ps1` (só o proxy —
 ver "No Windows nativo" acima).
@@ -195,7 +194,7 @@ nunca criando arquivo local. As principais:
 
 | Ferramenta | Para quê |
 |---|---|
-| `fos_boot_skeleton` | Carregar o contexto do projeto no início da sessão |
+| `engram_boot` / `engram_end_session` | Iniciar / encerrar a sessão (conduzidos pelo `/boot` e `/end-session` servidos) |
 | `fos_memory` | Escrever/atualizar uma memória |
 | `fos_recall` | Ler memórias por tópico ou nome exato |
 | `fos_memory_lookup` | Buscar por fragmento de nome (passo zero de dedup) |

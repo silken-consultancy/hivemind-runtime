@@ -7,14 +7,13 @@
 // PURPOSE:
 //   `bin/hivemind` opens a real fos_session before `exec claude` and exports
 //   its id as ENGRAM_SESSION_ID (see `_open_session_spine` in bin/hivemind).
-//   Historically the ONLY way that session closed was the founder typing
+//   Historically the ONLY way that session closed was the user typing
 //   `/end-session` by hand — no Stop hook, no SessionEnd hook, and neither
 //   the product CLAUDE.md nor /boot even mentioned it. That is how orphan
-//   sessions were born (P1 of the same implementation measured the server
-//   watchdog could not reliably reclaim them either — see end-session.md's
-//   corrected fallback text). This hook is the client-side half of the fix:
+//   sessions were born (the server watchdog alone could not reliably reclaim
+//   them either). This hook is the client-side half of the fix:
 //   it closes the session automatically the moment the window really ends,
-//   without the founder needing to type anything.
+//   without the user needing to type anything.
 //
 // WHY NOT Stop (measured, load-bearing — do not "fix" by adding Stop here):
 //   `Stop` fires at the end of EVERY assistant turn, not at session end —
@@ -32,7 +31,7 @@
 //   assumes the session is still open, and marks a still-active lane as
 //   closed/handed-off before it truly ended. (Historically this comment also
 //   cited a per-slug open() lock freed too early; that harness slug-lock was
-//   removed in P4 / impl 989cb79b — concurrent sessions per slug are now
+//   removed — concurrent sessions per slug are now
 //   intended and made safe by the engram's lane-safe open() guard — so that
 //   particular rationale no longer applies, but the continuity one still
 //   does.) This is a
@@ -49,9 +48,9 @@
 // for the conversation being left while the window, the process and the
 // product session are all still alive; "logout" is re-auth, not necessarily
 // process exit. Closing the real fos_session on those reproduces the exact
-// Stop problem above through a side door — MEASURED: session 82f9f738 closed
-// 1 s after the founder typed /resume (history 10:29:24.361 UTC → closed_at
-// 10:29:25) under the old skip-list, which only knew clear/logout.
+// Stop problem above through a side door — measured: a session closed
+// one second after the user typed /resume, under the old skip-list, which
+// only knew clear/logout.
 //
 // Hence an ALLOWLIST, not a skip-list: only "prompt_input_exit" and "other"
 // close the session. Everything else — clear, resume, logout, any reason a
@@ -74,7 +73,7 @@
 //   - Idempotent by construction: fos_session(action:'close') on an
 //     already-closed session returns {already_closed:true} server-side
 //     (engram apps/backend/src/modules/sessions/sessions.service.ts) — safe
-//     to fire even if the founder already ran /end-session.
+//     to fire even if the user already ran /end-session.
 //   - Reuses the SAME local mTLS-proxy call shape bin/hivemind itself uses
 //     (`_mcp_call`/`_open_session_spine`): POST a JSON-RPC tools/call to
 //     http://127.0.0.1:${MTLS_PROXY_PORT}/v1/mcp with header
@@ -136,8 +135,7 @@ function main() {
         // shaped to satisfy validateNextNote's WIP:/NEXT:/LANE: requirement
         // directly (no force:true needed). The 'LANE: <auto:hook>' marks a
         // machine-closer (no vessel/model in the loop) for signed-lane rehydration —
-        // REQUIRED since the engram backend now enforces a LANE: line (impl 989cb79b
-        // P3.8); without it this auto-close would be rejected and continuity break.
+        // REQUIRED since the engram backend now enforces a LANE: line ; without it this auto-close would be rejected and continuity break.
         const floor =
           'WIP: [auto-close: SessionEnd hook — no explicit /end-session handoff was recorded]\n' +
           'NEXT: run /end-session at the start of the next session for a deliberate handoff note\n' +

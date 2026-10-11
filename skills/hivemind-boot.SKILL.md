@@ -21,9 +21,9 @@ Do this now, in order:
 2. **Fetch the procedure:** call `fos_procedure({ id: "boot" })`.
 
 3. **Execute the returned `body` verbatim and in full.** It is the authoritative, self-sufficient
-   instruction set for this session's boot — it loads its own tools, resolves the slug (by env,
-   by what you were given, or by discovery — asking you to pick a real project when nothing sets it; never `default`; none → create it on the web),
-   **opens the session**, and runs the deterministic identity + project spine. Follow it exactly.
+   instruction set for this session's boot — it loads its own tools, resolves the project (never
+   `default`) and opens or adopts the session. Make exactly the calls it prescribes and nothing
+   else: no other boot recipe runs alongside it.
 
 **FAIL-CLOSED — no memory authority, no session.** If the `fos_procedure` call errors, returns
 an empty body, or the engram is unreachable, **STOP** and say plainly that the HiveMind boot

@@ -142,6 +142,11 @@
       "mcp__engram__fos_edge_mark_dead",
       "mcp__engram__fos_agent",
       "mcp__engram__fos_entitlement",
+      "mcp__engram__engram_boot",
+      "mcp__engram__engram_end_session",
+      "mcp__engram__fos_procedure",
+      "mcp__engram__fos_served_contracts",
+      "mcp__engram__fos_onboarding",
       "Bash(gh run watch *)",
       "Bash(gh run list *)",
       "Bash(gh run view *)"
@@ -200,7 +205,7 @@
         ]
       },
       {
-        "matcher": "mcp__engram__fos_delivery|mcp__engram__fos_implementation_phase|mcp__engram__fos_session|mcp__engram__fos_blocker|Bash",
+        "matcher": "mcp__engram__fos_delivery|mcp__engram__fos_implementation_phase|mcp__engram__fos_session|mcp__engram__engram_end_session|mcp__engram__fos_blocker|Bash",
         "hooks": [
           {
             "type": "command",
@@ -209,7 +214,7 @@
         ]
       },
       {
-        "matcher": "mcp__engram__fos_decision|mcp__engram__fos_implementation|mcp__engram__fos_implementation_phase|mcp__engram__fos_delivery|mcp__engram__fos_session|mcp__engram__fos_recall|mcp__engram__fos_memory|mcp__engram__fos_blocker|mcp__engram__fos_phase_item|Edit|Write|MultiEdit|Bash|Task",
+        "matcher": "mcp__engram__fos_decision|mcp__engram__fos_implementation|mcp__engram__fos_implementation_phase|mcp__engram__fos_delivery|mcp__engram__fos_session|mcp__engram__engram_end_session|mcp__engram__fos_recall|mcp__engram__fos_memory|mcp__engram__fos_blocker|mcp__engram__fos_phase_item|Edit|Write|MultiEdit|Bash|Task",
         "hooks": [
           {
             "type": "command",

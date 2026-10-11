@@ -15,7 +15,7 @@ the procedure body.
    full** — it is the authoritative instruction set for consolidating this session's
    memories and closing with a handoff `next_note`.
 
-**FAIL-CLOSED (founder ruling — `decision_serve-boot-and-end-session-as-mcp-prompts-fail-closed`):**
+**FAIL-CLOSED:**
 if the `fos_procedure` call errors, returns an empty body, or the engram is unreachable,
 **STOP**. Report plainly that the end-session procedure could not be served. Do **NOT**
 improvise the close from memory, and do **NOT** fall back to any local or cached copy.
