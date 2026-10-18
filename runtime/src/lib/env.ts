@@ -52,9 +52,8 @@ const schema = z.object({
   MTLS_KEY_PATH: z.string().optional(),
   MTLS_CA_PATH: z.string().optional(),
 
-  // Durable per-machine identity (bin/hivemind:_resolve_device_id, Fase 6,
-  // DR-6.3) — exported into the daemon's env by _spawn_runtime so reconcile
-  // (Fase 2) and lifecycle events (Fase 4) tag their own device without a
+  // Durable per-machine identity (bin/hivemind:_resolve_device_id) — exported into the daemon's env by _spawn_runtime so reconcile
+  // and lifecycle events tag their own device without a
   // second, divergent notion of "device" inside this process. Optional: a
   // daemon started directly (`bun src/server.ts`, bypassing the bash
   // wrapper) simply runs without it rather than failing to boot.

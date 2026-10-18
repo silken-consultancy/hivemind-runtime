@@ -1,4 +1,4 @@
-// request-guard.ts — F2 (security impl 9658277f, R1): the daemon's global
+// request-guard.ts — the daemon's global
 // browser-facing boundary.
 //
 // THREAT MODEL — what this daemon (127.0.0.1:<AR_PORT>) defends against, and
@@ -9,11 +9,11 @@
 //   - DNS rebinding (an attacker hostname re-pointed at 127.0.0.1): blocked
 //     by the Host rule below, GETs included.
 //   - Other local processes running as the SAME OS user, for enrollment
-//     only: /setup/enroll needs the launcher's one-shot nonce (R2,
-//     routes/setup.ts). The other mutating routes (/sessions/adopt,
+//     only: /setup/enroll needs the launcher's one-shot nonce
+//     (routes/setup.ts). The other mutating routes (/sessions/adopt,
 //     /internal/proxy/reload) are NOT yet authenticated against same-user
-//     processes — open as blocker 53b6455c (AR_API_TOKEN bearer, whole-server).
-//   OUT OF SCOPE (pending a founder decision — a DIFFERENT local OS user on a
+//     processes — tracked as a known gap (AR_API_TOKEN bearer, whole-server).
+//   OUT OF SCOPE (pending an owner decision — a DIFFERENT local OS user on a
 //   shared host):
 //   - nonce in argv: the daemon gets it via env (not readable across users),
 //     but the setup URL carrying it is an argument to xdg-open/open and to
@@ -57,7 +57,7 @@
 //
 // This is NOT authentication of non-browser local processes — anything that
 // can run curl as this user can still omit Origin. The setup enroll route
-// adds its own one-shot nonce for that (R2, routes/setup.ts).
+// adds its own one-shot nonce for that (routes/setup.ts).
 import type { MiddlewareHandler } from 'hono';
 
 export function localOriginGuard(port: number): MiddlewareHandler {

@@ -1,8 +1,7 @@
 // mTLS loopback proxy for hivemind-runtime.
 //
-// Listens on 127.0.0.1:<MTLS_PROXY_PORT> (the shared/default port) PLUS,
-// per Option 2 (fos_decision 1caee6a7, B1 fix — full design in fos_sketchpad
-// 4f8142e3-73c6-468c-8ec3-1b871e8bb23b § ADDENDUM 3), one ADDITIONAL loopback
+// Listens on 127.0.0.1:<MTLS_PROXY_PORT> (the shared/default port) PLUS
+// one ADDITIONAL loopback
 // listener per installed target (`~/.engram/mtls/port-map.json`), each pinned
 // to a device_id fixed at `hivemind install` time. All listeners live in this
 // ONE process (N `Bun.serve()` calls, not N processes) and forward every
@@ -241,7 +240,7 @@ export function buildUpstreamRequestHeaders(
     upHeaders.delete('x-fos-key');
   }
 
-  // Device-identity injection (Option 2, fos_decision 1caee6a7) — see the
+  // Device-identity injection — see the
   // function-level comment above for the unspoofability rationale.
   if (opts.pinnedDeviceId) {
     upHeaders.set('x-fos-device-id', opts.pinnedDeviceId);
@@ -398,7 +397,7 @@ export interface MtlsProxyCfg {
 }
 
 // ── bindDefaultAndMappedListeners ─────────────────────────────────────────────
-// N-listener daemon boot (Option 2, item 46d0eeed): binds the default/shared
+// N-listener daemon boot: binds the default/shared
 // port (cfg.port, unpinned, unchanged) PLUS one listener per
 // ~/.engram/mtls/port-map.json entry (pinned to that entry's device_id).
 // Rebinding every mapped port on every daemon (re)start is the ENTIRE

@@ -6,8 +6,8 @@
 //
 // PURPOSE:
 //   The execute-boundary hard gate (pre-tool-use.execute-boundary-gate.js) and its
-//   messenger-only override (lib/execute-boundary-override.mjs) are TURN-SCOPED —
-//   a founder OK for "one more inline call" authorizes exactly the current turn,
+//   main-session-only override (lib/execute-boundary-override.mjs) are TURN-SCOPED —
+//   an owner OK for "one more inline call" authorizes exactly the current turn,
 //   never set-and-forget. This hook is what makes that real: on every new user
 //   message it (1) bumps the turn counter, (2) invalidates any prior override
 //   grant, and (3) resets the mutating-call counter so the new turn starts clean.

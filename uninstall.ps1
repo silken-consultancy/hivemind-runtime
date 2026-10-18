@@ -1,5 +1,4 @@
-# uninstall.ps1 - thin wrapper over `hivemind uninstall` on native Windows (impl
-# 3e2c90da, phase W, item W3; parity with uninstall.sh).
+# uninstall.ps1 - thin wrapper over `hivemind uninstall` on native Windows (parity with uninstall.sh).
 #
 # The product path is `hivemind uninstall` (bin\hivemind.ps1 Invoke-Uninstall):
 # it lists everything first, then stops the daemon and removes %USERPROFILE%\

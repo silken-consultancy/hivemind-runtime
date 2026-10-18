@@ -1,7 +1,6 @@
 # hivemind.ps1 - HiveMind launcher for native Windows (PROXY-ONLY).
 #
-# Windows counterpart of bin/hivemind on a proxy-only install (impl 3e2c90da,
-# phase W, item W2). Starts/stops the UNCHANGED bun daemon (runtime\src\server.ts:
+# Windows counterpart of bin/hivemind on a proxy-only install. Starts/stops the UNCHANGED bun daemon (runtime\src\server.ts:
 # the local mTLS proxy + the first-login setup server) and prints how to connect
 # an MCP client to it. It never launches Claude Code and never opens a session -
 # a proxy-only vessel opens its own, as any foreign MCP client does.
@@ -11,21 +10,20 @@
 #   hivemind stop                 stop the daemon (forced - see below)
 #   hivemind update               pull + verify + staged swap of the runtime
 #                                 and this launcher, rollback on a failed
-#                                 proxy health check (item W7); also run
+#                                 proxy health check; also run
 #                                 silently on launch (start / no args)
 #   hivemind status               pidfile + command-line check + health probes
 #   hivemind uninstall [-Yes] [-KeepCerts]
-#                                 remove everything HiveMind installed (item W3)
+#                                 remove everything HiveMind installed
 #   hivemind autostart on|off|status
-#                                 start the proxy at log-on (opt-in, item A2):
+#                                 start the proxy at log-on (opt-in):
 #                                 per-user Scheduled Task, Startup-folder fallback
 #   hivemind --help | --version
 #   --verbose (anywhere)          say why the on-launch update check skipped
 #
-# Stop is forceful by design (founder decision 95a181bd): on Windows a bun
+# Stop is forceful by design: on Windows a bun
 # process gets no SIGTERM (Stop-Process = TerminateProcess), and `taskkill`
-# without /F arrives as SIGHUP, which server.ts deliberately ignores (measured in
-# W0). So `stop` uses Stop-Process -Force, and ONLY on a PID whose command line is
+# without /F arrives as SIGHUP, which server.ts deliberately ignores (measured). So `stop` uses Stop-Process -Force, and ONLY on a PID whose command line is
 # bun running THIS install's runtime\src\server.ts - never a recycled PID. The
 # daemon's state is written atomically (tmp + rename), so a hard kill is safe.
 #
@@ -66,10 +64,10 @@ $RuntimeDir      = Join-Path $HivemindHome 'runtime'
 $RuntimeBin      = Join-Path $RuntimeDir 'src\server.ts'
 $LocalHttpsCa    = Join-Path $CertDir 'local-https\ca.cert.pem'
 $EnvFile         = Join-Path $HivemindHome '.env'
-# Update (W7): staged tree + rollback copy, siblings of HIVEMIND_HOME (as on Linux).
+# Update: staged tree + rollback copy, siblings of HIVEMIND_HOME (as on Linux).
 $StagingDir      = "$HivemindHome.staging"
 $LastGoodDir     = "$HivemindHome.last-good"
-# uninstall -KeepCerts: the .env credential keys, kept next to the certs (3b7a507e a).
+# uninstall -KeepCerts: the .env credential keys, kept next to the certs (kept credentials).
 $KeptCredsFile   = Join-Path $EngramDir 'kept-credentials.env'
 $DefaultEndpoint = 'hivemind.ia.br:4443'
 $DirectMcpUrlDefault = 'https://api.hivemind.ia.br/v1/mcp'
@@ -94,7 +92,7 @@ function Test-Interactive {
 
 # ---- .env (UTF-8, LF or CRLF, backslash Windows paths kept verbatim) ---------
 # Read as UTF-8 explicitly: setup.ts writes a UTF-8 em dash in the header line,
-# which Get-Content without -Encoding mangles on 5.1 (W0).
+# which Get-Content without -Encoding mangles on 5.1.
 $DotEnv = @{}
 if (Test-Path -LiteralPath $EnvFile -PathType Leaf) {
   foreach ($raw in ([IO.File]::ReadAllText($EnvFile, $Utf8NoBom) -split "`r?`n")) {
@@ -398,7 +396,7 @@ function Invoke-SetupMode {
 
 # ---- Proxy start (idempotent) ------------------------------------------------
 # The enrollment credentials the daemon needs to start the mTLS proxy (setup.ts
-# writes them to .env). A certificate file alone is NOT enough (blocker 3b7a507e).
+# writes them to .env). A certificate file alone is NOT enough.
 $CredentialKeys = @('MTLS_CERT_PATH', 'MTLS_KEY_PATH', 'MTLS_CA_PATH', 'HIVEMIND_OWNER', 'FOS_API_KEY')
 
 # The proxy listener comes up next to healthz; give it a moment, fail fast if
@@ -425,7 +423,7 @@ function Get-ProxyDownMessage {
 }
 
 # Returns '' when the runtime is up - and, when a certificate is present, the
-# mTLS proxy is listening too (3b7a507e b) - else the error text. Never exits:
+# mTLS proxy is listening too (proxy check) - else the error text. Never exits:
 # the update's health check + rollback (Invoke-Update) call it as well.
 function Start-ProxyCore {
   if ((Test-RuntimeHealthy) -and (Test-ProxyAlive)) {
@@ -509,7 +507,7 @@ function Write-ConnectHints {
   }
 }
 
-# ---- User-only ACL (same rule as install.ps1, decision 95a181bd) -------------
+# ---- User-only ACL -------------
 # chmod is a no-op on Windows: the parent dir is tightened (inheritance removed,
 # one (OI)(CI) Full Control ACE for the current user) and children inherit it.
 function Test-UserOnlyAcl([string]$path, [bool]$mustBeProtected = $false) {
@@ -541,13 +539,13 @@ function Set-UserOnlyAcl([string]$dir) {
   return (Test-UserOnlyAcl $dir $true)
 }
 
-# ---- Uninstall (item W3) -----------------------------------------------------
-# Same contract as bin/hivemind `uninstall` (phase U), for what install.ps1 +
+# ---- Uninstall -----------------------------------------------------
+# Same contract as bin/hivemind `uninstall`, for what install.ps1 +
 # enrollment write on Windows. Order: stop (pidfiles + identity, never by port)
 # -> local HTTPS CA out of the user Root store -> %USERPROFILE%\.hivemind ->
 # %USERPROFILE%\.engram (or, with -KeepCerts, everything but the mtls certs and
 # device-id) -> the bun cache ONLY if install.ps1 recorded that it created it ->
-# the launcher dir off the user Path -> (autostart: nothing yet, phase A) -> the
+# the launcher dir off the user Path -> (autostart: nothing yet) -> the
 # launcher dir LAST.
 # Invariants: only the fixed paths HiveMind writes are touched (no scan); every
 # removal root passes Test-UninstallRoot first, and a single refusal aborts the
@@ -734,7 +732,7 @@ function Remove-LocalCaFromStore([string]$store, [string]$thumb) {
 # uninstall -KeepCerts keeps the IDENTITY, and the identity is more than the
 # cert files: the daemon starts the mTLS proxy only with MTLS_CERT_PATH/KEY_PATH/
 # CA_PATH, and authenticates with HIVEMIND_OWNER + FOS_API_KEY - all in .hivemind\
-# .env, which the uninstall removes (blocker 3b7a507e, owner decision a). Those
+# .env, which the uninstall removes. Those
 # keys (MTLS_* + HIVEMIND_OWNER + FOS_API_KEY, nothing else) are written to
 # .engram\kept-credentials.env, which inherits .engram's user-only ACL; install.ps1
 # merges them back into the new .env and deletes the file. Values are never
@@ -770,13 +768,13 @@ function Save-KeptCredentials {
   Write-Output "  kept:    the enrollment credentials of .env ($($keep.Count) keys) in $KeptCredsFile (-KeepCerts)"
 }
 
-# ---- Autostart (impl 3e2c90da, phase A, item A2) ------------------------------
+# ---- Autostart ------------------------------
 # `hivemind autostart on|off|status` - opt-in, default OFF (a default install or
 # an update never creates it). Mechanism: a per-user Scheduled Task (no admin;
 # measured 2026-10-06: a non-admin user registers an AtLogOn task for itself)
 # whose action is the INSTALLED launcher (%LOCALAPPDATA%\hivemind\bin\
 # hivemind.ps1, never the .cmd shim via PATH) with `start`, hidden. A log-on
-# start runs the W7 update check like any start (founder 2026-10-05, A-2).
+# start runs the update check like any start (opt-in).
 # Fallback when the registration is refused (e.g. policy): a .cmd in the user's
 # Startup folder. Requires a certificate: a log-on start must never land in
 # interactive enrollment.
@@ -1214,7 +1212,7 @@ function Invoke-Uninstall([string[]]$argv) {
   exit 0
 }
 
-# ---- Update (item W7) --------------------------------------------------------
+# ---- Update --------------------------------------------------------
 # Port of bin/hivemind cmd_update + _maybe_auto_update for a proxy-only Windows
 # install. Same model: pinned origin -> fetch -> reset --hard origin/<branch> ->
 # integrity (git verify-commit, OR HEAD == the LATEST_SHA manifest at
@@ -1223,7 +1221,7 @@ function Invoke-Uninstall([string[]]$argv) {
 # live -> launcher swap -> start + health (healthz AND, with a certificate, the
 # mTLS proxy listening) -> on failure: restore .last-good + the launcher, reset
 # the clone, restart.
-# Windows specifics (measured in W0/W7 smoke):
+# Windows specifics (measured in smoke tests):
 #  - the daemon AND its cmd wrapper (whose working dir is inside .hivemind\
 #    runtime) are gone before any rename: an open handle / CWD makes the rename
 #    fail -> abort with nothing changed;
@@ -1322,7 +1320,7 @@ function New-StagedTree([string]$src, [string]$target) {
   }
   Push-Location -LiteralPath $dstRoot
   try {
-    # --production: runtime deps only, never the devDependencies (item D3).
+    # --production: runtime deps only, never the devDependencies.
     [void](Invoke-Native { & $script:BunExe install --production --silent 2>&1 })
     if ($LASTEXITCODE -ne 0) { [void](Invoke-Native { & $script:BunExe install --production 2>&1 }) }
     $bunExit = $LASTEXITCODE
@@ -1368,7 +1366,7 @@ function Test-UpdatedRuntime {
   return $true
 }
 
-# F4/G1 - update integrity. INVARIANT: an update never discards local work in
+# Update integrity. INVARIANT: an update never discards local work in
 # HIVEMIND_SOURCE_DIR. An update runs `git reset --hard` on its source, so it
 # runs only on a source that is, by CONTENT:
 #   (a) clean - `git status --porcelain --untracked-files=no` is empty;
@@ -1445,7 +1443,7 @@ function Invoke-Update {
   if ($script:GitExit -ne 0 -or -not $after) { SayErr "Error: origin/$branch not found - staying on the current version."; return }
   $b12 = $before.Substring(0, [Math]::Min(12, $before.Length)); $a12 = $after.Substring(0, [Math]::Min(12, $after.Length))
   if ($before -eq $after) { Say "Already up to date ($b12)."; $script:UpdateRc = 0; return }
-  # G1: after the fetch, before any reset - HEAD must be reachable from the
+  # After the fetch, before any reset - HEAD must be reachable from the
   # fetched origin/<branch>. Every reset below (and each rollback to $before)
   # runs only on a source that passed here: clean and fast-forwardable.
   $why = Get-UpdateSourceRefusal $src "origin/$branch"

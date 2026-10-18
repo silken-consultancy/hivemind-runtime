@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 // HiveMind — execute-boundary override setter — standalone CLI, NOT a registered
-// hook. Invoked directly by the messenger, never dispatched to a subagent:
-//   node .claude/hooks/lib/execute-boundary-override.mjs --ok "<verbatim founder OK>"
+// hook. Invoked directly by the main session, never dispatched to a subagent:
+//   node .claude/hooks/lib/execute-boundary-override.mjs --ok "<verbatim owner OK>"
 // lib/execute-boundary-override.mjs
 //
 // PURPOSE:
 //   The hard gate (pre-tool-use.execute-boundary-gate.js) denies past CEILING
 //   with no escape hatch — this CLI IS the escape hatch. It writes the single
-//   grant file the gate reads, so a founder-directed inline drive is not
+//   grant file the gate reads, so a owner-directed inline drive is not
 //   permanently blocked. This is the ONE place that grant is ever written.
 //
-// MESSENGER-ONLY — the REAL enforcement moved to the GATE (2026-07-31, measured):
+// MAIN-SESSION-ONLY — the REAL enforcement moved to the GATE:
 //   CLAUDE_AGENT_NAME was measured LIVE to be EMPTY for a dispatched subagent
-//   (it inherits the messenger's env), so the refusal below is NOT a reliable
+//   (it inherits the main session's env), so the refusal below is NOT a reliable
 //   structural barrier on its own — a subagent COULD invoke this CLI and slip
 //   past this check. The primary, reliable protection now lives in
 //   pre-tool-use.execute-boundary-gate.js, which denies a subagent's Bash call
@@ -39,12 +39,11 @@
 //   REFUSES rather than silently granting — a meaningless grant must never
 //   be written by accident.
 //
-// SESSION-ID RECONCILIATION (2026-08-27, blocker d85e3fb7-818e-4dab-b034-
-// 85b926beae60 — MEASURED never-worked, not a regression: `git log -p` on
+// SESSION-ID RECONCILIATION (MEASURED never-worked, not a regression: `git log -p` on
 // both this file and the gate shows `input.session_id ||
 // process.env.ENGRAM_SESSION_ID` in the gate and `process.env.
 // ENGRAM_SESSION_ID` alone here were introduced in the SAME originating
-// commit (bbc971d, 2026-07-31) and neither has changed since — the mismatch
+// commit (the originating commit) and neither has changed since — the mismatch
 // was structurally present from day one, just never exercised live because
 // the gate defaulted OFF until this session's dark-ship flip to enforce):
 //   The gate (pre-tool-use.execute-boundary-gate.js) keys its state-file
@@ -57,8 +56,8 @@
 //   `process.env.ENGRAM_SESSION_ID` alone, a grant written here lands under
 //   a DIFFERENT state-file key than the one the gate reads from whenever the
 //   two ids diverge (measured live: harness session_id
-//   d6525965-7c7e-4444-aa32-4f8b8b752f4a vs ENGRAM_SESSION_ID
-//   06658549-f642-4e53-b709-e11edf51bed4 in the SAME turn) — the grant is
+//   <id-A> vs ENGRAM_SESSION_ID
+//   <id-B> in the SAME turn) — the grant is
 //   silently invisible to the gate, and the CLI reports "granted" while the
 //   very next mutating call is denied identically.
 //   FIX (per the gate keeping `input.session_id` as its preferred source of
@@ -111,7 +110,7 @@ export function appendAudit(sessionId, entry) {
   }
 }
 
-// ─── resolveSessionId(argv, env) — the reconciliation fix (blocker d85e3fb7) ──
+// ─── resolveSessionId(argv, env) — the reconciliation fix ──
 // PREFERS `--session <id>` (the gate's own resolved sessionId, handed over
 // via its deny message) over ENGRAM_SESSION_ID — the CLI learns the gate's
 // key; the gate keeps preferring input.session_id, unchanged. Falls back to
@@ -131,7 +130,7 @@ function main() {
   const okIdx = process.argv.indexOf('--ok');
   const ok = okIdx !== -1 ? process.argv[okIdx + 1] : '';
   if (!ok || !ok.trim()) {
-    process.stderr.write('[execute-boundary-override] refused: --ok "<quote of the founder OK>" is required\n');
+    process.stderr.write('[execute-boundary-override] refused: --ok "<quote of the owner OK>" is required\n');
     process.exit(1);
   }
 
@@ -144,7 +143,7 @@ function main() {
   // Fail-CLOSED: a session-less override is meaningless — refuse, do not
   // grant. sessionId now PREFERS --session <id> (the gate's resolved key,
   // copy-pasted verbatim from its deny message) over ENGRAM_SESSION_ID — see
-  // the SESSION-ID RECONCILIATION header note above (blocker d85e3fb7).
+  // the SESSION-ID RECONCILIATION header note above.
   const sessionId = resolveSessionId(process.argv, process.env);
   if (!sessionId) {
     process.stderr.write(
@@ -180,17 +179,17 @@ function main() {
 
 // ─── self-test (node execute-boundary-override.mjs --selftest) ────────────
 //
-// Unit-level ONLY (deliberate scope limit — see blocker d85e3fb7 task note):
+// Unit-level ONLY (deliberate scope limit):
 // an end-to-end grant-and-consume cannot be simulated from a dispatched
 // subagent, because the gate structurally denies a subagent's Bash call that
 // invokes this file at all (isOverrideCliInvocation + isSubagentContext in
 // the gate, regardless of which flag is passed) — that IS the gate's
-// override-is-messenger-exclusive protection working as designed, not a gap
+// override-is-main-session-exclusive protection working as designed, not a gap
 // to route around. This selftest therefore exercises resolveSessionId()
 // directly (pure function, no process spawn, no grant file touched by
 // main()) rather than shelling out to `node ... --ok/--session` end-to-end.
 // The true end-to-end re-run (grant via --session, confirm the gate's next
-// mutating call is ALLOWED) belongs to a real conversational/messenger loop.
+// mutating call is ALLOWED) belongs to a real conversational loop.
 function selftest() {
   let fail = 0;
   const check = (label, cond, detail) => {
@@ -204,13 +203,13 @@ function selftest() {
 
   // resolveSessionId precedence — the actual reconciliation fix.
   const CASES = [
-    [['--ok', 'x', '--session', 'gate-resolved-A'], { ENGRAM_SESSION_ID: 'messenger-env-B' }, 'gate-resolved-A',
+    [['--ok', 'x', '--session', 'gate-resolved-A'], { ENGRAM_SESSION_ID: 'main-env-B' }, 'gate-resolved-A',
       '--session (gate-resolved key) wins over a mismatched ENGRAM_SESSION_ID'],
-    [['--ok', 'x'], { ENGRAM_SESSION_ID: 'messenger-env-B' }, 'messenger-env-B',
+    [['--ok', 'x'], { ENGRAM_SESSION_ID: 'main-env-B' }, 'main-env-B',
       'no --session → falls back to ENGRAM_SESSION_ID (back-compat when they coincide)'],
-    [['--ok', 'x', '--session', ''], { ENGRAM_SESSION_ID: 'messenger-env-B' }, 'messenger-env-B',
+    [['--ok', 'x', '--session', ''], { ENGRAM_SESSION_ID: 'main-env-B' }, 'main-env-B',
       'empty --session value → falls back to ENGRAM_SESSION_ID, not empty string'],
-    [['--ok', 'x', '--session', '   '], { ENGRAM_SESSION_ID: 'messenger-env-B' }, 'messenger-env-B',
+    [['--ok', 'x', '--session', '   '], { ENGRAM_SESSION_ID: 'main-env-B' }, 'main-env-B',
       'whitespace-only --session value → falls back to ENGRAM_SESSION_ID'],
     [['--ok', 'x'], {}, '', 'neither --session nor ENGRAM_SESSION_ID present → empty (caller must refuse)'],
     [[], { ENGRAM_SESSION_ID: 'env-only' }, 'env-only', 'no argv at all → still falls back to env'],

@@ -1,7 +1,6 @@
 # install.ps1 - HiveMind installer for native Windows (PROXY-ONLY).
 #
-# Windows counterpart of `bash install.sh --proxy-only` (impl 3e2c90da, phase W,
-# item W1). Installs the connection layer only: the unchanged bun daemon + mTLS
+# Windows counterpart of `bash install.sh --proxy-only`. Installs the connection layer only: the unchanged bun daemon + mTLS
 # proxy (runtime\), %USERPROFILE%\.hivemind\.env, the components marker and the
 # `hivemind` launcher on the user PATH. The Claude Code harness is not built on
 # Windows. Does NOT provision a certificate - run `hivemind` afterwards for the
@@ -43,7 +42,7 @@
 #                                    mingw64\bin, ShiningLight's install dir).
 #
 # This file is ASCII on purpose: Windows PowerShell 5.1 misreads UTF-8 without a
-# BOM (measured in W0 on an em dash).
+# BOM (measured on an em dash).
 
 [CmdletBinding()]
 param(
@@ -87,7 +86,7 @@ if ($env:HIVEMIND_HOME) { $HivemindHome = $env:HIVEMIND_HOME } else { $HivemindH
 $EngramDir = Join-Path $UserHome '.engram'
 if (-not $env:LOCALAPPDATA) { Fail 'LOCALAPPDATA is not set.' }
 
-# F11: HIVEMIND_HOME must be strictly inside the profile (same path rules as the
+# HIVEMIND_HOME must be strictly inside the profile (same path rules as the
 # launcher's Test-UninstallRoot guard): never the profile itself or one of its
 # ancestors, never outside it, never overlapping the clone this script runs
 # from, never a link/junction. The tree gets a user-only ACL, the update renames
@@ -203,10 +202,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $ScriptDir 'bin\hivemind.ps1') -Path
 
 Write-Output 'Installing HiveMind (proxy-only)...'
 
-# ---- User-only ACL (founder decision 95a181bd; blocker 26ed2154) -------------
+# ---- User-only ACL -------------
 # Applied to BOTH %USERPROFILE%\.engram (certs/keys) and %USERPROFILE%\.hivemind
 # (its .env carries FOS_API_KEY after enrollment).
-# chmod/mode 0600 is a no-op on Windows (W0): files inherit the parent's ACL. So
+# chmod/mode 0600 is a no-op on Windows: files inherit the parent's ACL. So
 # the parent is tightened: inheritance removed, a single (OI)(CI) Full Control
 # ACE for the current user. Everything setup writes below it later (mtls\ keys,
 # cache\, device-id) inherits exactly that. Re-applying is harmless.
@@ -273,7 +272,7 @@ function Set-EnvKeys([hashtable]$pairs, [string[]]$order) {
     }
     if (-not $found) { $lines.Add("$k=$($pairs[$k])") }
   }
-  # F11: atomic - tmp in the same (user-only ACL) dir + rename over .env, so a
+  # Atomic - tmp in the same (user-only ACL) dir + rename over .env, so a
   # crash mid-write never leaves a truncated .env.
   $tmp = "$EnvFile.tmp.$PID"
   [IO.File]::WriteAllText($tmp, (($lines -join "`n") + "`n"), $Utf8NoBom)
@@ -299,7 +298,7 @@ if (Test-Path -LiteralPath (Join-Path $ScriptDir '.git')) {
 $envOrder += @('HIVEMIND_OPENSSL_DIR', 'HIVEMIND_BUN_EXE')
 Set-EnvKeys $envPairs $envOrder
 
-# ---- Credentials kept by `hivemind uninstall -KeepCerts` (blocker 3b7a507e) ---
+# ---- Credentials kept by `hivemind uninstall -KeepCerts` ---
 # The uninstall moved the .env credential keys (MTLS_*, HIVEMIND_OWNER,
 # FOS_API_KEY) to %USERPROFILE%\.engram\kept-credentials.env (user-only, like all
 # of .engram). Merge them back - only keys the new .env does not already have
@@ -356,7 +355,7 @@ $bunPre = @{}
 foreach ($rel in $bunRels) { $bunPre[$rel] = Test-Path -LiteralPath (Join-Path $UserHome $rel) }
 Push-Location -LiteralPath $RuntimeDst
 try {
-  # --production: runtime deps only, never the devDependencies (item D3).
+  # --production: runtime deps only, never the devDependencies.
   $bunOut = Invoke-Native { & $bun.Source install --production --silent 2>&1 }
   if ($LASTEXITCODE -ne 0) { $bunOut = Invoke-Native { & $bun.Source install --production 2>&1 } }
   $bunExit = $LASTEXITCODE
@@ -435,7 +434,7 @@ Write-Output ''
 Write-Output 'HiveMind installed (proxy-only). Open a new terminal and run: hivemind'
 Write-Output 'On the first run you will be guided through the certificate setup.'
 
-# ---- Autostart (impl 3e2c90da, phase A, item A2) - ONLY with -Autostart -------
+# ---- Autostart - ONLY with -Autostart -------
 # Runs the launcher just installed. It needs a certificate; without one the
 # install still succeeds and the exact next step is printed.
 if ($Autostart) {

@@ -13,7 +13,7 @@
 //   below was originally moved here verbatim; isMutatingToolCall() is the
 //   entry point that also counts Edit/Write/MultiEdit unconditionally.
 //
-// WIDENED AGAIN (2026-08-27, MEASURED counted-set hole): isMutatingBash() was
+// WIDENED AGAIN: isMutatingBash() was
 // pattern-matching the command string for known mutating SHAPES (ssh/scp/
 // docker/git/psql/sed -i/rm-mv-cp/curl) but had NO rule at all for plain file
 // writes — `>`/`>>` redirection, `tee`, or an interpreter (python/node/perl/
@@ -24,7 +24,7 @@
 // definition for why the added rules deliberately invert the function's
 // original noise-conservative default.
 //
-// NOT WIDENED: governed board/memory edits (fos_* tool calls — messenger
+// NOT WIDENED: governed board/memory edits (fos_* tool calls — main session
 // work) and reads (Read/Grep/Glob) are NEVER counted by either consumer —
 // only main-loop builder-work that mutates code or infra.
 //
@@ -56,7 +56,7 @@ const CEILING = 15;
 // an operation that changes state (local or remote) or runs remote work.
 // Deliberately CONSERVATIVE: when in doubt, do NOT count (fluidity > noise).
 //
-// BIAS RE-EXAMINED (2026-08-27, MEASURED — not theoretical): that "when in
+// BIAS RE-EXAMINED: that "when in
 // doubt, don't count" bias was written against NOISE (an over-eager gate
 // nagging on harmless reads). It was never examined against the failure this
 // session actually measured firsthand: seven real source-file mutations in
@@ -155,7 +155,7 @@ function isMutatingToolCall(toolName, toolInput) {
 
 // ─── isSubagentContext(input) — MEASURED discriminator (2026-07-31 live probe) ──
 //
-// CLAUDE_AGENT_NAME is EMPTY for subagents (they inherit the messenger's env)
+// CLAUDE_AGENT_NAME is EMPTY for subagents (they inherit the main session's env)
 // — USELESS as a signal, despite being the convention every OTHER hook in
 // this dir still uses. transcript_path is the PARENT session's path in BOTH
 // contexts — also USELESS. The RELIABLE discriminator, measured directly
@@ -182,8 +182,7 @@ function isSubagentContext(input) {
 // classifier here uses (isMutatingToolCall). A non-Bash tool returns false;
 // only a Bash command string is ever inspected.
 //
-// ALLOW-LIST OF PURE READS, NOT AN ENUMERATION OF RUNTIMES (2026-08-27, item
-// B1.8 — fix for a MEASURED false positive AND the false negative that a first
+// ALLOW-LIST OF PURE READS, NOT AN ENUMERATION OF RUNTIMES (fix for a MEASURED false positive AND the false negative that a first
 // runtime-enumeration attempt opened): this gate is the SOLE barrier against a
 // subagent self-granting the override (the CLI's own CLAUDE_AGENT_NAME refusal
 // is useless for subagents — env is empty for them), so the safe default MUST
@@ -293,15 +292,15 @@ function selftest() {
     'psql -c "INSERT INTO foo VALUES (1)"', 'sed -i "s/a/b/" file.txt',
     'rm -rf /tmp/x', 'mv a.txt b.txt', 'cp a.txt b.txt',
     'curl -X POST https://x', 'curl --data "x=1" https://x',
-    // ── write-shaped rules (2026-08-27, MEASURED counted-set hole) — each of
+    // ── write-shaped rules — each of
     // these 4 is a real command shape from the session that measured the
     // hole first-hand.
     "python3 - <<'EOF'\np='x.ts'\nopen(p,'w').write(s)\nEOF",
     'echo "x" > file.txt',
     'cat file | tee out.txt',
     `node -e "require('fs').writeFileSync('a','b')"`,
-    // ── PORTED (item B1.10 — single-harness port of the retired
-    // kernel/hooks/.test-fixtures/execute-boundary-parity.js §5, whose
+    // ── PORTED (single-harness port of an earlier
+    // comparative suite, whose
     // comparative corpus never exercised -c/truncate/dd/install or >>): the
     // rest of the counted-set's write shapes, so this selftest — the only
     // place isMutatingBash is exercised now that the second harness is
@@ -319,13 +318,13 @@ function selftest() {
     'psql -c "SELECT * FROM foo"', 'curl https://x',
     // the override CLI invocation itself must never self-block (pitfall from
     // items 3.3/4.3: a bare `node <path>` must not match any classifier row).
-    'node .claude/hooks/lib/execute-boundary-override.mjs --ok "founder said go"',
+    'node .claude/hooks/lib/execute-boundary-override.mjs --ok "owner said go"',
     // ── noise guards for the write-shaped rules above — must NOT count.
     'grep -rn "foo" src/ 2>/dev/null',
     'ls -la > /dev/null',
     'git status --short',
     'cat file.txt',
-    // ── PORTED (item B1.10, §5): stderr-merge (2>&1) must NOT be mistaken
+    // ── PORTED: stderr-merge (2>&1) must NOT be mistaken
     // for a file-write redirect — the digit-lookbehind exclusion in the `>`
     // rule was previously untested by this selftest (only the /dev/null
     // exclusion above was covered).
@@ -379,8 +378,7 @@ function selftest() {
 
   // isOverrideCliInvocation(toolName, toolInput) — DENY (true) any Bash command
   // that RUNS the override CLI; ALLOW (false) a pure read that only names it,
-  // and never fire for a non-Bash tool. Pure-read allow-list model (item B1.8 —
-  // see the function's header comment). Rows below lock down BOTH failure
+  // and never fire for a non-Bash tool. Pure-read allow-list model (see the function's header comment). Rows below lock down BOTH failure
   // directions: the false POSITIVE the old ^-anchored READONLY_LEAD caused
   // (compound reads → must ALLOW) and the false NEGATIVE a runtime-enumeration
   // attempt opened (wrapper / sh -c / substitution / pipe / env-prefix → must
@@ -393,8 +391,8 @@ function selftest() {
     ['Bash', 'git status', false],
     // ── false-POSITIVE cures (must ALLOW): compound reads whose lead token is
     // not the FIRST token of the whole command.
-    ['Bash', 'cd repo && grep -n founder .claude/hooks/lib/execute-boundary-override.mjs', false],
-    ['Bash', 'A=1 grep -n founder execute-boundary-override.mjs', false],
+    ['Bash', 'cd repo && grep -n owner .claude/hooks/lib/execute-boundary-override.mjs', false],
+    ['Bash', 'A=1 grep -n owner execute-boundary-override.mjs', false],
     // ── false-NEGATIVE closures (must DENY): a real run behind a wrapper,
     // shell -c, substitution, pipe, or env-prefix.
     ['Bash', "cd repo && node .claude/hooks/lib/execute-boundary-override.mjs --ok 'go'", true],

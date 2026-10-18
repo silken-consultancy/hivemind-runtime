@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // merge-settings-json.mjs — deep-merge helper for $HIVEMIND_HOME/.claude/settings.json.
 //
-// WHY THIS EXISTS (founder report): install.sh used to `sed ... > settings.json`
+// WHY THIS EXISTS: install.sh used to `sed ... > settings.json`
 // unconditionally — a full-file OVERWRITE. On a fresh install that's fine (there
 // is nothing to lose), but on a RE-install it silently deleted whatever the user
 // had added on top of the shipped defaults (extra permissions.allow entries via

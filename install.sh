@@ -4,7 +4,7 @@
 # Installs the hivemind binary to PATH and copies runtime files to $HIVEMIND_HOME.
 # Does NOT provision a certificate — run 'hivemind' after install for first-time setup.
 #
-# Components (impl 3e2c90da, phase S): the PROXY (connection layer: runtime
+# Components: the PROXY (connection layer: runtime
 # daemon + mTLS proxy, .env, binary) is always installed; the Claude Code
 # HARNESS (CLAUDE.md, settings.json, commands, hooks, statusline, isolated
 # credentials seed) is installed by default and skipped with --proxy-only.
@@ -64,16 +64,16 @@ if [ "${PROXY_ONLY}" = "1" ] \
   exit 1
 fi
 
-# ── Interactive-context check (F2.4) ──────────────────────────────────────────
+# ── Interactive-context check ──────────────────────────────────────────
 # The first USE of hivemind (interactive project-slug selection + mTLS
 # enrollment) requires a real interactive terminal — neither works in a
 # non-interactive/piped context, where bin/hivemind now fails closed (cmd_open,
-# F2.3). Surface that requirement HERE, at install time, so it's discovered up
+# ). Surface that requirement HERE, at install time, so it's discovered up
 # front instead of on the first silent first-run failure. We WARN and continue
 # (do NOT hard-abort): the file-copy/dependency steps below are safe to run
 # non-interactively (e.g. an automated `curl … | bash` provisioning), and only
 # the subsequent `hivemind` first-run needs the TTY. The check itself (not hard
-# enforcement) is the F2.4 requirement.
+# enforcement) is the interactive-context requirement.
 if ! { [ -t 0 ] && [ -t 1 ]; }; then
   echo "AVISO: a instalação e o primeiro uso do hivemind exigem um terminal interativo —" >&2
   echo "       seleção de projeto e enrollment (mTLS) não funcionam em modo não-interativo." >&2
@@ -153,7 +153,7 @@ _set_env_kv() {
 touch "${HIVEMIND_HOME}/.env"
 _set_env_kv HIVEMIND_ENDPOINT "${HIVEMIND_ENDPOINT}"
 
-# Pin the update source (item 4.4, hivemind update): the remote URL + branch
+# Pin the update source (hivemind update): the remote URL + branch
 # recorded HERE, once, at install time — 'hivemind update' pulls from this
 # pinned pair, not from whatever the local clone's remote/branch might drift
 # to later. This is requirement 1 (fonte pinada) of the hardened pull-agent.
@@ -167,7 +167,7 @@ if [ -d "${SCRIPT_DIR}/.git" ]; then
   _set_env_kv HIVEMIND_UPDATE_BRANCH "${_pinned_branch}"
 fi
 
-# ── Credentials kept by `hivemind uninstall --keep-certs` (blocker 3b7a507e) ──
+# ── Credentials kept by `hivemind uninstall --keep-certs` ──
 # The cert files alone do not start the mTLS proxy: MTLS_CERT_PATH/KEY_PATH/
 # CA_PATH, HIVEMIND_OWNER and FOS_API_KEY lived in the .env that uninstall
 # removed, so it parked those lines (MTLS_* + HIVEMIND_OWNER + FOS_API_KEY) in
@@ -199,7 +199,7 @@ if [ -f "${_KEPT_CREDENTIALS}" ]; then
 fi
 
 # ── Copy files ────────────────────────────────────────────────────────────────
-# NOTE (item 1.6, prompts não expostos): self-core.seed does NOT exist in this
+# NOTE (prompts não expostos): self-core.seed does NOT exist in this
 # repo anymore and must NEVER be added back to this copy list. The espinha
 # (identity/posture/resonance/purpose/voice) is provisioned server-side at
 # enrollment and read via fos_recall({mode:'topic', topic:'self/core'}) — see
@@ -210,13 +210,12 @@ fi
 # (proxy+harness) install stays line-for-line what it was.
 if [ "${PROXY_ONLY}" != "1" ]; then
 # CLAUDE.md is copied under .claude/ (not $HIVEMIND_HOME root) so Claude Code's
-# CLAUDE_CONFIG_DIR-scoped global-CLAUDE.md discovery picks it up (item 5.2,
-# F2 isolation — measured: $CLAUDE_CONFIG_DIR/CLAUDE.md is the real path read,
+# CLAUDE_CONFIG_DIR-scoped global-CLAUDE.md discovery picks it up (measured: $CLAUDE_CONFIG_DIR/CLAUDE.md is the real path read,
 # NOT $CLAUDE_CONFIG_DIR/../CLAUDE.md). Source in the repo stays at the root
 # for readability — only the copy DESTINATION moved.
 cp "${SCRIPT_DIR}/CLAUDE.md" "${HIVEMIND_HOME}/.claude/CLAUDE.md"
 
-# settings.json is TEMPLATED, not copied literally (F5.3): it ships with a
+# settings.json is TEMPLATED, not copied literally: it ships with a
 # __HIVEMIND_HOME__ placeholder in statusLine.command / hooks.UserPromptSubmit
 # (the absolute path Claude Code's config schema requires — no relative/env-var
 # expansion is done by the harness itself). HIVEMIND_HOME is only known here,
@@ -224,7 +223,7 @@ cp "${SCRIPT_DIR}/CLAUDE.md" "${HIVEMIND_HOME}/.claude/CLAUDE.md"
 # pattern as _set_env_kv above — ADDITIVE to the existing copy step, not the
 # rejected --profile mechanism.
 #
-# MERGE-SAFE (founder report): a re-install used to `sed ... >` this file
+# MERGE-SAFE: a re-install used to `sed ... >` this file
 # directly — a full-file OVERWRITE that silently deleted whatever the user had
 # added on top of the shipped defaults (extra permissions.allow/deny entries
 # via /config, a custom hook, etc.), forcing full reconfiguration on every
@@ -249,8 +248,8 @@ bun run "${SCRIPT_DIR}/scripts/merge-settings-json.mjs" \
   "${HIVEMIND_HOME}/.claude/settings.json" "${_templated_settings}"
 rm -f "${_templated_settings}"
 
-# Copy product slash-commands (item 5.3, F3 — /boot + /end-session).
-# These are THIN STUBS (Branch B, decision_serve-boot-and-end-session-as-mcp-prompts-fail-closed):
+# Copy product slash-commands (/boot + /end-session).
+# These are THIN STUBS:
 # the canonical procedure body no longer lives here — each stub fetches it live from the
 # engram via fos_procedure({id}) at invocation time and executes it verbatim. FAIL-CLOSED:
 # if the engram is unreachable, the stub does not fall back to any local copy — the session
@@ -258,7 +257,7 @@ rm -f "${_templated_settings}"
 mkdir -p "${HIVEMIND_HOME}/.claude/commands"
 cp -r "${SCRIPT_DIR}/.claude/commands/." "${HIVEMIND_HOME}/.claude/commands/"
 
-# Copy the status-CLI (F5) + quota-capture hook (F5) referenced by the
+# Copy the status-CLI + quota-capture hook referenced by the
 # templated settings.json above — same __HIVEMIND_HOME__-resolved absolute
 # paths point here.
 mkdir -p "${HIVEMIND_HOME}/bin"
@@ -273,7 +272,7 @@ cp -r "${SCRIPT_DIR}/.claude/hooks/." "${HIVEMIND_HOME}/.claude/hooks/"
 
 # Seed the isolated CONFIG_DIR's Claude Code credentials from the user's
 # personal ones ONLY when the isolated destination doesn't have one yet
-# (item 5.0, F0 auth) — best-effort, seed-on-absence by design. A live,
+# best-effort, seed-on-absence by design. A live,
 # already-logged-in isolated credential must never be clobbered by a
 # possibly-stale personal copy on every (re)install/re-enroll — that was
 # measured to force a spurious logout on every reinstall. If neither exists,
@@ -304,10 +303,10 @@ rsync -a --exclude='node_modules/' --exclude='bun.lock' \
 # ── Install bun dependencies ──────────────────────────────────────────────────
 echo "Instalando dependências do runtime (bun install)..."
 # --production: runtime deps only — a user install never gets the
-# devDependencies (typescript, @types/bun) (impl 3e2c90da, item D3).
+# devDependencies (typescript, @types/bun).
 (cd "${HIVEMIND_HOME}/runtime" && bun install --production --silent 2>/dev/null || bun install --production)
 
-# ── Component marker (phase S2) — read by bin/hivemind's _has_harness ─────────
+# ── Component marker — read by bin/hivemind's _has_harness ─────────
 # (the proxy-only marker was already written before the runtime copy, above)
 if [ "${PROXY_ONLY}" != "1" ]; then
   printf 'proxy harness\n' > "${HIVEMIND_HOME}/.components"
@@ -354,7 +353,7 @@ if [ "${PROXY_ONLY}" = "1" ]; then
   echo "Instalação só-proxy: 'hivemind' sobe o proxy e mostra como conectar o seu cliente MCP."
 fi
 
-# ── Autostart (impl 3e2c90da, phase A) — ONLY with --autostart ────────────────
+# ── Autostart — ONLY with --autostart ────────────────
 # Runs the binary just installed. It needs a certificate; without one the
 # install still succeeds and the exact next step is printed.
 if [ "${AUTOSTART}" = "1" ]; then

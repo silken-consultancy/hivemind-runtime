@@ -27,7 +27,7 @@ import { existsSync, mkdirSync, writeFileSync, chmodSync, unlinkSync, renameSync
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-// Product endpoint — parametrized (P0 fix). Set via HIVEMIND_ENDPOINT env
+// Product endpoint — parametrized. Set via HIVEMIND_ENDPOINT env
 // (written by install.sh --endpoint; preserved across enrollment).
 const ENDPOINT = process.env.HIVEMIND_ENDPOINT ?? 'hivemind.ia.br:4443';
 
@@ -123,7 +123,7 @@ function resolveTenant(responseTenant: string | undefined, certPem: string): str
   return undefined;
 }
 
-// ── Setup nonce (F2, security impl 9658277f, R2) ─────────────────────────────
+// ── Setup nonce ─────────────────────────────
 //
 // The origin guard (lib/request-guard.ts) stops web pages; it cannot stop a
 // local process that simply omits Origin. So /enroll also requires a one-shot
@@ -317,7 +317,7 @@ function renderSetupPage(pageNonce: string): string {
 //  6. Merge-write $HIVEMIND_HOME/.claude/.claude.json (mcpServers.engram, incl.
 //     headers['x-fos-key']) — the only path Claude Code actually reads for
 //     user-scope MCP discovery (measured, CLI v2.1.207; ~/.claude/mcp.json and
-//     ~/.mcp.json are dead paths, never read — item 5.1/F1 fix)
+//     ~/.mcp.json are dead paths, never read)
 //  7. Return { ok: true, tenant }
 //
 // Reached only through createSetupRouter's /enroll wrapper (nonce checked,
@@ -467,12 +467,12 @@ async function handleEnroll(c: Context): Promise<Response> {
 
     // 5. Merge-write $HIVEMIND_HOME/.env with MTLS_* vars + FOS_API_KEY (item
     // 6.1, auth cert+chave). FOS_API_KEY is consumed by the DAEMON now
-    // (atomic-flip, round-2 2026-07-30): mtls-proxy.ts injects x-fos-key
+    // (atomic flip): mtls-proxy.ts injects x-fos-key
     // server-side on the outbound hop from this same .env var (exported into
     // the daemon's env by bin/hivemind's `set -a; . .env; set +a`) — Claude
     // Code's own MCP config (step 6 below) no longer carries the key at all.
     //
-    // MERGE-SAFE (root cause fix, measured via fos_report 226b1fee): this used
+    // MERGE-SAFE (root cause fix, measured): this used
     // to be a bare writeFileSync of ONLY these ~8 keys, with no read of the
     // existing file — a full-file OVERWRITE that erased whatever install.sh
     // had written into this SAME .env seconds earlier, in particular
@@ -547,10 +547,10 @@ async function handleEnroll(c: Context): Promise<Response> {
     // 6. Merge-write $HIVEMIND_HOME/.claude/.claude.json — the only path
     // Claude Code v2.1.207 actually reads for user-scope MCP server discovery
     // (measured; ~/.claude/mcp.json and ~/.mcp.json below are DEAD paths,
-    // never read by this CLI version — this is the item 5.1/F1 contract fix).
+    // never read by this CLI version).
     // MERGE-SAFE: read→parse (try/catch, corrupted/absent → {}) →spread→
     // overwrite only mcpServers.engram, so any OTHER top-level key or other
-    // mcpServers.* entry that already exists survives (P1 pitfall — tested:
+    // mcpServers.* entry that already exists survives (pitfall — tested:
     // running enrollment twice, and against a pre-existing .claude.json with
     // an arbitrary extra key + another mcpServers.* entry, both survive).
     const claudeConfigPath = join(hivemindHome, '.claude', '.claude.json');
@@ -576,14 +576,14 @@ async function handleEnroll(c: Context): Promise<Response> {
         existingConfig = {};
       }
     }
-    // mcpServers.engram (atomic-flip, round-2 2026-07-30 — supersedes the
-    // item 6.1 headers['x-fos-key'] template + its OPEN-cfg-A live-expansion
+    // mcpServers.engram (atomic flip — supersedes the
+    // earlier headers['x-fos-key'] template + its live-expansion
     // proof, both removed here): url is now https://127.0.0.1:<port>/v1/mcp, matching the
-    // local HTTPS-only listener (mtls-proxy.ts item 1.1(B)) — validates
-    // against the local CA trusted into the system store by item 1.4, so no
+    // local HTTPS-only listener (mtls-proxy.ts) — validates
+    // against the local CA trusted into the system store, so no
     // manual "accept this certificate" prompt. NO headers written: the proxy
     // injects x-fos-key server-side from FOS_API_KEY in .env (mtls-proxy.ts
-    // item 1.1(A)), so this file — readable by anything with fs access to
+    // the proxy), so this file — readable by anything with fs access to
     // $HIVEMIND_HOME — carries zero secret material regardless of what wrote
     // or read it.
     const mergedConfig = {

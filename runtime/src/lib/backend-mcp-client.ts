@@ -6,12 +6,12 @@
 //
 // Deliberately targets the upstream DIRECTLY via mTLS (mtlsCredentials()'s
 // cert/key/ca + upstream URL), NEVER the local loopback proxy
-// (mtls-proxy.ts) that this same daemon manages — explicit founder
-// instruction, same reasoning DR-2.3 already applies to close/pause/resume:
+// (mtls-proxy.ts) that this same daemon manages — explicit owner
+// instruction, same reasoning already applies to close/pause/resume:
 // administrative daemon→backend calls must not be coupled to the health of
 // the proxy the daemon is itself responsible for.
 //
-// CORRECTED (Fase 2 review, measured live): this used to call
+// CORRECTED (measured live): this used to call
 // mtlsProxyConfig(), which gates on MTLS_PROXY_PORT — a precondition for the
 // LOCAL PROXY LISTENER, not for whether this process can reach the backend
 // directly. That coupled every daemon→backend call to whether the proxy was

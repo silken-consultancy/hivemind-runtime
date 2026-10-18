@@ -27,7 +27,7 @@
 //     produto é lido antes do fallback pessoal.
 //     Não logamos, não copiamos, não enviamos a lugar nenhum além de api.anthropic.com
 //     (audiência legítima do próprio token; uso = auto-monitoramento da própria conta).
-//   - CACHE (gate F5.2, confirmado nesta porta): a constante abaixo usa
+//   - CACHE: a constante abaixo usa
 //     os.homedir() diretamente — NÃO é escopada por CLAUDE_CONFIG_DIR. Resolve
 //     sempre para ~/.claude/cache/usage.json (o home REAL do usuário), mesmo
 //     dentro de uma sessão hivemind com CLAUDE_CONFIG_DIR isolado. Isso é

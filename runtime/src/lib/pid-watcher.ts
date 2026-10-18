@@ -10,7 +10,7 @@
 //
 // The returned cleanup function cancels the polling WITHOUT triggering onExit.
 //
-// Cross-platform flag (DR-5.2, docs/ARCHITECTURE.md): process.kill(pid, 0)
+// Cross-platform flag (see docs/ARCHITECTURE.md): process.kill(pid, 0)
 // under Bun/Node on NATIVE Windows (not WSL) has different semantics — no
 // real POSIX signal 0 delivery, the implementation maps it to a different
 // existence check. Reconfirm this when/if Windows support is scheduled;

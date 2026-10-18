@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # hivemind — HiveMind thin CLI.
 #
-# Analogous to silken-runtime but standalone — zero lab deps.
+# Standalone launcher — no external runtime dependencies.
 # Runs in the user's project directory; slug = explicit arg or interactive
 # picker (fail-closed if non-interactive — no basename(cwd) fallback).
 #
@@ -43,17 +43,16 @@ PROXY_PORT="${MTLS_PROXY_PORT:-7779}"
 RUNTIME_LOG="${HOME}/.engram/cache/hivemind-runtime.log"
 RUNTIME_PID_FILE="${HOME}/.engram/cache/hivemind-runtime.pid"
 # Leftover-session pidfile from an interrupted --setup-only run (see _setup_mode
-# / cmd_stop hardening, item 4.2) — best-effort cleanup, not fatal if absent.
+# / cmd_stop hardening) — best-effort cleanup, not fatal if absent.
 SETUP_PID_FILE="${HOME}/.engram/cache/hivemind-setup.pid"
 CERT_DIR="${HOME}/.engram/mtls"
 RUNTIME_BIN="${HIVEMIND_HOME}/runtime/src/server.ts"
 # `hivemind install`'s Antigravity candidate — the WSL↔Windows bridge root
-# (measured, 62e96c8e item 4.4: Windows-side config lives at
+# (measured: Windows-side config lives at
 # <root>/<user>/.gemini/config/mcp_config.json). Overridable so tests can
 # point detection at a fixture tree instead of a real /mnt/c mount.
 ANTIGRAVITY_WINDOWS_USERS_ROOT="${ANTIGRAVITY_WINDOWS_USERS_ROOT:-/mnt/c/Users}"
-# Local HTTPS loopback listener cert (round-2, item 1.1(B)/1.4, founder
-# 2026-07-30) — generated lazily by mtls-proxy.ts under this subdir, DISTINCT
+# Local HTTPS loopback listener cert — generated lazily by mtls-proxy.ts under this subdir, DISTINCT
 # from CERT_DIR's enrollment client cert. Trusted into the WSL/Linux system
 # store here so a strict-TLS IDE client validates it without a skip-verify
 # flag (see _trust_local_ca).
@@ -68,19 +67,19 @@ _UNINSTALL_CA_DEST_OVERRIDE="${HIVEMIND_SYSTEM_CA_DEST:-}"
 # (_print_connect_hints), snapshotted from the PROCESS env before the .env
 # load, same as above — a .env line never chooses what URL is printed.
 _DIRECT_MCP_URL_OVERRIDE="${HIVEMIND_DIRECT_MCP_URL:-}"
-# Managed update source (impl 3e2c90da, item D1). The canonical remote every
+# Managed update source. The canonical remote every
 # install updates from once its source is moved to ${HIVEMIND_HOME}.src
 # (_maybe_migrate_source). HIVEMIND_CANONICAL_REMOTE is a test seam read from
 # the PROCESS env only, snapshotted here before the .env load like the
 # overrides above — a .env line never chooses where the CLI clones from, nor
-# which clone `uninstall all` may remove. F11: honoured only together with the
+# which clone `uninstall all` may remove. Honoured only together with the
 # explicit test-mode flag HIVEMIND_TEST_SEAMS=1 (also process env only), so a
 # stray exported variable alone can never redirect a real install's updates.
 _CANONICAL_REMOTE="https://github.com/silken-consultancy/hivemind-runtime.git"
 if [ "${HIVEMIND_TEST_SEAMS:-}" = "1" ] && [ -n "${HIVEMIND_CANONICAL_REMOTE:-}" ]; then
   _CANONICAL_REMOTE="${HIVEMIND_CANONICAL_REMOTE}"
 fi
-# Blocker 3b7a507e. `hivemind uninstall --keep-certs` parks the enrollment
+# `hivemind uninstall --keep-certs` parks the enrollment
 # credentials of $HIVEMIND_HOME/.env here (mode 0600); install.sh merges them
 # back into the new .env and deletes the file.
 KEPT_CREDENTIALS_FILE="${HOME}/.engram/kept-credentials.env"
@@ -89,7 +88,7 @@ KEPT_CREDENTIALS_FILE="${HOME}/.engram/kept-credentials.env"
 # seam), snapshotted before the .env load like the overrides above.
 _PROXY_WAIT_SECS="${HIVEMIND_PROXY_WAIT_SECS:-10}"
 case "${_PROXY_WAIT_SECS}" in '' | *[!0-9]*) _PROXY_WAIT_SECS=10 ;; esac
-# `hivemind autostart` (impl 3e2c90da, phase A). Snapshotted from the PROCESS
+# `hivemind autostart`. Snapshotted from the PROCESS
 # env before the .env load, like the overrides above — a .env line never
 # chooses where a unit / Startup file is written. XDG_CONFIG_HOME: the systemd
 # --user unit dir and the XDG autostart dir. HIVEMIND_WINDOWS_STARTUP_DIR (test
@@ -98,8 +97,8 @@ case "${_PROXY_WAIT_SECS}" in '' | *[!0-9]*) _PROXY_WAIT_SECS=10 ;; esac
 _AUTOSTART_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
 _AUTOSTART_STARTUP_OVERRIDE="${HIVEMIND_WINDOWS_STARTUP_DIR:-}"
 _AUTOSTART_WSL_OVERRIDE="${HIVEMIND_AUTOSTART_WSL:-}"
-# WSL interop probe dir (A6) and the daemon detach mechanism (I8). Test seams,
-# process env only, honoured only with HIVEMIND_TEST_SEAMS=1 (like F11 above):
+# WSL interop probe dir and the daemon detach mechanism. Test seams,
+# process env only, honoured only with HIVEMIND_TEST_SEAMS=1 (like the one above):
 # HIVEMIND_WSL_BINFMT_DIR replaces /proc/sys/fs/binfmt_misc;
 # HIVEMIND_DETACH_VIA=setsid|pgid forces one of _detach_begin's two paths
 # (setsid falls back to pgid when there is no setsid binary to run).
@@ -138,23 +137,22 @@ fi
 RUNTIME_PORT="${AR_PORT:-${RUNTIME_PORT}}"
 PROXY_PORT="${MTLS_PROXY_PORT:-${PROXY_PORT}}"
 
-# ── Option 2 per-target proxy (fos_decision 1caee6a7, item 18cff9b7) ────────
+# ── per-target proxy ────────
 # `hivemind install <target>` allocates a DEDICATED loopback port + mints a
 # device_id per installed target, instead of every foreign client sharing
-# PROXY_PORT — full design: fos_sketchpad 4f8142e3 § ADDENDUM 3. Persisted to
+# PROXY_PORT. Persisted to
 # PORT_MAP_FILE (sibling to CERT_DIR, same owner-scoped ~/.engram/mtls root);
 # read by runtime/src/lib/mtls-proxy.ts's startAllMtlsProxies() at daemon boot
 # and on every POST /internal/proxy/reload.
 PORT_MAP_FILE="${CERT_DIR}/port-map.json"
 # Range default 7780-7879 (100 max installed targets) — a technical default
-# with an obvious safe choice, not escalated as a founder fork (ADDENDUM 3
-# OPEN 17). Tunable via env, mirroring the existing MTLS_PROXY_PORT override
+# with an obvious safe choice, not escalated as an open question. Tunable via env, mirroring the existing MTLS_PROXY_PORT override
 # pattern. Computed AFTER the PROXY_PORT refresh above so a .env-overridden
 # MTLS_PROXY_PORT shifts the range with it.
 MTLS_INSTALL_PORT_RANGE_START="${MTLS_INSTALL_PORT_RANGE_START:-$((PROXY_PORT + 1))}"
 MTLS_INSTALL_PORT_RANGE_END="${MTLS_INSTALL_PORT_RANGE_END:-$((PROXY_PORT + 100))}"
 
-# ── Installed components (impl 3e2c90da, phase S) ───────────────────────────
+# ── Installed components ───────────────────────────
 # PROXY = the connection layer (daemon + mTLS proxy, runtime/, .env, ~/.engram,
 # target wiring) — always installed. HARNESS = the optional Claude Code layer
 # ($HIVEMIND_HOME/.claude: CLAUDE.md, settings.json, commands/, hooks/ + the
@@ -203,11 +201,10 @@ _vecho() {
 }
 
 # ── _brand_header: quiet-by-default output still shows this once ───────────
-# F6.1 — minimal ASCII identity block: small, simple geometry (a single glyph
+# Minimal ASCII identity block: small, simple geometry (a single glyph
 # + two lines), NOT a logo/illustration — studio is out of scope here (glyph
 # is a placeholder for studio to revise later). Shows the resolved endpoint
-# (HIVEMIND_ENDPOINT, defaulting to the product's own domain) so a lab<->
-# product swap via .env is visible at every startup, not just in the .env file.
+# (HIVEMIND_ENDPOINT, defaulting to the product's own domain) so an endpoint swap via .env is visible at every startup, not just in the .env file.
 _brand_header() {
   echo ""
   echo "  $(_ok "◆") HiveMind — shared memory runtime"
@@ -217,7 +214,7 @@ _brand_header() {
 # ── _has_cert: returns 0 only if THIS owner's cert exists (owner-scoped) ─────
 # Aligned with _check_health / cmd_status (:301+), which validate exactly
 # "${CERT_DIR}/${HIVEMIND_OWNER}.cert.pem". A bare `ls *.cert.pem` glob (the
-# previous impl) accepted a cert belonging to ANY owner — so a machine that
+# previous implementation) accepted a cert belonging to ANY owner — so a machine that
 # already enrolled owner A would silently SKIP setup for owner B, then present
 # owner B a runtime authenticated as A. Owner-scoped here closes that: another
 # owner's cert present + this owner's cert absent → _has_cert fails → _setup_mode.
@@ -316,7 +313,7 @@ _check_health() {
     fi
   fi
 
-  # Endpoint reachability — new check (item 4.3), public path, no cert needed.
+  # Endpoint reachability — new check, public path, no cert needed.
   if _endpoint_ok; then
     _HEALTH_ENDPOINT_OK=1
   fi
@@ -362,7 +359,7 @@ _kill_wait_escalate() {
 }
 
 # ── Detach: the daemon is NEVER in the launching terminal's process group ────
-# I8, measured 2026-10-07 on a live install: a launch auto-updated, restarted
+# Measured on a live install: a launch auto-updated, restarted
 # the daemon from that terminal, and a Ctrl+C at the project menu shut it down
 # (`SIGINT — shutting down`, proxy down). The tty delivers SIGINT/SIGQUIT/
 # SIGTSTP to its whole FOREGROUND process group, and a plain `cmd &` from a
@@ -442,7 +439,7 @@ _setup_stop_daemon() {
 }
 
 # ── _setup_interrupted <INT|TERM|HUP>: _setup_mode's signal trap ─────────────
-# The setup daemon runs in its own session (I8), so the terminal's Ctrl+C no
+# The setup daemon runs in its own session, so the terminal's Ctrl+C no
 # longer kills it as a side effect; this is the deliberate teardown that
 # replaces that accident. Armed BEFORE the spawn: a signal in the gap between
 # the `&` and `_SETUP_PID=$!` (bash runs the trap between the two) still finds
@@ -512,14 +509,12 @@ _setup_mode() {
   # (identity-guarded via _pid_is_hivemind_runtime, never touches a foreign
   # process) unconditionally, healthy or not: re-enroll SUBSTITUTES the
   # running daemon rather than refusing or requiring a manual `hivemind stop`
-  # first (single-owner-per-machine — decision
-  # decision_hivemind-single-owner-per-machine-and-re-enroll-replaces,
-  # founder 2026-08-07). The daemon this reaps only ever serves THIS
+  # first (single-owner-per-machine). The daemon this reaps only ever serves THIS
   # machine's single owner, so replacing it is always safe; there is no
   # multi-owner coexistence case to protect against here.
   _reap_stale_runtime
 
-  # One-shot setup nonce (F2, security impl 9658277f, R2). The setup daemon's
+  # One-shot setup nonce. The setup daemon's
   # POST /setup/enroll rewrites this machine's FOS_API_KEY/HIVEMIND_OWNER/cert,
   # so it only accepts a request carrying this secret: handed to the daemon
   # via the process environment ONLY (never written to disk, never passed on
@@ -539,7 +534,7 @@ _setup_mode() {
 
   _vecho "[hivemind] setup: runtime=${RUNTIME_BIN} port=${RUNTIME_PORT} log=${RUNTIME_LOG}"
   _vecho "[hivemind] setup: endpoint=${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443} (enrollment goes to the 443/LE surface of this host)"
-  # Own session / process group (I8, see _detach_begin) — but unlike the
+  # Own session / process group (see _detach_begin) — but unlike the
   # runtime this daemon belongs to the enrollment THIS launcher drives: on a
   # Ctrl+C / termination / hangup the trap stops it deliberately (SIGTERM,
   # identity-guarded, pidfile removed) instead of the terminal's SIGINT hitting
@@ -644,7 +639,7 @@ _setup_mode() {
   # The setup daemon must be GONE, not merely signalled, before we tell the user
   # to run `hivemind`: it holds ${RUNTIME_PORT}, and setup-only mode never starts
   # the mTLS proxy. A lingering one makes the very next `hivemind` see "runtime
-  # up on ${RUNTIME_PORT}, proxy ${PROXY_PORT} dead" — the founder-reported
+  # up on ${RUNTIME_PORT}, proxy ${PROXY_PORT} dead" — the user-reported
   # "mTLS proxy: not responding" right after a SUCCESSFUL enroll. The reap in
   # _start_proxy now recovers from that state; waiting here means it should
   # never be entered in the first place.
@@ -652,7 +647,7 @@ _setup_mode() {
   _setup_stop_daemon "${_SETUP_PID}"
   echo ""
   echo "Done. Run 'hivemind' in your project directory to start."
-  # Wizard-was-orphan fix (reinforcement_zero-friction-setup-is-product-law):
+  # Wizard-was-orphan fix:
   # proactively surface `hivemind install` right after a successful first
   # enrollment for any detectable-but-unmapped client target — non-blocking,
   # the offer itself is the discovery mechanism. One-time event (this
@@ -688,7 +683,7 @@ _proxy_ok() {
 # _setup_mode removes SETUP_PID_FILE the moment enrollment ends. So a daemon
 # that outlived the shell that spawned it, or one left over from an interrupted
 # enrollment, can hold ${RUNTIME_PORT} while being invisible to BOTH the pidfile
-# reap below AND `hivemind stop` — which is exactly why the founder's only way
+# reap below AND `hivemind stop` — which is exactly why the owner's only way
 # out was a manual stop+start that, by luck, also cleared SETUP_PID_FILE.
 #
 # Selection is by IDENTITY, never by port: a candidate must carry the FULL
@@ -739,7 +734,7 @@ _reap_orphan_runtimes() {
 # ${PROXY_PORT} is dead — while a RUNTIME_PID_FILE-only reap finds nothing to
 # kill and the fresh spawn then dies on EADDRINUSE. That is the measured
 # "enrolled fine, then 'mTLS proxy: not responding' until a manual stop+start"
-# bug (founder, 2026-07-31): _setup_mode signalled its daemon and exited without
+# bug: _setup_mode signalled its daemon and exited without
 # waiting, and nothing downstream owned the leftover.
 _reap_stale_runtime() {
   local _f _pid
@@ -769,11 +764,11 @@ _reap_stale_runtime() {
 # of burning the full 15s timeout. Returns 0 on success, 1 otherwise.
 _spawn_runtime() {
   local _pid
-  # Own session / process group (I8, see _detach_begin): a Ctrl+C in the
+  # Own session / process group (see _detach_begin): a Ctrl+C in the
   # launching terminal — including the auto-update restart, which reaches here
   # through _start_proxy from the user's own `hivemind` — must never reach the
   # daemon. nohup + disown stay: the daemon must survive the terminal that launched it
-  # closing (Fase 1, DR-1.1) — nohup makes the child IGNORE SIGHUP (portable
+  # closing — nohup makes the child IGNORE SIGHUP (portable
   # POSIX, kept on the pgid fallback where there is no setsid); disown drops the job
   # from bash's job table so the shell itself never signals the child when
   # this script exits. Neither alone is enough: nohup without disown can
@@ -781,7 +776,7 @@ _spawn_runtime() {
   # stdin from /dev/null — nohup does not do this itself, and a detached
   # process with no terminal reading stdin can otherwise block/misbehave.
   # HIVEMIND_DEVICE_ID is exported into the daemon's env here so later
-  # reconcile/event-emission (Fase 2/4) can tag its own device without a
+  # reconcile/event-emission can tag its own device without a
   # second, divergent notion of "device" inside the daemon process.
   _detach_begin nohup
   HIVEMIND_DEVICE_ID="$(_resolve_device_id)" \
@@ -824,9 +819,9 @@ _local_ca_trusted() {
   [ -n "${_have}" ] && [ "${_have}" = "${_want}" ]
 }
 
-# ── _trust_local_ca: item 1.4 — trust the local HTTPS listener CA into the
+# ── _trust_local_ca: trust the local HTTPS listener CA into the
 # WSL/Linux system store (this machine only; Windows/Antigravity trust is
-# Phase 4 item 4.4, out of scope here). No-op when the local CA has not been
+# out of scope here). No-op when the local CA has not been
 # generated yet (mtls-proxy.ts generates it lazily on first proxy start —
 # nothing to trust before that) or when already trusted (idempotent).
 # System-level act (sudo + update-ca-certificates) — this is the ONE place
@@ -850,7 +845,7 @@ _trust_local_ca() {
   fi
 }
 
-# ── Blocker 3b7a507e (b): a certificate alone does not make a running proxy ───
+# ── (b) a certificate alone does not make a running proxy ───
 # The daemon starts the mTLS proxy only when MTLS_PROXY_PORT + MTLS_CERT_PATH/
 # KEY_PATH/CA_PATH reach it (server.ts: "[mtls-proxy] disabled ..."), and the
 # proxy authenticates with HIVEMIND_OWNER + FOS_API_KEY — all written to .env by
@@ -924,7 +919,7 @@ _require_proxy_listening() {
 _start_proxy() {
   # Fast path: an already-healthy runtime+proxy is reused untouched.
   if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; then
-    # Item 1.4: ensure the local HTTPS cert (if present) is trusted BEFORE
+    # Ensure the local HTTPS cert (if present) is trusted BEFORE
     # the _proxy_ok probe below — that probe is now an https:// request, so
     # an untrusted CA would make a perfectly healthy proxy read as "down"
     # (SSL verify failure, not connection-refused) and trigger a needless
@@ -970,7 +965,7 @@ _start_proxy() {
   # healthz(7777) confirmed above by _spawn_runtime — by server.ts's own
   # startup order, startMtlsProxy() (and its lazy cert generation) runs
   # synchronously BEFORE the main app's Bun.serve, so LOCAL_HTTPS_CA already
-  # exists on disk here if the proxy is configured at all (item 1.4).
+  # exists on disk here if the proxy is configured at all.
   _trust_local_ca
   _require_proxy_listening "$(cat "${RUNTIME_PID_FILE}" 2>/dev/null || echo '')"
 }
@@ -1002,7 +997,7 @@ cmd_help() {
   echo "                         client (Cursor, Cowork, Antigravity) reaches the written"
   echo "                         https://127.0.0.1:<port>/v1/mcp URL AS-IS — WSL2's own default"
   echo "                         localhost-forwarding already bridges it to the Linux-side listener,"
-  echo "                         no extra relay/bridge setup needed (confirmed working, founder-tested)."
+  echo "                         no extra relay/bridge setup needed (confirmed working)."
   echo "  hivemind uninstall [all|harness] [--yes] [--keep-certs]"
   echo "                         Remove everything HiveMind installed on this machine (all, default),"
   echo "                         or only the Claude Code harness (harness) — lists it first."
@@ -1069,7 +1064,7 @@ cmd_start() {
   _start_proxy
   echo "[hivemind] proxy running on port ${PROXY_PORT}"
   _maybe_surface_install_candidates
-  # Proxy-only installs only (phase S4) — the proxy+harness output is unchanged.
+  # Proxy-only installs only — the proxy+harness output is unchanged.
   if ! _has_harness; then _print_connect_hints; fi
 }
 
@@ -1080,7 +1075,7 @@ cmd_stop() {
     if [ -n "${_pid}" ] && kill -0 "${_pid}" 2>/dev/null; then
       if _pid_is_hivemind_runtime "${_pid}"; then
         kill "${_pid}"
-        # DR-3.2: wait (bounded) for the daemon to actually exit, escalating
+        # Wait (bounded) for the daemon to actually exit, escalating
         # to SIGKILL if it doesn't — mirrors _reap_stale_runtime's own
         # wait+escalate (:286-293). Without this, `cmd_stop` used to
         # return the instant the signal was SENT, not once the process was
@@ -1129,7 +1124,7 @@ cmd_restart() {
   echo "[hivemind] restarted"
 }
 
-# ── Autostart (impl 3e2c90da, phase A: A1 + A3) ───────────────────────────────
+# ── Autostart ───────────────────────────────
 # `hivemind autostart on|off|status` — opt-in, default OFF: nothing here runs
 # unless the user (or `install.sh --autostart`) asks. A default install, an
 # update and every other command never create an autostart entry.
@@ -1146,7 +1141,7 @@ cmd_restart() {
 #                               `wsl.exe -d <distro> -u <user> --exec <this binary> autostart
 #                               wsl-boot`, which starts the proxy (only when no systemd unit
 #                               owns it) and then keeps the distro alive with one
-#                               `sleep infinity` (founder 2026-10-05 A-1: per-user keep-alive,
+#                               `sleep infinity` (per-user keep-alive,
 #                               no global .wslconfig change).
 # Requires a certificate (a log-on start must never land in interactive
 # enrollment). Paths are baked into the unit / Startup file, so a path the
@@ -1154,7 +1149,7 @@ cmd_restart() {
 _AUTOSTART_UNIT="hivemind-proxy.service"
 _AUTOSTART_STARTUP_NAME="hivemind-wsl.cmd"
 _AUTOSTART_KEEPALIVE_PID="${HOME}/.engram/cache/hivemind-wsl-keepalive.pid"
-# A7 refinement: the local record that `autostart on` wrote a Windows Startup
+# Refinement: the local record that `autostart on` wrote a Windows Startup
 # trigger (one line: its Linux path; mode 600). Lets off/uninstall tell "the
 # folder is unresolvable from this shell AND a trigger was written here" (a
 # real leftover → failure + manual path) from "never enabled" (a note, rc 0).
@@ -1169,7 +1164,7 @@ _autostart_is_wsl() {
     1) return 0 ;;
     0) return 1 ;;
   esac
-  # A6: WSL = a WSL distro name AND Windows interop. Never the kernel release
+  # WSL = a WSL distro name AND Windows interop. Never the kernel release
   # alone: a Linux container on Docker Desktop shares the WSL2 kernel
   # (osrelease says "microsoft") yet has no interop, so the WSL branch (Windows
   # Startup folder via cmd.exe) can only fail there — measured by the install
@@ -1180,13 +1175,13 @@ _autostart_is_wsl() {
   command -v cmd.exe > /dev/null 2>&1
 }
 
-# A7: "a Windows Startup trigger MAY exist" — wider than _autostart_is_wsl,
+# "A Windows Startup trigger MAY exist" — wider than _autostart_is_wsl,
 # for the paths that REMOVE or LIST it (off / uninstall / status). A shell
 # entered through ssh / su / sudo loses WSL_DISTRO_NAME and /mnt/c on PATH, so
 # _autostart_is_wsl says no, yet the WSLInterop binfmt entry (system-wide, not
 # per-env) still marks a WSL distro whose user may have run `autostart on`. A
 # Docker Desktop container has neither (its binfmt_misc is not mounted), so it
-# stays out — measured 2026-10-07. The explicit override wins both ways.
+# stays out — measured. The explicit override wins both ways.
 _autostart_maybe_wsl() {
   case "${_AUTOSTART_WSL_OVERRIDE}" in
     1) return 0 ;;
@@ -1286,7 +1281,7 @@ _proc_starttime() {
   printf '%s\n' "${20}"
 }
 
-# prints the live keep-alive pid, rc 1 if none. F11: OURS only when the pidfile
+# prints the live keep-alive pid, rc 1 if none. OURS only when the pidfile
 # ("<pid> <starttime>", written by _autostart_wsl_boot) matches a live process
 # that is `sleep infinity`, owned by this user, with that exact start time — a
 # recycled PID, or another user's / another tool's sleep, is never killed.
@@ -1326,7 +1321,7 @@ _autostart_on() {
   # Resolve everything that can fail BEFORE writing anything.
   if [ "${_wsl}" = "1" ]; then
     _distro="${WSL_DISTRO_NAME:-}"
-    # F11: the account this process really runs as — never $USER, which any
+    # The account this process really runs as — never $USER, which any
     # caller can set to another name baked into the Windows trigger.
     _user="$(id -un 2>/dev/null || true)"
     if ! [[ "${_distro}" =~ ^[A-Za-z0-9._-]+$ ]] || ! [[ "${_user}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -1415,7 +1410,7 @@ start \"\" /min powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -C
 # a file it could not remove is reported through _UNINSTALL_FAILED instead.
 _AUTOSTART_REMOVED=0
 # _autostart_rm_file <path>: rm + say so; a file left behind is a failure
-# (F8: sets _UNINSTALL_FAILED, read by cmd_uninstall / cmd_autostart off).
+# (sets _UNINSTALL_FAILED, read by cmd_uninstall / cmd_autostart off).
 _autostart_rm_file() {
   if rm -f -- "$1" 2>/dev/null && [ ! -e "$1" ] && [ ! -L "$1" ]; then
     echo "  removed: $1"
@@ -1452,7 +1447,7 @@ _autostart_remove() {
       # The record goes with the trigger — kept while the trigger is still there.
       [ -e "${_sdir}/${_AUTOSTART_STARTUP_NAME}" ] || rm -f "${_AUTOSTART_WSL_RECORD}"
     elif [ "${_recorded}" = "1" ]; then
-      # A7 / G2: a trigger written here that we cannot even look for is a
+      # A trigger written here that we cannot even look for is a
       # failure, not "off". The record stays for a later run from a normal shell.
       _autostart_manual_startup_hint
       _UNINSTALL_FAILED=1
@@ -1478,7 +1473,7 @@ _autostart_plan_lines() {
     if _sdir="$(_autostart_startup_dir)"; then
       _uninstall_list "${_sdir}/${_AUTOSTART_STARTUP_NAME}"
     elif _autostart_wsl_trigger_recorded; then
-      echo "    Windows Startup trigger ${_AUTOSTART_STARTUP_NAME}: folder not resolvable from this shell — cannot be removed here (A7)"
+      echo "    Windows Startup trigger ${_AUTOSTART_STARTUP_NAME}: folder not resolvable from this shell — cannot be removed here"
     fi
   fi
   if _p="$(_autostart_keepalive_pid)"; then echo "    WSL keep-alive process (pid ${_p})"; fi
@@ -1504,7 +1499,7 @@ _autostart_status() {
   fi
   if [ -n "${_AUTOSTART_STARTUP_OVERRIDE}" ] || _autostart_maybe_wsl; then
     if ! _sdir="$(_autostart_startup_dir)"; then
-      echo "  Windows Startup trigger: unknown — the Startup folder is not resolvable from this shell (A7)"
+      echo "  Windows Startup trigger: unknown — the Startup folder is not resolvable from this shell"
     elif [ -f "${_sdir}/${_AUTOSTART_STARTUP_NAME}" ]; then
       echo "  Windows Startup trigger: ${_sdir}/${_AUTOSTART_STARTUP_NAME}"
       _on=1
@@ -1543,7 +1538,7 @@ cmd_autostart() {
       _UNINSTALL_FAILED=0
       _autostart_remove off
       if [ "${_UNINSTALL_FAILED}" = "1" ]; then
-        # G2: a trigger left behind is a failure, never "already off".
+        # A trigger left behind is a failure, never "already off".
         echo "[hivemind] autostart off FAILED: an autostart trigger could not be removed or checked (see the '!' lines above) — autostart may still be on. Delete it by hand, then check: hivemind autostart status" >&2
         return 1
       elif [ "${_AUTOSTART_REMOVED}" = "1" ]; then
@@ -1559,7 +1554,7 @@ cmd_autostart() {
   esac
 }
 
-# ── Update mechanism (item 4.4) ───────────────────────────────────────────────
+# ── Update mechanism ───────────────────────────────────────────────
 # Pull-agent for the thin client: bin/hivemind + runtime/src/* ONLY — prompts/
 # seeds are never touched here (they live server-side).
 # Hardened (silent auto-pull): pinned source, integrity check,
@@ -1571,7 +1566,7 @@ cmd_autostart() {
 # manifest published on a channel separate from git itself (the product HTTPS
 # domain, not the repo host) — fallback for when no signer is configured.
 # The manifest endpoint (https://<host>/hivemind/LATEST_SHA) is LIVE — it is
-# kept equal to the dist main HEAD by a pull timer on each box (silken-ops manifest-cd), so the (b)
+# kept equal to the dist main HEAD by a pull timer on each box, so the (b)
 # path resolves normally. If the fetch fails (endpoint unreachable / empty),
 # this still fails closed for unsigned commits, which is the correct fail-safe
 # default (spec: "se a verificação falhar → NÃO aplica"), not a bug.
@@ -1602,19 +1597,18 @@ _verify_commit_integrity() {
 # commands/, runtime/ — the NEW version from HIVEMIND_SOURCE_DIR always wins;
 # (2) RUNTIME-WRITTEN state — everything Claude Code / the enrollment flow
 # writes into $HIVEMIND_HOME at runtime (NOT sourced from git: .env,
-# .claude/.claude.json [mcpServers.engram, item 5.1], .claude/.credentials.json
-# [item 5.0], plus whatever Claude Code writes next — history.jsonl, sessions/,
+# .claude/.claude.json [mcpServers.engram], .claude/.credentials.json, plus whatever Claude Code writes next — history.jsonl, sessions/,
 # projects/, shell-snapshots/, caches, none of it enumerable up front) — the
 # LIVE state always wins. A fixed allowlist (the previous version of this
 # function only preserved .env + .credentials.json) silently drops every other
 # runtime-written file on the first 'hivemind update' — this is exactly what
-# broke the item 5.1 MCP fix (.claude.json is written by the ENROLLMENT
+# broke the MCP fix (.claude.json is written by the ENROLLMENT
 # handler at runtime, not by git, so it was never in the allowlist and got
 # wiped by the staging mv). Inverting the pattern to "preserve everything,
 # except what git explicitly owns" closes that class of regression instead of
 # cherry-picking the next file that turns out to matter.
 #
-# COMPONENT-AWARE (impl 3e2c90da, phase S3): a proxy-only install (marker
+# COMPONENT-AWARE: a proxy-only install (marker
 # "proxy") is staged by _stage_build_proxy_only instead — no harness file is
 # ever (re)shipped to it. Every other install — marker "proxy harness" or NO
 # marker (legacy, pre-split) — runs the steps below EXACTLY as before; the
@@ -1630,23 +1624,23 @@ _stage_build() {
   mkdir -p "${_target}/.claude" "${_target}/.claude/hooks" "${_target}/bin" "${_target}/runtime" || return 1
 
   # ── Tier 1: git-managed — NEW version wins ────────────────────────────────
-  # CLAUDE.md lands under .claude/ — mirrors install.sh's item 5.2 fix
+  # CLAUDE.md lands under .claude/ — mirrors install.sh's fix
   # (load-bearing: forgetting this side regresses the pull-agent silently).
   cp "${HIVEMIND_SOURCE_DIR}/CLAUDE.md" "${_target}/.claude/CLAUDE.md" || return 1
-  # settings.json is TEMPLATED (F5.3), same as install.sh — __HIVEMIND_HOME__
+  # settings.json is TEMPLATED, same as install.sh — __HIVEMIND_HOME__
   # resolves against the LIVE HIVEMIND_HOME (this update targets the same
   # install, not a fresh one), not the staging dir itself.
   sed "s|__HIVEMIND_HOME__|${HIVEMIND_HOME}|g" \
     "${HIVEMIND_SOURCE_DIR}/.claude/settings.json" > "${_target}/.claude/settings.json" || return 1
-  # Product slash-commands (item 5.3) — same mirror requirement as above.
-  # These are THIN STUBS (Branch B, decision_serve-boot-and-end-session-as-mcp-prompts-fail-closed):
+  # Product slash-commands — same mirror requirement as above.
+  # These are THIN STUBS:
   # the canonical procedure body is served by the engram (fos_procedure({id})) and fetched at
   # invocation, FAIL-CLOSED (engram unreachable → no local fallback, session does not
   # boot/close). This copy step only ships the stub files, not the procedure content — see
   # CLAUDE.md § Session start / § Session close.
   mkdir -p "${_target}/.claude/commands" || return 1
   cp -r "${HIVEMIND_SOURCE_DIR}/.claude/commands/." "${_target}/.claude/commands/" || return 1
-  # Status-CLI (F5.1) + quota-capture hook (F5.2) — referenced by the
+  # Status-CLI + quota-capture hook — referenced by the
   # templated settings.json above; must ship alongside it on every update.
   cp "${HIVEMIND_SOURCE_DIR}/bin/hivemind-statusline.py" "${_target}/bin/hivemind-statusline.py" || return 1
   chmod +x "${_target}/bin/hivemind-statusline.py" || return 1
@@ -1669,7 +1663,7 @@ _stage_build() {
   if [ -f "${HIVEMIND_HOME}/.env" ]; then
     cp "${HIVEMIND_HOME}/.env" "${_target}/.env" || return 1
   fi
-  # Component marker (phase S3): carried as-is when present; never invented
+  # Component marker: carried as-is when present; never invented
   # for a legacy install (absent marker = proxy+harness, unchanged).
   if [ -f "$(_components_file)" ]; then
     cp "$(_components_file)" "${_target}/.components" || return 1
@@ -1679,9 +1673,9 @@ _stage_build() {
   # root with a leading '/' so a same-named file/dir nested deeper — e.g. under
   # sessions/ or projects/ — is never accidentally excluded). No --delete: this
   # only ADDS/overwrites from live into staging, it never removes a
-  # freshly-placed git file. Covers .claude.json (item 5.1) + .credentials.json
-  # (item 5.0) + anything else Claude Code writes there, present or future.
-  # /hooks/ added at F5.2 (quota-capture hook is git-managed like
+  # freshly-placed git file. Covers .claude.json + .credentials.json
+  # + anything else Claude Code writes there, present or future.
+  # /hooks/ added later (quota-capture hook is git-managed like
   # CLAUDE.md/settings.json/commands/, not runtime-written).
   if [ -d "${HIVEMIND_HOME}/.claude" ]; then
     rsync -a \
@@ -1786,7 +1780,7 @@ _rollback_installed_binary() {
 }
 
 cmd_update() {
-  # D1: a dev / legacy source is moved to the managed clone first (fail-open).
+  # A dev / legacy source is moved to the managed clone first (fail-open).
   # D1b: only an EXPLICIT `hivemind update` bypasses the 24h clone backoff —
   # the silent on-launch auto-update (_maybe_auto_update → cmd_update) obeys it.
   if [ "${_HM_EXPLICIT_UPDATE:-0}" = "1" ]; then
@@ -1798,7 +1792,7 @@ cmd_update() {
     echo "Error: HIVEMIND_SOURCE_DIR not set or not a git clone — re-run install.sh to pin the update source." >&2
     exit 1
   fi
-  # F4/G1: never `reset --hard` a source that holds local work (a dev-shaped
+  # Never `reset --hard` a source that holds local work (a dev-shaped
   # clone that is not the managed one, uncommitted tracked changes, or a git
   # query that fails). Checked BEFORE the fetch: a refused source is not written.
   local _why
@@ -1832,7 +1826,7 @@ cmd_update() {
     return 0
   fi
 
-  # G1: AFTER the fetch, BEFORE any reset — the whole predicate again, now with
+  # AFTER the fetch, BEFORE any reset — the whole predicate again, now with
   # the fetched ref: HEAD must be reachable from origin/<branch> (no local
   # commit is ever dropped). Every reset below (this one and the rollbacks to
   # ${_before}) runs only on a source that passed here: clean, fast-forwardable.
@@ -1912,14 +1906,14 @@ cmd_update() {
   echo "$(_ok "Updated"): ${_before:0:12} -> ${_after:0:12}."
 }
 
-# _maybe_auto_update: silent on-launch check (OPEN-6, founder-approved).
+# _maybe_auto_update: silent on-launch check (approved).
 # Best-effort + fail-open on ANY network/config hiccup — never blocks startup.
 # Short timeout (~2s) on the remote check only; the actual update (if one
 # applies) reuses cmd_update's hardened staged/atomic/rollback path.
 _maybe_auto_update() {
   [ -n "${HIVEMIND_SOURCE_DIR:-}" ] || return 0
   [ -d "${HIVEMIND_SOURCE_DIR}/.git" ] || return 0
-  # F4/G1: a source holding local work is never updated — skip silently
+  # A source holding local work is never updated — skip silently
   # (logged under --verbose), the launch goes on. cmd_update re-checks after
   # its fetch (unpushed commits); that refusal reaches --verbose via fd 3.
   local _why
@@ -1957,7 +1951,7 @@ _maybe_auto_update() {
   return 0
 }
 
-# ── Managed update source (impl 3e2c90da, item D1) ───────────────────────────
+# ── Managed update source ───────────────────────────
 # Every install updates from ${HIVEMIND_HOME}.src — a clone of the canonical
 # remote (_CANONICAL_REMOTE) that only this CLI writes. An install whose
 # HIVEMIND_SOURCE_DIR is still a dev / legacy clone (one that tracks .github/,
@@ -1983,7 +1977,7 @@ _is_managed_clone() {
   [ "$(git -C "$1" remote get-url origin 2>/dev/null || true)" = "${_CANONICAL_REMOTE}" ]
 }
 
-# F4/G1 — update integrity. INVARIANT: an update never discards local work in
+# Update integrity. INVARIANT: an update never discards local work in
 # HIVEMIND_SOURCE_DIR. cmd_update runs `reset --hard` on its source, so it runs
 # only on a source that is, by CONTENT:
 #   (a) clean — `git status --porcelain --untracked-files=no` is empty (staged
@@ -2062,11 +2056,11 @@ _update_refuse() {
 # A completed move removes the marker. Reusing an existing managed clone is
 # not a network step and is never gated.
 _SRC_MIGRATE_BACKOFF_SECS=86400
-# F5: the marker and the .env backup live in ~/.engram, OUTSIDE $HIVEMIND_HOME —
+# The marker and the .env backup live in ~/.engram, OUTSIDE $HIVEMIND_HOME —
 # an update's staged swap replaces $HIVEMIND_HOME wholesale (_stage_build
 # carries only .env / .components / harness files), so anything kept inside it
 # was lost on the first update after the move. ~/.engram is never touched by an
-# update (DR-6.1) and goes away with `uninstall` (also under --keep-certs, which
+# update and goes away with `uninstall` (also under --keep-certs, which
 # keeps only mtls/, device-id*, kept-credentials.env).
 _src_migrate_marker() { printf '%s\n' "${HOME}/.engram/src-migrate-last-attempt"; }
 _src_migrate_env_backup() { printf '%s\n' "${HOME}/.engram/env.pre-managed-source"; }
@@ -2146,7 +2140,7 @@ _maybe_migrate_source() {
         _vecho "[hivemind] source move skipped: could not check out the installed commit"; return 0
       fi
     fi
-    # F6: two launches may race here. Never nest one clone inside the other:
+    # Two launches may race here. Never nest one clone inside the other:
     # the loser drops its temp clone and reuses the winner's (if it is valid).
     if ! _mv_dir_exclusive "${_tmp}" "${_dst}"; then
       rm -rf -- "${_tmp}" 2>/dev/null || true
@@ -2158,9 +2152,9 @@ _maybe_migrate_source() {
   fi
 
   # The backup holds FOS_API_KEY: created user-only (umask 077 + chmod 600),
-  # in ~/.engram (F5 — survives every later update).
+  # in ~/.engram (survives every later update).
   _bak="$(_src_migrate_env_backup)"
-  # G3: `! -e` alone is true for a DANGLING symlink — cp would follow it and
+  # `! -e` alone is true for a DANGLING symlink — cp would follow it and
   # write the .env (FOS_API_KEY) wherever it points. A link is never written.
   if [ ! -e "${_bak}" ] && [ ! -L "${_bak}" ] && ! { mkdir -p -m 700 "${HOME}/.engram" 2>/dev/null \
       && ( umask 077; cp -- "${_env}" "${_bak}" ) 2>/dev/null && chmod 600 -- "${_bak}" 2>/dev/null; }; then
@@ -2194,7 +2188,7 @@ _maybe_migrate_source() {
   return 0
 }
 
-# ── Session spine (WS-0.3, P0.1) ──────────────────────────────────────────────
+# ── Session spine ──────────────────────────────────────────────
 # Opens a real fos_session BEFORE exec'ing claude, through the
 # product's MCP tool surface (fos_session/fos_registry over the local mTLS
 # proxy).
@@ -2202,9 +2196,8 @@ _maybe_migrate_source() {
 # _resolve_device_id: stable device_id for this machine.
 # Created once (first run), reused thereafter.
 #
-# Fase 6:
 #
-# DR-6.1 — `~/.engram/device-id` lives OUTSIDE ${HIVEMIND_HOME} (see the
+# `~/.engram/device-id` lives OUTSIDE ${HIVEMIND_HOME} (see the
 # ~/.engram-vs-~/.hivemind isolation note at :25-28). Measured: `cmd_update`
 # only mv/rm's inside ${HIVEMIND_HOME}[.staging|.last-good], and install.sh
 # only writes inside ${HIVEMIND_HOME}/{.claude,runtime,bin} — neither ever
@@ -2213,12 +2206,12 @@ _maybe_migrate_source() {
 # isolation; this comment makes the invariant explicit instead of leaving it
 # an accident nobody wrote down.
 #
-# DR-6.2 — the write is atomic (tmp+rename via _atomic_write, not a bare
+# the write is atomic (tmp+rename via _atomic_write, not a bare
 # redirect a crash/SIGKILL mid-write could truncate) and self-healing: an
 # absent OR empty/corrupted file both regenerate rather than sticking as a
 # permanently-broken device_id.
 #
-# DR-6.3 — every caller here (_spawn_runtime, _open_session_spine) already
+# every caller here (_spawn_runtime, _open_session_spine) already
 # runs AFTER cmd_open's/cmd_start's `_has_cert || _setup_mode` gate at the
 # top of each command — measured, not
 # assumed: `_setup_mode` always `exit 0`s (no fallthrough), so control only
@@ -2228,7 +2221,7 @@ _maybe_migrate_source() {
 # daemon is never spawned before device-id exists on a fresh machine — no
 # separate reordering was needed once these two facts are put together.
 #
-# DR-6.4 — device_id is CROSS-CHECKED against the enrolled cert's SHA-256
+# device_id is CROSS-CHECKED against the enrolled cert's SHA-256
 # fingerprint (~/.engram/device-id-cert-binding), never DERIVED from it — a
 # cert renewal on the SAME machine must not churn device_id (see the plan
 # for why derive-from was rejected). Mismatch (re-enrollment, or device-id
@@ -2238,12 +2231,12 @@ _resolve_device_id() {
   local _id_file="${HOME}/.engram/device-id"
   local _binding_file="${HOME}/.engram/device-id-cert-binding"
 
-  # DR-6.2: validate-on-read. `-s` is false for both "absent" and "present
+  # validate-on-read. `-s` is false for both "absent" and "present
   # but empty/truncated" — one branch self-heals both cases.
   [ -s "${_id_file}" ] || _regenerate_device_id "${_id_file}"
 
-  # DR-6.4: only meaningful once a cert actually exists — pre-enrollment
-  # callers (degenerate today, see DR-6.3 above) just skip this block;
+  # only meaningful once a cert actually exists — pre-enrollment
+  # callers (degenerate today, see above) just skip this block;
   # device_id is already durable from the step above, only unbound until
   # enrollment completes (the binding is written the first time this runs
   # with a cert present).
@@ -2268,7 +2261,7 @@ _resolve_device_id() {
 
 # _mint_uuid: RFC4122 uuid via uuidgen, /proc fallback, then a last-resort
 # non-RFC4122-but-locally-unique fallback. Extracted from
-# _regenerate_device_id's inline chain (Fase 6) so item 18cff9b7's port-map
+# _regenerate_device_id's inline chain so the port-map
 # device_id minting (_resolve_target_port_and_device_id below) shares the
 # exact same fallback discipline instead of duplicating it — the two are
 # independent identity namespaces (~/.engram/device-id vs a per-target
@@ -2288,14 +2281,14 @@ _mint_uuid() {
 }
 
 # _regenerate_device_id: mint a fresh uuid and persist it atomically
-# (DR-6.2). Shared by first-creation and self-heal/rebind paths.
+# Shared by first-creation and self-heal/rebind paths.
 _regenerate_device_id() {
   local _id_file="$1"
   mkdir -p "$(dirname "${_id_file}")"
   _atomic_write "${_id_file}" "$(_mint_uuid)"
 }
 
-# _atomic_write: write $2 (+ trailing newline) to $1 via tmp+rename (DR-6.2)
+# _atomic_write: write $2 (+ trailing newline) to $1 via tmp+rename
 # — a crash/SIGKILL mid-write leaves the ORIGINAL file untouched instead of
 # a truncated one. `.tmp.$$` keys the scratch file to this process so two
 # concurrent first-run writers (fresh machine, two `hivemind` windows at
@@ -2310,7 +2303,7 @@ _atomic_write() {
   mv "${_tmp}" "${_path}"
 }
 
-# _cert_fingerprint_sha256: SHA-256 fingerprint of a cert (DR-6.4), colon-
+# _cert_fingerprint_sha256: SHA-256 fingerprint of a cert, colon-
 # separated hex after the `=`. `cut -d= -f2` rather than matching a literal
 # "SHA256 Fingerprint=" prefix: measured openssl on this box prints the
 # lowercase "sha256 Fingerprint=" label (casing is openssl-version-
@@ -2363,22 +2356,22 @@ _mcp_result_field() {
 # ENGRAM_SESSION_ID / ENGRAM_DEVICE_ID (read by cmd_open's final exec).
 # $1 = project slug.
 #
-# BEST-EFFORT (deliberate divergence from silken-runtime, which hard-aborts
+# BEST-EFFORT (deliberate choice: the shipped client does not hard-abort
 # on an empty session_id): this is the shipped client — a flaky network or a
 # transient engram outage must not block the user from opening Claude at all.
 # A missing ENGRAM_SESSION_ID just degrades /boot (no next_note surfaced) and
 # /end-session (no real close — the watchdog reclaims the orphan) rather than
 # refusing to start.
 #
-# NO auto-registration (WS-0.3.3 — REMOVED, F2.1). A prior version silently
+# NO auto-registration (REMOVED). A prior version silently
 # upserted the slug into the registry on the first slug_not_found here (dupla
 # cobertura). That silently created a registry row for any typo'd/unknown slug
 # on the user's behalf — the exact behavior the explicit slug-selection work
-# (F2.2 picker) and explicit first-project bootstrap (F3.2, confirmed create)
+# (picker) and explicit first-project bootstrap (confirmed create)
 # replace. Slug existence is now settled BEFORE this function runs (cmd_open
 # resolves via arg / picker / confirmed bootstrap). If a slug still turns up
 # unknown here (slug_not_found / project_required from the engram's open
-# gate), we ABORT before claude starts (Phase 9) — we do NOT create it.
+# gate), we ABORT before claude starts — we do NOT create it.
 # This comment is a headstone, not an invitation: do not reintroduce the
 # auto-upsert.
 _open_session_spine() {
@@ -2391,7 +2384,7 @@ _open_session_spine() {
     return 0
   fi
 
-  # `default` is never a session place (impl 4e978e9c Phase 9): the opener
+  # `default` is never a session place: the opener
   # refuses it outright, whatever the caller — no session is ever opened on it.
   if [ "${_slug}" = "default" ]; then
     echo "Erro: 'default' não é um lugar de sessão — abortando antes de abrir sessão." >&2
@@ -2403,10 +2396,10 @@ _open_session_spine() {
   _resp="$(_mcp_call "fos_session" "${_open_args}" 1)"
   _err_field="$(_mcp_result_field "${_resp}" "_err")"
 
-  # The engram's open gate (impl 4e978e9c Phase 8) answers `project_required`
+  # The engram's open gate answers `project_required`
   # (default / archived / retired / blank) or `slug_not_found`: NO project, NO
   # session — abort BEFORE claude starts, never degrade, never auto-create
-  # (F2.1). The other degrades below (no API key, no session_id) stay
+  # The other degrades below (no API key, no session_id) stay
   # best-effort: an engram outage must not block the launch.
   case "${_err_field}" in
     project_required|slug_not_found)
@@ -2414,7 +2407,7 @@ _open_session_spine() {
       exit 1
       ;;
   esac
-  # warn-mode gate (Phase 8): the open proceeds but carries a warning only this
+  # warn-mode gate: the open proceeds but carries a warning only this
   # launcher can show (the agent never sees the open response).
   local _gate_warn
   _gate_warn="$(_mcp_result_field "${_resp}" "project_required_warning")"
@@ -2430,14 +2423,14 @@ _open_session_spine() {
 
   ENGRAM_SESSION_ID="${_session_id}"
 
-  # Adopt-back (decision 3cab5d01, Option B device-identity): fos_session(open)'s
+  # Adopt-back: fos_session(open)'s
   # response now echoes device_id — supplied-and-reused (the normal case here,
   # since we always sent one from _resolve_device_id above) or freshly minted
-  # (only for callers who had none — never us, DR-6.1-6.4 already resolves one
+  # (only for callers who had none — never us, the device-id logic already resolves one
   # locally before this point). If it ever differs from what we sent, the
   # server's answer is treated as canonical and persisted the same atomic way
   # _regenerate_device_id does. In steady state this is a no-op echo — see
-  # DR-6.3/_spawn_runtime's unavoidable local-bootstrap need, unchanged here.
+  # _spawn_runtime's unavoidable local-bootstrap need, unchanged here.
   #
   # code-review fix: this is a TRUST-DIRECTION change — the server is telling
   # the client to overwrite its own local identity file — so it now logs at
@@ -2469,7 +2462,7 @@ _open_session_spine() {
   _vecho "[hivemind] sessão aberta: ${ENGRAM_SESSION_ID} (slug=${_slug})"
 }
 
-# ── Slug selection (F2.2 / F3) ────────────────────────────────────────────────
+# ── Slug selection ────────────────────────────────────────────────
 # The registry is owner-scoped SERVER-SIDE (every read is scoped to the owner
 # derived from your certificate), so `fos_registry(action:list)` already returns
 # ONLY this owner's slugs — the client never filters by owner and cannot see
@@ -2478,9 +2471,9 @@ _open_session_spine() {
 # _list_slugs: populate _SLUGS_RAW ("slug<TAB>name" lines, owned + not
 # archived/retired) for the
 # current owner. Returns 0 on a VALID registry response — the list may be EMPTY
-# (a genuine count:0 for an owner with no projects yet, the F3 bootstrap case).
+# (a genuine count:0 for an owner with no projects yet, the first-project bootstrap case).
 # Returns 1 on transport/parse failure (no API key, proxy/network down,
-# malformed payload). The caller MUST distinguish these two (F3.1): an EMPTY
+# malformed payload). The caller MUST distinguish these two: an EMPTY
 # list means "bootstrap first project", an UNREACHABLE registry means "abort,
 # don't guess" — collapsing them would silently offer to create a duplicate of
 # an existing project during a network blip.
@@ -2517,7 +2510,7 @@ _list_slugs() {
 
 # _nondefault_slugs_raw: filter _SLUGS_RAW ("slug<TAB>name" lines, set by
 # _list_slugs) down to every row EXCEPT the deliberate `default` home (Phase
-# 2, H1/2.1). `default` is now ALWAYS a registry row (Phase 3 seed +
+# 2). `default` is now ALWAYS a registry row (seed +
 # backfill), so a bare `-z "${_SLUGS_RAW}"` emptiness test would never fire
 # again — "does this owner have a REAL project yet" must exclude the home
 # row first. Echoes the filtered lines; empty output means "no real project"
@@ -2531,7 +2524,7 @@ _nondefault_slugs_raw() {
   done <<< "${_SLUGS_RAW}"
 }
 
-# NOTE (impl 4e978e9c Phase 9 — supersedes P3-1/P3-2): the onboarding-field
+# NOTE: the onboarding-field
 # routing (_onboarding_probe / _onboarding_state / _is_first_timer → `default`
 # + ENGRAM_STARTUP=1) was REMOVED. "No project, no session": the launcher never
 # routes anyone to `default`. Onboarding is SELF-only, runs inside the first
@@ -2539,24 +2532,22 @@ _nondefault_slugs_raw() {
 # (skeleton.onboarding_completed) — the runtime no longer looks at it.
 # This comment is a headstone: do not reintroduce onboarding routing here.
 
-# NOTE (P4 — impl 989cb79b): the double-access slug-lock (formerly "Fase 7 /
-# DR-7.A": _fetch_lock_table + _lock_state_for_slug + a pre-open refuse in
+# NOTE: the double-access slug-lock (formerly "double-access lock": _fetch_lock_table + _lock_state_for_slug + a pre-open refuse in
 # cmd_open) was REMOVED here. It was a Claude-Code-harness-only lock that
-# masked a real open() clobber — now fixed at the engram level by P1 (the
-# lane-safe open() freshness guard, live in prod v1.57.1: a NULL/different-pid
+# masked a real open() clobber — now fixed at the engram level (the
+# lane-safe open() freshness guard, live in production v1.57.1: a NULL/different-pid
 # open never closes a FRESH live sibling; only a same-pid reconnect or a
 # genuinely-stale orphan is reclaimed). With that guard live, N concurrent
 # sessions per slug is the intended behavior, so the harness no longer blocks
 # a second open. cmd_resume (below) is now pure crash-recovery that delegates
 # reclaim to that engram open() guard rather than to a client-side lock.
 
-# _pick_project — render this owner's slugs and set _PICKED_SLUG. Mirrors
-# silken-runtime:_pick_project (fzf when available; numbered-read fallback;
-# same color scheme + Ctrl-C/Ctrl-D → 130). Input: _SLUGS_RAW (from
+# _pick_project — render this owner's slugs and set _PICKED_SLUG. Uses fzf when available; numbered-read fallback;
+# same color scheme + Ctrl-C/Ctrl-D → 130. Input: _SLUGS_RAW (from
 # _list_slugs). The picker simply lists every slug as selectable — there are
-# no lock-state markers anymore (P4, impl 989cb79b): a slug already open in
+# no lock-state markers anymore: a slug already open in
 # another window is no longer greyed out or blocked, because N concurrent
-# sessions per slug is now the intended behavior (the engram P1 open()
+# sessions per slug is now the intended behavior (the engram open()
 # freshness guard is what keeps the sibling rows safe, not a client-side lock).
 _pick_project() {
   _PICKED_SLUG=""
@@ -2621,8 +2612,8 @@ _pick_project() {
 }
 
 # _bootstrap_first_slug (the bare bash "type your first project's name" flow)
-# was REMOVED (Phase 2, H2/2.2) and the `default` + ENGRAM_STARTUP first-timer
-# route that replaced it was REMOVED too (impl 4e978e9c Phase 9). The launcher
+# was REMOVED and the `default` + ENGRAM_STARTUP first-timer
+# route that replaced it was REMOVED too. The launcher
 # creates NOTHING: projects are created on the HiveMind web app, and a
 # project-less owner is pointed at _web_create_url (see _resolve_project_slug).
 #
@@ -2631,9 +2622,7 @@ _pick_project() {
 # POST /v1/registry) — the web create form is its client, never this script.
 
 # _seed_engram_mcp_config: re-assert mcpServers.engram in
-# $HIVEMIND_HOME/.claude/.claude.json at OPEN time (papercut d,
-# pattern_hivemind-runtime-mcp-config-is-user-scope-not-project-mcp-json,
-# measured 2026-08-04).
+# $HIVEMIND_HOME/.claude/.claude.json at OPEN time (measured: the config is user-scope, not project .mcp.json).
 #
 # WHY: cmd_open execs `claude --setting-sources user`, so Claude Code
 # discovers MCP servers ONLY from this user-scope file. The enrollment-time
@@ -2647,7 +2636,7 @@ _pick_project() {
 # ONLY mcpServers.engram; self-heal a missing/corrupted/non-object top-level
 # document AND a missing/null/array `mcpServers` to {} rather than throwing.
 # NO headers, NO FOS_API_KEY or other secret material in the written entry —
-# the mTLS proxy injects x-fos-key server-side (atomic-flip, round-2
+# the mTLS proxy injects x-fos-key server-side (atomic flip
 # 2026-07-30; setup.ts:414-423) — so this file, readable by anything with fs
 # access to $HIVEMIND_HOME, carries zero secrets regardless of who wrote or
 # reads it. Atomic write (temp file + rename) + chmod 0600, same posture as
@@ -2667,10 +2656,10 @@ _pick_project() {
 # EXTRACTED so it can target an ARBITRARY path — not just Claude Code's own
 # $HIVEMIND_HOME/.claude/.claude.json. Shared by _seed_engram_mcp_config
 # below (Claude Code's user-scope file) and `hivemind install`'s carrier
-# (P2, item ef1c9385 — reuse, don't reinvent) for any OTHER local client's
+# for any OTHER local client's
 # own mcp.json-shaped config. $1 = absolute path to write/merge, $2 = port.
 #
-# PORT IS NOW AN EXPLICIT REQUIRED ARG (Option 2, item 18cff9b7) — this used
+# PORT IS NOW AN EXPLICIT REQUIRED ARG — this used
 # to hardcode the implicit shared "${PROXY_PORT}" as its 2nd positional bun
 # arg; every caller now decides which port an entry points at.
 # _seed_engram_mcp_config (Claude Code's own self-seed) still passes
@@ -2684,8 +2673,7 @@ _pick_project() {
 # missing/corrupted/non-object document AND a missing/null/array
 # `mcpServers` to {} rather than throwing; atomic tmp+rename; chmod 0600;
 # NO headers/FOS_API_KEY or other secret material in the written entry — the
-# mTLS proxy injects the credential server-side (decision `bee7f370`:
-# HTTPS-loopback-by-default, no stdio, no header/${VAR} dependency for any
+# mTLS proxy injects the credential server-side (HTTPS-loopback-by-default, no stdio, no header/${VAR} dependency for any
 # client). Returns bun's exit status — 0 on a clean write, non-zero on any
 # failure (disk full, permissions, malformed args) — callers decide whether
 # a failure is fail-soft (re-seed) or fail-loud (a fresh `install`).
@@ -2749,8 +2737,8 @@ _seed_engram_mcp_config() {
   return 0
 }
 
-# ── Option 2 per-target proxy — port-map.json helpers (item 18cff9b7) ───────
-# Full design: fos_sketchpad 4f8142e3 § ADDENDUM 3. `hivemind install
+# ── per-target proxy — port-map.json helpers ───────
+# `hivemind install`
 # <target>` allocates a DEDICATED loopback port + mints a device_id per
 # installed target, persisted to PORT_MAP_FILE — read at daemon boot and on
 # every POST /internal/proxy/reload by runtime/src/lib/mtls-proxy.ts's
@@ -2970,11 +2958,11 @@ _no_project_message() {
 # need to survive run it in a subshell (the tests do).
 # The tty test goes through _is_interactive so tests can shadow it.
 #
-# NO PROJECT, NO SESSION (impl 4e978e9c Phase 9, decisions 6d7c8491/78dfeaf0):
+# NO PROJECT, NO SESSION:
 # a session exists only on a REAL project — owned, not `default`, not
 # archived. Candidates = _nondefault_slugs_raw (_list_slugs already returns
 # owned, not archived/retired). Order: explicit arg > interactive selection. There is
-# deliberately NO basename(cwd) fallback (F2.3) and NO routing to `default`.
+# deliberately NO basename(cwd) fallback and NO routing to `default`.
 #   - explicit arg: registry FIRST (unreachable → abort). `default` → exit 2;
 #     unknown/archived → exit 1 "projeto '<x>' não encontrado" + create URL.
 #     Claude never starts.
@@ -3047,7 +3035,7 @@ _resolve_project_slug() {
       _RESOLVED_SLUG="${_PICKED_SLUG}"
     fi
   else
-    # No arg + non-interactive: fail closed (F2.3, founder-accepted). No
+    # No arg + non-interactive: fail closed. No
     # basename(cwd) fallback — automation must pass an explicit slug.
     echo "Erro: nenhum slug informado e a entrada não é um terminal interativo." >&2
     echo "      Rode 'hivemind <slug>' explicitamente em contexto não-interativo." >&2
@@ -3057,16 +3045,12 @@ _resolve_project_slug() {
 
 # cmd_open: start proxy + exec claude.
 # $1 = slug (optional); remaining $@ passed to claude.
-# ── Proxy-only launch (impl 3e2c90da, phase S4) ─────────────────────────────
-# Direct engram MCP endpoint for the bearer fallback — measured in the engram
-# (read-only, engram@d7d2034): apps/backend/src/config/env.config.ts:839
-# FOS_MCP_URL default; header shape from modules/me/mcp-config.service.ts:85
-# (`Authorization: Bearer fospb_…`, prefix common/porta-b-token-registry.ts:48),
-# accepted on /v1/mcp by common/mcp-tenant-context.middleware.ts:442-444
-# (Layer 0, Porta-B). Whether a plan may use it is decided server-side
-# (access posture), never here. That default is the PROD engram, so it is
-# printed only for an install pointed at the default PROD endpoint; any other
-# endpoint (e.g. LAB) gets the fallback only with HIVEMIND_DIRECT_MCP_URL set
+# ── Proxy-only launch ─────────────────────────────
+# Direct engram MCP endpoint for the bearer fallback: the engram accepts
+# `Authorization: Bearer fospb_…` on /v1/mcp. Whether a plan may use it is decided server-side
+# (access posture), never here. The default URL points at the product engram, so it is
+# printed only for an install pointed at the default product endpoint; any other
+# endpoint gets the fallback only with HIVEMIND_DIRECT_MCP_URL set
 # in the process env (_DIRECT_MCP_URL_OVERRIDE).
 DIRECT_MCP_URL_DEFAULT="https://api.hivemind.ia.br/v1/mcp"
 DEFAULT_HIVEMIND_ENDPOINT="hivemind.ia.br:4443"
@@ -3135,7 +3119,7 @@ _open_proxy_only() {
 }
 
 cmd_open() {
-  # Proxy-only install (phase S4) — everything below this branch is the
+  # Proxy-only install — everything below this branch is the
   # proxy+harness path, unchanged.
   if ! _has_harness; then
     _open_proxy_only "$@"
@@ -3163,27 +3147,27 @@ cmd_open() {
     exit 1
   fi
 
-  # ── P4 (impl 989cb79b): NO pre-open slug-lock here anymore ───────────────
-  # The former "Fase 7 / DR-7.A" double-access lock refused to open a slug
+  # ── NO pre-open slug-lock here anymore ───────────────
+  # The former double-access lock refused to open a slug
   # already held by a live session on this device. It was removed: a second
   # session on the same slug now opens FREELY (N concurrent lanes per slug is
   # the intended behavior). The clobber that lock masked is fixed at the
-  # engram level by P1 — the lane-safe open() freshness guard (live in prod
+  # engram level — the lane-safe open() freshness guard (live in production
   # v1.57.1) never closes a FRESH live sibling, so a concurrent open() cannot
   # destroy the other lane's session row. There is nothing to check here; we
   # go straight to opening.
 
-  # Espinha de sessão (WS-0.3) — abre DEPOIS do proxy responder no health,
-  # ANTES do exec (silken-runtime mirror). Sets ENGRAM_SESSION_ID/
+  # Espinha de sessão — abre DEPOIS do proxy responder no health,
+  # ANTES do exec (mirrors the launcher flow). Sets ENGRAM_SESSION_ID/
   # ENGRAM_DEVICE_ID (globals, best-effort — see _open_session_spine).
   _open_session_spine "${_project_slug}"
 
-  # Fase 3 (DR-3.1) — adopt-before-exec: register this session's pid with
-  # the daemon so its pid-watcher + heartbeat (Fase 2, routes/sessions.ts)
+  # Adopt-before-exec: register this session's pid with
+  # the daemon so its pid-watcher + heartbeat (routes/sessions.ts)
   # start tracking it. Must run AFTER _open_session_spine (needs a real
   # ENGRAM_SESSION_ID) and BEFORE `exec` below replaces this script's process
   # image — $$ only stays valid as the tracked pid across that exec because
-  # exec preserves the pid (same trick silken-runtime:376-377 relies on).
+  # exec preserves the pid.
   # Best-effort, same fail-soft spirit as _open_session_spine itself: a
   # daemon hiccup here must never block the user from opening Claude.
   if [ -n "${ENGRAM_SESSION_ID}" ]; then
@@ -3193,20 +3177,20 @@ cmd_open() {
       "http://127.0.0.1:${RUNTIME_PORT}/sessions/adopt" > /dev/null 2>&1 || true
   fi
 
-  # F0 auth fail-safe (item 5.0) — the isolated CONFIG_DIR may have no
+  # Auth fail-safe — the isolated CONFIG_DIR may have no
   # credential at all (install.sh only seeds it best-effort from the user's
   # personal ~/.claude, and a brand-new CONFIG_DIR on a machine with no prior
   # personal login has nothing to seed from). Missing credential triggers a
   # login flow INSIDE the same isolated CONFIG_DIR, so the resulting auth
   # state stays apartada from the user's personal Claude Code account.
-  # Confirmed live (G3, Claude Code CLI v2.1.207): `claude auth login`
+  # Confirmed live (Claude Code CLI v2.1.207): `claude auth login`
   # authenticates-AND-EXITS (prints an OAuth URL, waits for the pasted
   # callback code, writes the credential, then returns) — it does NOT enter an
   # interactive session, so it is safe to run here and fall through to the
   # normal `exec claude` below afterwards. Fail-safe, not fail-closed: if the
   # login is skipped/cancelled/times out, we still proceed to `exec` (the
   # interactive session will show its own auth prompt if needed) — never abort
-  # the whole command over auth. NOTE (P2, out of scope for this pass): this
+  # the whole command over auth. NOTE (out of scope for this pass): this
   # only covers ABSENCE, not an EXPIRED-but-present credential — known
   # limitation.
   if [ ! -f "${HIVEMIND_HOME}/.claude/.credentials.json" ]; then
@@ -3221,10 +3205,10 @@ cmd_open() {
   # in cmd_open having run first. Best-effort, never blocks the exec below.
   _seed_engram_mcp_config
 
-  # --setting-sources user (item 5.2, F2 isolation): the isolated CONFIG_DIR
+  # --setting-sources user (isolation): the isolated CONFIG_DIR
   # already redirects commands/skills/MCP/global-CLAUDE.md (CLAUDE_CONFIG_DIR
   # above), but without this flag the user's PROJECT ./CLAUDE.md (walk-up from
-  # cwd) still leaks into context — measured (P3/P4, CLI v2.1.207). This flag
+  # cwd) still leaks into context — measured (CLI v2.1.207). This flag
   # is the scalpel that suppresses project-scoped settings/CLAUDE.md/.mcp.json
   # while keeping the product's user-scoped config intact — intentional, not
   # a side effect (re-measure if the embedded CLI version changes).
@@ -3241,11 +3225,11 @@ cmd_open() {
 # the command themselves. $1 = slug (required, no picker here — recovery
 # targets a specific known-crashed slug, not a browse-and-pick flow).
 #
-# P4 (impl 989cb79b): this is now PURE crash-recovery — it no longer carries
+# This is now PURE crash-recovery — it no longer carries
 # the old client-side alive/dead slug-lock model (that whole lock was removed,
-# see the note above _pick_project and the P4 block in cmd_open). Recovery of
+# see the note above _pick_project and the block in cmd_open). Recovery of
 # a stale/crashed session is now owned by the engram's lane-safe open() guard
-# (P1, live in prod v1.57.1): a fresh open() on the slug reconnects a same-pid
+# (live in production): a fresh open() on the slug reconnects a same-pid
 # session and reclaims a genuinely-stale orphan, while never clobbering a
 # FRESH live sibling. So `resume` just re-opens the slug through the normal
 # cmd_open path — same slug, same spine, same adopt-before-exec — and lets the
@@ -3280,16 +3264,16 @@ cmd_resume() {
   cmd_open "${_slug}"
 }
 
-# ── install (P2 — guided MCP-client installer, platform-agnostic core) ──────
+# ── install (guided MCP-client installer, platform-agnostic core) ──────
 # `hivemind install [<target>]` walks a human through wiring the SAME generic
 # entry `_seed_engram_mcp_config` already writes for Claude Code itself
 # (`mcpServers.engram = {type:"http", url:"https://127.0.0.1:<port>/v1/mcp"}`,
-# decision `bee7f370`: HTTPS-loopback-by-default, no stdio, no header/${VAR}
+# HTTPS-loopback-by-default, no stdio, no header/${VAR}
 # dependency for any client — the mTLS proxy injects the credential
 # server-side) into ANOTHER local client's own mcp.json-shaped config
 # (Cursor, Antigravity, ...).
 #
-# FOUNDER CONSTRAINT — NO DEFAULT PATH, EVER: every write is preceded by an
+# DESIGN CONSTRAINT — NO DEFAULT PATH, EVER: every write is preceded by an
 # explicit, typed confirmation of the EXACT path about to be touched.
 # Candidates are DETECTED and PRESENTED, never assumed; scope (global vs
 # per-project) is ASKED, never assumed. This is why the whole command is
@@ -3302,7 +3286,7 @@ cmd_resume() {
 # generic carrier (_write_generic_mcp_config, above). Per-client FORMAT
 # quirks (e.g. a client whose own config uses a different top-level
 # key/shape than the mcpServers convention) are explicitly OUT of scope —
-# _INSTALL_IDS/_INSTALL_LABELS below is the seam a P3 per-client writer
+# _INSTALL_IDS/_INSTALL_LABELS below is the seam a per-client writer
 # would extend or override, not something to speculatively build now.
 
 # _install_target_catalog: populates the static candidate list. Parallel
@@ -3316,8 +3300,7 @@ _install_target_catalog() {
 
 # _cowork_skills_dir: prints the Cowork (Claude desktop, MSIX) skills-plugin dir
 # this machine writes client-side skills to; returns non-zero if not found.
-# Cowork is the ONE target that gets skill FILES written (exception to decision
-# bee7f370): it reaches the engram via the device bridge, which proxies TOOLS
+# Cowork is the ONE target that gets skill FILES written (exception to the URL-only wiring): it reaches the engram via the device bridge, which proxies TOOLS
 # (fos_*) but NOT MCP prompts — so it cannot discover the served
 # /mcp__engram__boot|end-session prompts and needs thin-stub carriers that call
 # the fos_procedure TOOL.
@@ -3346,9 +3329,7 @@ _cowork_skills_dir() {
 }
 
 # _detect_unmapped_install_candidates: the wizard-was-orphan fix
-# (reinforcement_zero-friction-setup-is-product-law's own named example:
-# "o wizard multi-client (hivemind install) existindo mas ÓRFÃO — nunca
-# oferecido."). Reuses the SAME detection `hivemind install` already has
+# (the multi-client installer existing but never being offered). Reuses the SAME detection `hivemind install` already has
 # (Antigravity via ANTIGRAVITY_WINDOWS_USERS_ROOT/*/.gemini/config, Cowork
 # via _cowork_skills_dir) to print a one-line, NON-BLOCKING advisory for any
 # target that is DETECTED on this machine but not yet wired — the offer
@@ -3401,7 +3382,7 @@ _maybe_surface_install_candidates() {
   printf '%s' "${_today}" > "${_marker}" 2>/dev/null || true
 }
 
-# _install_cowork_skills: the Cowork exception to bee7f370. Writes the thin-stub
+# _install_cowork_skills: the Cowork exception to the URL-only wiring. Writes the thin-stub
 # skill files (boot + end-session) from the repo into Cowork's skills dir — the
 # skills only CALL fos_procedure (the served body stays the single source of
 # truth; nothing is inlined). Copies from HIVEMIND_SOURCE_DIR/skills (the clone).
@@ -3424,7 +3405,7 @@ _install_cowork_skills() {
   echo "  Alvo:    ${_label}" >&2
   echo "  Skills:  ${_skills[*]}" >&2
   echo "  Destino: ${_dir}/" >&2
-  echo "  $(_dim "Cowork recebe skills client-side (thin-stub que busca fos_procedure) — exceção à bee7f370: a device bridge proxia tools, não os prompts MCP servidos.")" >&2
+  echo "  $(_dim "Cowork recebe skills client-side (thin-stub que busca fos_procedure) — exceção: a device bridge proxia tools, não os prompts MCP servidos.")" >&2
   printf '  Confirma a escrita? [y/N]: ' >&2
   local _confirm
   if ! IFS= read -r _confirm; then echo "" >&2; return 130; fi
@@ -3702,7 +3683,7 @@ _install_run() {
       # assumed" bar even where there is structurally only one scope.
       echo "" >&2
       echo "  $(_dim "Antigravity só suporta configuração global (não há escopo por projeto).")" >&2
-      echo "  $(_dim "Antigravity roda nativo no Windows; a URL abaixo (127.0.0.1) atravessa a fronteira WSL↔Windows via o localhost-forwarding PADRÃO do WSL2 — nenhuma ponte/relay adicional é necessária (confirmado em teste real do founder).")" >&2
+      echo "  $(_dim "Antigravity roda nativo no Windows; a URL abaixo (127.0.0.1) atravessa a fronteira WSL↔Windows via o localhost-forwarding PADRÃO do WSL2 — nenhuma ponte/relay adicional é necessária (confirmado em teste real).")" >&2
       local _wp
       for _wp in "${ANTIGRAVITY_WINDOWS_USERS_ROOT}"/*/.gemini/config; do
         [ -d "${_wp}" ] || continue
@@ -3755,7 +3736,7 @@ _install_run() {
     done
   fi
 
-  # Cowork exception (bee7f370): this target writes a client-side skill FILE,
+  # Cowork exception: this target writes a client-side skill FILE,
   # not an mcpServers URL entry — so it bypasses the entire per-target proxy
   # port + device_id + generic-MCP-config machinery below. Its own confirm +
   # write lives in _install_cowork_skills.
@@ -3764,7 +3745,7 @@ _install_run() {
     return $?
   fi
 
-  # Option 2 (fos_decision 1caee6a7, item 18cff9b7): a DEDICATED loopback
+  # A DEDICATED loopback
   # port + device_id for this exact config path — never PROXY_PORT (that
   # stays the shared/default port for the CLI's OWN self-seed entry only,
   # unchanged). Idempotent: re-running install against an already-mapped
@@ -3796,7 +3777,7 @@ _install_run() {
   echo "  Porta dedicada: ${_preview_port}" >&2
   echo "  Entrada: mcpServers.engram = {type:\"http\", url:\"https://127.0.0.1:${_preview_port}/v1/mcp\"}" >&2
   if [ "${_chosen_id}" = "antigravity" ] || [ "${_chosen_id}" = "cursor" ]; then
-    echo "  $(_dim "Se este cliente roda nativo no Windows (fora do WSL): a URL 127.0.0.1 acima funciona sem ajuste — o WSL2 já encaminha, por padrão, uma porta de loopback do lado Linux para o localhost do Windows (localhost-forwarding). Nenhuma ponte/relay manual é necessária; confirmado em teste real (Cursor + Cowork, founder, 2026-08-08).")" >&2
+    echo "  $(_dim "Se este cliente roda nativo no Windows (fora do WSL): a URL 127.0.0.1 acima funciona sem ajuste — o WSL2 já encaminha, por padrão, uma porta de loopback do lado Linux para o localhost do Windows (localhost-forwarding). Nenhuma ponte/relay manual é necessária; confirmado em teste real (Cursor + Cowork).")" >&2
   fi
   printf '  Confirma a escrita neste caminho? [y/N] ' >&2
   local _confirm
@@ -3834,12 +3815,12 @@ _install_run() {
   if _write_err="$(_write_generic_mcp_config "${_final_path}" "${_target_port}" 2>&1)"; then
     echo "  $(_ok "✓") gravado: ${_final_path} (device_id ${_target_device_id})" >&2
     # Best-effort: tell an already-running daemon about the freshly-mapped
-    # port so it's live immediately, no daemon restart needed (item
-    # 46d0eeed's POST /internal/proxy/reload). NOT a hard dependency — if
+    # port so it's live immediately, no daemon restart needed
+    # via POST /internal/proxy/reload. NOT a hard dependency — if
     # the daemon isn't running (or this call fails for any reason), the
     # next _start_proxy spawn reads the full port-map.json at boot anyway.
     # JSON content-type + empty object body: the daemon's global request guard
-    # (F2, runtime/src/lib/request-guard.ts) answers 415 to any POST that is
+    # (runtime/src/lib/request-guard.ts) answers 415 to any POST that is
     # not application/json. Harmless to an older daemon, which ignores both.
     curl -sf --max-time 3 -X POST -H "Content-Type: application/json" -d '{}' \
       "http://127.0.0.1:${RUNTIME_PORT}/internal/proxy/reload" > /dev/null 2>&1 || true
@@ -3852,14 +3833,14 @@ _install_run() {
     return 1
   fi
 
-  # ef1c9385 — no local skill/stub file is written for ANY P2 target: per
-  # decision bee7f370 the URL+header (server-injected credential) wiring
+  # No local skill/stub file is written for ANY target: per
+  # design the URL+header (server-injected credential) wiring
   # above is sufficient on its own for every target this pass ships. A
-  # thin-stub carrier (aea3837b/boot.md's shape — a fetch+inject pointer,
+  # thin-stub carrier (boot.md's shape — a fetch+inject pointer,
   # never the full procedure body) would only be needed for a FUTURE target
   # whose client cannot discover served MCP prompts/resources on its own —
   # none of today's targets need that, so none is speculatively built here.
-  echo "  $(_dim "Nenhum arquivo local de skill/stub foi escrito para '${_chosen_id}' — apenas o wiring de URL acima (decisão bee7f370).")" >&2
+  echo "  $(_dim "Nenhum arquivo local de skill/stub foi escrito para '${_chosen_id}' — apenas o wiring de URL acima (por design).")" >&2
   return 0
 }
 
@@ -3867,7 +3848,7 @@ _install_run() {
 # (not inside _install_run) specifically so tests can call _install_run
 # directly with piped stdin to exercise the guided flow — the pipe itself
 # is never a TTY, so a gate inside _install_run would make that untestable.
-# Same fail-closed posture as the slug-picker (cmd_open, F2.3): a target arg
+# Same fail-closed posture as the slug-picker (cmd_open): a target arg
 # does NOT bypass this gate — the scope/path confirmation below still needs
 # a real terminal, so a non-interactive `hivemind install <target>` would
 # only hang or silently fail a `read`, never a safe outcome.
@@ -3899,12 +3880,12 @@ cmd_install() {
   _install_run "$@"
 }
 
-# ── hivemind uninstall (impl 3e2c90da, phase U) ─────────────────────────────
+# ── hivemind uninstall ─────────────────────────────
 # Removes everything install.sh + enrollment + `hivemind install <target>`
 # wrote on this machine, component by component:
 #   HARNESS (Claude Code layer): $HIVEMIND_HOME/.claude — INCLUDING the
 #     isolated Claude Code state (history, projects, sessions, credentials;
-#     founder Q4 2026-10-05 "apaga tudo", listed before deletion) — and
+#     owner request "apaga tudo", listed before deletion) — and
 #     $HIVEMIND_HOME/bin/hivemind-statusline.py.
 #   PROXY (connection layer): the mcpServers.engram entry in every config file
 #     recorded in PORT_MAP_FILE (only when it still points at its HiveMind
@@ -3914,7 +3895,7 @@ cmd_install() {
 # Invariants: the daemon is stopped through its pidfile only (cmd_stop — never
 # the port-based _reap_orphan_runtimes); only paths HiveMind itself recorded
 # are touched (no filesystem scan); every rm -rf root passes _uninstall_guard;
-# no server-side device revoke (founder Q6, out of v1). Seams for tests:
+# no server-side device revoke (out of v1). Seams for tests:
 # HIVEMIND_UNINSTALL_BIN_DIRS (colon-separated, like PATH),
 # HIVEMIND_SYSTEM_CA_DEST (process env only, snapshotted before the .env
 # load into _UNINSTALL_CA_DEST_OVERRIDE; basename must be
@@ -4082,7 +4063,7 @@ _uninstall_root_check() {
   return 0
 }
 
-# managed-src (item D1) — the ONE git clone uninstall may remove: exactly
+# managed-src — the ONE git clone uninstall may remove: exactly
 # ${HIVEMIND_HOME}.src, strictly inside $HOME, a real dir (not a symlink)
 # holding a clone whose origin is the canonical remote (_is_managed_clone),
 # not inside another git work tree. It is allowed to BE HIVEMIND_SOURCE_DIR
@@ -4133,7 +4114,7 @@ _uninstall_guard_harness() {
   _uninstall_root_check "HIVEMIND_HOME" "${HIVEMIND_HOME:-}" hivemind || return 1
   # The update's staging / rollback copies hold their own .claude (credentials,
   # history) — approved (path rules only) so they go ENTIRELY: no backup of
-  # the harness is left behind (founder 2026-10-05, finding b354891e).
+  # the harness is left behind.
   _uninstall_root_check "HIVEMIND_HOME.staging" "${HIVEMIND_HOME}.staging" hivemind-aux || return 1
   _uninstall_root_check "HIVEMIND_HOME.last-good" "${HIVEMIND_HOME}.last-good" hivemind-aux || return 1
   if [ ! -d "${HIVEMIND_HOME}" ]; then
@@ -4160,7 +4141,7 @@ _uninstall_rm() {
     echo "  removed: ${_p}"
   else
     echo "  ! could not remove ${_p} — remove it by hand" >&2
-    _UNINSTALL_FAILED=1  # F8: a failed removal → exit 1 (same as Windows)
+    _UNINSTALL_FAILED=1  # a failed removal → exit 1 (same as Windows)
   fi
   return 0
 }
@@ -4248,7 +4229,7 @@ _uninstall_targets() {
           # to the cwd of that install, which was never recorded, with a
           # leading `~` NOT expanded. Resolving it against today's cwd could
           # edit the wrong file, so it is never touched: a visible warning
-          # names it and the step fails (F8 — wiring left behind). Its
+          # names it and the step fails (wiring left behind). Its
           # port-map entry is NOT kept: port-map.json goes with ~/.engram (or
           # explicitly under --keep-certs) in _uninstall_proxy, which frees
           # the port; the path survives only in this warning.
@@ -4268,7 +4249,7 @@ _uninstall_targets() {
           else
             _status="warn"; _msg="edit failed: ${_res}"
           fi
-          # F8: an entry that could not be removed fails the uninstall; a
+          # An entry that could not be removed fails the uninstall; a
           # deliberate "changed after install" refusal does not.
           case "${_status}:${_msg}" in warn:"edit failed"*) _UNINSTALL_FAILED=1 ;; esac
           case "${_status}" in
@@ -4339,7 +4320,7 @@ _uninstall_system_ca() {
   return 0
 }
 
-# _keep_credentials: --keep-certs (blocker 3b7a507e a). The cert files alone do
+# _keep_credentials: --keep-certs. The cert files alone do
 # not bring the proxy back: MTLS_CERT_PATH/KEY_PATH/CA_PATH, HIVEMIND_OWNER and
 # FOS_API_KEY live in $HIVEMIND_HOME/.env, which this uninstall removes. Those
 # lines (MTLS_* + HIVEMIND_OWNER + FOS_API_KEY, nothing else) go to
@@ -4527,14 +4508,14 @@ _uninstall_plan() {
   return 0
 }
 
-# _uninstall_harness_only <yes>: `hivemind uninstall harness` (phase S5).
+# _uninstall_harness_only <yes>: `hivemind uninstall harness`.
 # Removes the harness (the whole $HIVEMIND_HOME/.claude — incl. the isolated
-# Claude Code state, founder Q4 "apaga tudo", listed first — and the
+# Claude Code state, owner request "apaga tudo", listed first — and the
 # statusline) and the update's ${HIVEMIND_HOME}.staging / .last-good copies
-# ENTIRELY (no backup left — finding b354891e) through the same guarded
+# ENTIRELY (no backup left) through the same guarded
 # _uninstall_rm, then writes marker "proxy". The daemon is NOT stopped; runtime/, .env, ~/.engram, client
 # wiring and the binaries are not touched. `hivemind update` then stages no
-# harness file (S3) and `hivemind` starts the proxy only (S4).
+# harness file and `hivemind` starts the proxy only.
 _uninstall_harness_only() {
   local _yes="$1" _ans="" _marker _tmp
   _uninstall_guard_harness || exit 1

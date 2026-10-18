@@ -7,7 +7,7 @@
 //   BEFORE `exec claude` replaces the script's process image — the pid it
 //   sends ($$ in bash) only stays valid across that exec because exec
 //   preserves the pid. Starts the pid-watcher + heartbeat for the session.
-// GET  /sessions — diagnostic listing, incl. heartbeat_active (DR-2.5).
+// GET  /sessions — diagnostic listing, incl. heartbeat_active.
 //
 // REVIVE-ON-RETURN (the model this whole file implements):
 // the daemon never decides on its own that a session is dead. A
@@ -120,7 +120,7 @@ function adoptPid(entry: SessionEntry, pid: number): void {
   // Persist the new pid to disk immediately.
   persistStore();
 
-  // Heartbeat every ~30s while pid is alive (DR-2.2 — Correção A: without
+  // Heartbeat every ~30s while pid is alive (without
   // this, a silent-but-alive interactive session goes stale in the
   // backend's eyes and eventually reads as orphan to the watchdog, even
   // though nothing is actually wrong).
@@ -129,7 +129,7 @@ function adoptPid(entry: SessionEntry, pid: number): void {
   }, 30_000);
 
   // pid-watcher: when the pid dies, PAUSE (not close) — revive-on-return
-  // (DR-2.2/2.3). The daemon is not the judge of whether the session is
+  //. The daemon is not the judge of whether the session is
   // gone for good; it only reports "no local process for this right now".
   entry.pidCleanup = watchPid(pid, (_reason) => {
     console.log(`[sessions] pid ${pid} gone — pausing session ${entry.session_id} (revive-on-return)`);
@@ -198,7 +198,7 @@ sessions.post('/adopt', async (c) => {
 //   - pid dead (ESRCH) or null → untouched. Never closed here — that is the
 //     WatchdogService's job, and only after its own conservative threshold.
 //
-// Fase 4, DR-4.1: emits a fire-and-forget hivemind_runtime.daemon_started
+// Emits a fire-and-forget hivemind_runtime.daemon_started
 // event (revived/skipped counts) once reconcile finishes — both the normal
 // (backend list_active) and degraded (local mirror) branches. Skipped only
 // in the HIVEMIND_DEVICE_ID-absent guard above: that path has no
@@ -249,7 +249,7 @@ export async function reconcileOnStartup(): Promise<void> {
 
     console.log(`[sessions] reconcileOnStartup: ${revived} session(s) re-adopted, ${skipped} left untouched (dead pid or gone — watchdog decides)`);
 
-    // Fase 4, DR-4.1 — fire-and-forget observability event, corrected
+    //   fire-and-forget observability event, corrected
     // kind_category (see lifecycle-emitter.ts header). Never blocks/throws:
     // lifecycleEmitter.emit() only enqueues.
     lifecycleEmitter.emit('hivemind_runtime.daemon_started', { revived, skipped, degraded: false });
@@ -279,7 +279,7 @@ export async function reconcileOnStartup(): Promise<void> {
 
 // ---------------------------------------------------------------
 // shutdownSessions — called on SIGTERM/SIGINT only (server.ts's shutdown()).
-// SIGHUP is a logged no-op (Fase 1, DR-1.2) and never reaches here.
+// SIGHUP is a logged no-op and never reaches here.
 //
 // PAUSE every still-pid-alive tracked session in the backend (not a
 // silent local-only persist) — the backend must actually
@@ -289,7 +289,7 @@ export async function reconcileOnStartup(): Promise<void> {
 // already died before shutdown was already paused by its own onExit
 // (adoptPid above) — nothing left to repeat for it here.
 //
-// Fase 4, DR-4.1: emits a fire-and-forget hivemind_runtime.daemon_shutdown
+// Emits a fire-and-forget hivemind_runtime.daemon_shutdown
 // event (paused count) on every call, including the zero-tracked-sessions
 // early return below — "0 paused" is still a real signal on the daemon's
 // lifecycle timeline.
@@ -298,7 +298,7 @@ export async function reconcileOnStartup(): Promise<void> {
 export async function shutdownSessions(): Promise<void> {
   const entries = [...sessionStore.values()];
   if (entries.length === 0) {
-    // Fase 4, DR-4.1 — still emit: "0 sessions paused" is itself a useful
+    //   still emit: "0 sessions paused" is itself a useful
     // signal on the daemon's lifecycle timeline (e.g. a restart while no
     // session was ever adopted), not a reason to go silent.
     lifecycleEmitter.emit('hivemind_runtime.daemon_shutdown', { paused: 0 });
@@ -337,7 +337,7 @@ export async function shutdownSessions(): Promise<void> {
 }
 
 // ---------------------------------------------------------------
-// GET /sessions — list adopted sessions (diagnostic, DR-2.5)
+// GET /sessions — list adopted sessions (diagnostic)
 // ---------------------------------------------------------------
 
 sessions.get('/', (c) => {

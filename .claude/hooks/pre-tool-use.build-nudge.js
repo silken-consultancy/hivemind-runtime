@@ -12,7 +12,7 @@
 //   the COMMAND TYPE (not a running count) and, before a build/long-op runs in
 //   the foreground, emits a non-blocking advisory to re-run it in the background.
 //
-// FOUNDER CALIBRATION — NUDGE, NOT A GATE:
+// OWNER CALIBRATION — NUDGE, NOT A GATE:
 //   This NEVER blocks, denies, or delays the command. It is a pure advisory:
 //   permissionDecision is ALWAYS "allow"; the command runs regardless; the model
 //   decides whether to heed it. No exit 2, ever. Caging is explicitly rejected.
@@ -30,7 +30,7 @@
 //   actually reads, non-blockingly, is hookSpecificOutput.additionalContext with
 //   permissionDecision "allow". So the nudge is emitted there (and mirrored to
 //   stderr for transcript/debug visibility). This is a non-blocking nudge, not a
-//   gate — exactly the founder calibration.
+//   gate — exactly the owner calibration.
 //
 // SUB-AGENTS DO NOT NUDGE (only the main loop freezes the user's session):
 //   inside a sub-agent the work is ALREADY dispatched, so a background nudge would

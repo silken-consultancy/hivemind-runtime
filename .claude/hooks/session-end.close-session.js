@@ -17,9 +17,7 @@
 //
 // WHY NOT Stop (measured, load-bearing — do not "fix" by adding Stop here):
 //   `Stop` fires at the end of EVERY assistant turn, not at session end —
-//   measured directly on this repo (see project memory
-//   pattern_hivemind-runtime-updater-settings-from-source-self-heals-dangling-hook-removal,
-//   which documents the SAME empirical fact about the prior stop.* hook: "the
+//   measured directly on this repo (the prior stop.* hook had the same issue: "the
 //   hook's own header comment mis-says 'session end'" — it does not mean
 //   that). `hivemind` execs `claude` INTERACTIVELY (bin/hivemind: `exec claude
 //   --setting-sources user "$@"`, no --print) — a session normally spans many
@@ -72,7 +70,7 @@
 //     silent no-op, not a failure.
 //   - Idempotent by construction: fos_session(action:'close') on an
 //     already-closed session returns {already_closed:true} server-side
-//     (engram apps/backend/src/modules/sessions/sessions.service.ts) — safe
+//     (engram-side behaviour) — safe
 //     to fire even if the user already ran /end-session.
 //   - Reuses the SAME local mTLS-proxy call shape bin/hivemind itself uses
 //     (`_mcp_call`/`_open_session_spine`): POST a JSON-RPC tools/call to

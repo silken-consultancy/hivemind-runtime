@@ -178,14 +178,13 @@ def _reset_remaining(iso: str) -> str:
 
 def quota() -> str:
     """
-    Subscription quota, ALWAYS present — the founder wants it visible at all times.
-    Layout (founder spec):
+    Subscription quota, ALWAYS present — it is meant to be visible at all times.
+    Layout:
       Sessão: NN% H:MMm~      → 5h window: % USED + time left until reset
       Global: NN%             → 7-day all-models: total % USED
 
     Source: ~/.claude/cache/usage.json — kept fresh per-message by the sibling
-    user-prompt-submit.capture-quota.js hook. NOTE (ported verbatim from the
-    lab, gate confirmed at F5.2): this path is the REAL homedir, not
+    user-prompt-submit.capture-quota.js hook. NOTE: this path is the REAL homedir, not
     ${CLAUDE_CONFIG_DIR}/cache/usage.json — the hook's CACHE constant hardcodes
     os.homedir(), same as here, so hook-write and statusline-read always agree
     with each other. This is intentional-safe: subscription quota is

@@ -6,8 +6,7 @@
 //   The advisory nudge (post-tool-use.dispatch-nudge.js) reminds; this hook
 //   ENFORCES. Past CEILING mutating/hands-on main-loop calls in the current
 //   turn, it DENIES the next one — forcing a dispatch instead of continuing
-//   the flow piece-meal in the foreground. Anchor:
-//   decision_execute-boundary-hard-gate-messenger-exclusive-override-turn-scoped-audited-lab-and-product.
+//   the flow piece-meal in the foreground.
 //
 // WHAT COUNTS: delegated entirely to lib/execute-boundary-classifier.js's
 // isMutatingToolCall() — Edit/Write/MultiEdit always count; Bash counts only
@@ -36,14 +35,13 @@
 // A single-owner-per-file discipline avoids a double-writer race between this
 // hook and the ones that actually mutate state.
 //
-// THE OVERRIDE — messenger-only, turn-scoped, audited: valid only if the grant
+// THE OVERRIDE — main-session-only, turn-scoped, audited: valid only if the grant
 // file exists AND its turn_seq matches the CURRENT turn_seq (a new user message
 // wipes the grant via the turn-reset hook — no set-and-forget). A valid consume
 // appends a 'consumed' line to the SAME audit JSONL the grant used (imported
 // from lib/execute-boundary-override.mjs, not duplicated here).
 //
-// ⚠ ACTIVATION STATUS (2026-08-27, item A2.1, revised same day for
-//   fail-safe default): this hook ENFORCES BY DEFAULT. Only the literal
+// ⚠ ACTIVATION STATUS (revised for fail-safe default): this hook ENFORCES BY DEFAULT. Only the literal
 //   value "off" for ENGRAM_EXECUTE_BOUNDARY_GATE disables it — unset, the
 //   string "enforce", or any typo/unexpected value all fall through to
 //   enforcing. This is deliberate: a misspelled or absent override must
@@ -93,9 +91,9 @@ if (require.main === module) {
 
 async function main() {
   // Runs BEFORE stdin is even touched — a MODE=off gate never parses input,
-  // cheapest + safest (mirrors lab's ordering exactly). Fail-safe guard:
+  // cheapest + safest (cheapest check first). Fail-safe guard:
   // only the literal "off" disables. Unset, "enforce", or any typo all fall
-  // THROUGH to enforcing — this is the whole point (item A2.1 revision).
+  // THROUGH to enforcing — this is the whole point.
   if (MODE === 'off') process.exit(0);
 
   let input;
@@ -118,7 +116,7 @@ async function main() {
       if (isOverrideCliInvocation(toolName, toolInput)) {
         deny(
           'Subagents cannot invoke the execute-boundary override CLI — this override is ' +
-          'messenger-only, structurally, regardless of the (env-unreliable for subagents) ' +
+          'main-session-only, structurally, regardless of the (env-unreliable for subagents) ' +
           'refusal inside the CLI itself.'
         );
         return;
@@ -144,15 +142,15 @@ async function main() {
     }
 
     // Embed the RESOLVED sessionId (input.session_id-preferring — see
-    // header/blocker d85e3fb7) in the deny reason itself. The override CLI is
+    // header) in the deny reason itself. The override CLI is
     // a standalone process with no stdin/harness input, so --session here is
     // the ONLY way it can learn this gate's actual state-file key — it must
     // NOT fall back to guessing via ENGRAM_SESSION_ID alone, which can differ
     // from input.session_id (measured live: harness session_id
-    // d6525965-... vs ENGRAM_SESSION_ID 06658549-... in the same turn).
+    // <id-A> vs ENGRAM_SESSION_ID <id-B> in the same turn).
     deny(
       `${count} hands-on/mutating commands in this turn — this is a FLOW, ` +
-      'dispatch it to a subagent instead of continuing inline. If a founder OK ' +
+      'dispatch it to a subagent instead of continuing inline. If an owner OK ' +
       'for one more inline call was actually given, run: ' +
       `node .claude/hooks/lib/execute-boundary-override.mjs --ok '<quote>' --session ${sessionId} first.`
     );
@@ -225,7 +223,7 @@ function deny(reason) {
 
 // ─── self-test (node pre-tool-use.execute-boundary-gate.js --selftest) ─────
 //
-// Asserts ALL FOUR MODE cases (item A2.1 fail-safe revision) by re-spawning
+// Asserts ALL FOUR MODE cases by re-spawning
 // this same file as a child process with crafted stdin + env, since MODE is
 // read once at module load. Craft: a CEILING-count dispatch state file + a
 // mutating Edit call, no override — this DENIES whenever MODE resolves to
@@ -278,13 +276,13 @@ function selftest() {
         fail++;
         console.error(`  FAIL (${label} should DENY at CEILING): got stdout: ${result}`);
       } else {
-        // Reconciliation check (blocker d85e3fb7): the override CLI runs as a
+        // Reconciliation check: the override CLI runs as a
         // standalone process with no stdin/harness input, so it can ONLY ever
         // learn the gate's resolved sessionId if the gate hands it over. The
         // deny reason IS that hand-over — it must embed `--session
         // <sessionId>` so a copy-pasted override invocation targets the SAME
         // state-file key this gate just read from, not whatever
-        // ENGRAM_SESSION_ID happens to be in the messenger's env (which may
+        // ENGRAM_SESSION_ID happens to be in the main session's env (which may
         // differ from input.session_id — the exact bug measured live this
         // session).
         const reason = (parsed && parsed.hookSpecificOutput && parsed.hookSpecificOutput.permissionDecisionReason) || '';
@@ -316,9 +314,7 @@ function selftest() {
     try { fs.unlinkSync(dispatchFile); } catch { /* best-effort cleanup */ }
   }
 
-  // ─── subagent-override-denial (PORTED, item B1.10 — single-harness port of
-  // §4 from the retired kernel/hooks/.test-fixtures/execute-boundary-parity.js;
-  // the lab-comparison premise is dead, but the isolation-boundary assertion
+  // ─── subagent-override-denial (PORTED — single-harness port; the isolation-boundary assertion
   // itself is not comparative and was otherwise going untested anywhere in
   // this repo). Proves the deny fires HERE, at the gate, via
   // isSubagentContext + isOverrideCliInvocation (the reliable input.agent_id
@@ -395,20 +391,19 @@ function selftest() {
     // (c) subagent Bash call that only MENTIONS the override CLI — allowed
     // because no command SEGMENT actually RUNS it (invocation-shape test, see
     // lib/execute-boundary-classifier.js's isOverrideCliInvocation). The
-    // COMPOUND form (`cd … && grep …`) is the exact B1.8 false positive: its
+    // COMPOUND form (`cd … && grep …`) is the exact false positive: its
     // lead token is `cd`, so the old ^-anchored READONLY_LEAD exemption
     // wrongly denied it. Confirmed end-to-end through the real gate subprocess,
     // not just the unit-level classifier call.
     runSubagentCase(
       'merely mentioning the override CLI in a compound read (cd && grep)',
       'Bash',
-      { command: 'cd repo && grep -n founder .claude/hooks/lib/execute-boundary-override.mjs' },
+      { command: 'cd repo && grep -n owner .claude/hooks/lib/execute-boundary-override.mjs' },
       false
     );
 
     // (d) subagent running the override CLI behind a shell -c wrapper — the
-    // false-negative a runtime-enumeration detector let through (item B1.8
-    // 🔴 fix). The pure-read allow-list denies it: the segment names the path
+    // false-negative a runtime-enumeration detector let through (fix). The pure-read allow-list denies it: the segment names the path
     // and its lead word (`bash`) is not a read verb. Proven end-to-end here.
     runSubagentCase(
       'running the override CLI behind a bash -c wrapper',
