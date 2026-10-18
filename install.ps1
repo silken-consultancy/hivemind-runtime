@@ -13,8 +13,8 @@
 #
 # Requirements, all checked BEFORE anything is written (a failed check leaves
 # nothing installed): git, bun, openssl. openssl is taken from PATH or from Git
-# for Windows' own build (<Git>\mingw64\bin\openssl.exe, OpenSSL 3.x, works
-# without an openssl.cnf); the daemon shells out to a bare `openssl`, so the
+# for Windows' own build (<Git>\ucrt64\bin, <Git>\mingw64\bin or
+# <Git>\usr\bin openssl.exe, OpenSSL 3.x, works without an openssl.cnf); the daemon shells out to a bare `openssl`, so the
 # directory found here is recorded in .env (HIVEMIND_OPENSSL_DIR) and the
 # launcher prepends it to the daemon's PATH.
 #
@@ -39,7 +39,8 @@
 #                                    text file instead of HKCU\Environment.
 #   HIVEMIND_OPENSSL_CANDIDATES      ';'-separated directories searched for
 #                                    openssl.exe INSTEAD of the defaults (Git's
-#                                    mingw64\bin, ShiningLight's install dir).
+#                                    ucrt64\bin, mingw64\bin and usr\bin, then
+#                                    ShiningLight's install dir).
 #
 # This file is ASCII on purpose: Windows PowerShell 5.1 misreads UTF-8 without a
 # BOM (measured on an em dash).
@@ -142,28 +143,36 @@ function Get-OpensslCandidateDirs {
     return @($env:HIVEMIND_OPENSSL_CANDIDATES -split ';' | Where-Object { $_ })
   }
   $dirs = @()
-  # Git for Windows: <Git>\cmd\git.exe -> <Git>\mingw64\bin\openssl.exe
+  # Git for Windows: <Git>\cmd\git.exe -> <Git>\{ucrt64,mingw64,usr}\bin\openssl.exe
+  # (current releases ship it in ucrt64\bin and usr\bin; older ones in mingw64\bin).
   $gitRoot = Split-Path -Parent (Split-Path -Parent $git.Source)
-  $dirs += (Join-Path $gitRoot 'mingw64\bin')
-  $dirs += 'C:\Program Files\Git\mingw64\bin'
+  $roots = @($gitRoot)
+  if (-not ($roots -contains 'C:\Program Files\Git')) { $roots += 'C:\Program Files\Git' }
+  foreach ($root in $roots) {
+    foreach ($sub in @('ucrt64\bin', 'mingw64\bin', 'usr\bin')) { $dirs += (Join-Path $root $sub) }
+  }
   # ShiningLight.OpenSSL.Light (winget) default install dir.
   $dirs += 'C:\Program Files\OpenSSL-Win64\bin'
   return $dirs
 }
 
+$script:OpensslSearched = @()
 function Find-OpensslDir {
+  $script:OpensslSearched = @('PATH')
   $onPath = Get-Command openssl.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($onPath) { return (Split-Path -Parent $onPath.Source) }
   foreach ($d in (Get-OpensslCandidateDirs)) {
+    $script:OpensslSearched += $d
     if (Test-Path -LiteralPath (Join-Path $d 'openssl.exe') -PathType Leaf) { return $d }
   }
   return $null
 }
 
 function Write-OpensslInstructions {
-  [Console]::Error.WriteLine("Error: 'openssl' not found (not on PATH, not in Git for Windows' mingw64\bin).")
+  [Console]::Error.WriteLine("Error: 'openssl' not found. Searched:")
+  foreach ($p in $script:OpensslSearched) { [Console]::Error.WriteLine("    $p") }
   [Console]::Error.WriteLine('  HiveMind needs openssl to create your certificate. Either:')
-  [Console]::Error.WriteLine('    - reinstall/repair Git for Windows (it ships openssl in <Git>\mingw64\bin), or')
+  [Console]::Error.WriteLine('    - reinstall/repair Git for Windows (it ships openssl in <Git>\ucrt64\bin), or')
   [Console]::Error.WriteLine('    - install OpenSSL:  winget install --id ShiningLight.OpenSSL.Light -e')
   [Console]::Error.WriteLine('  then re-run this installer. Nothing was installed.')
 }

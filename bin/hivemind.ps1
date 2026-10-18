@@ -202,6 +202,20 @@ function Get-OpensslDir {
   if ($d -and (Test-Path -LiteralPath (Join-Path $d 'openssl.exe') -PathType Leaf)) { return $d }
   $onPath = Get-Command openssl.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($onPath) { return (Split-Path -Parent $onPath.Source) }
+  # Same order as install.ps1: Git for Windows ucrt64\bin -> mingw64\bin -> usr\bin
+  # (current releases ship openssl in ucrt64\bin/usr\bin), then ShiningLight.
+  $git = Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  $roots = @()
+  if ($git) { $roots += (Split-Path -Parent (Split-Path -Parent $git.Source)) }
+  if (-not ($roots -contains 'C:\Program Files\Git')) { $roots += 'C:\Program Files\Git' }
+  $dirs = @()
+  foreach ($root in $roots) {
+    foreach ($sub in @('ucrt64\bin', 'mingw64\bin', 'usr\bin')) { $dirs += (Join-Path $root $sub) }
+  }
+  $dirs += 'C:\Program Files\OpenSSL-Win64\bin'
+  foreach ($c in $dirs) {
+    if (Test-Path -LiteralPath (Join-Path $c 'openssl.exe') -PathType Leaf) { return $c }
+  }
   return $null
 }
 
