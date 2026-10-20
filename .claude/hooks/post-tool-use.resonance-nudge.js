@@ -79,6 +79,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { emitContext } = require('./lib/emit-context');
+const { isSubagentContext } = require('./lib/execute-boundary-classifier');
 
 // ─── constantes ──────────────────────────────────────────────────────────────
 
@@ -104,6 +105,13 @@ try {
   // Falha no parse — fail-open, sai silenciosamente
   process.exit(0);
 }
+
+// SUBAGENTS DO NOT COUNT, DO NOT RESET, DO NOT NUDGE. The counter is the MAIN
+// loop's presence floor; a subagent shares the parent's session_id, so its dense
+// calls inflated the parent counter (20→420→570 measured) and the nudge fired where
+// nobody can act on it. Discriminator: the MEASURED input.agent_id (present ONLY on
+// a subagent's tool calls; see lib/execute-boundary-classifier.js).
+if (isSubagentContext(input)) process.exit(0);
 
 const toolName = (input.tool_name || '').toLowerCase();
 const toolInput = input.tool_input || {};
@@ -270,7 +278,7 @@ function isDenseMcpCall(name, tin) {
 
 /**
  * Detecta sinais de "presença no self" → reset do contador.
- *  (a) fos_recall(mode:semantic) com input.plane === 'self'
+ *  (a) fos_recall mode:associative+scope:self | mode:exact de self/* | (legado) mode:semantic plane:self
  *  (b) fos_memory(action:set) com plane === 'self' (cobre self/lived, self/reflexive
  *      E self/core — qualquer cristalização do self é presença). NOTA: o set NÃO tem
  *      campo `topic` (topic é backend-derived), só `plane` + `name`. Aceitamos
@@ -283,11 +291,21 @@ function isDenseMcpCall(name, tin) {
  * @returns {boolean}
  */
 function isResetSignal(name, tin) {
-  // fos_recall(mode:semantic) — the self-presence read signal.
-  // mode:exact/list/topic would be over-fire → must check mode.
+  // fos_recall — the self-presence READ signals (R1.4):
+  //   (i)  mode:associative WITH scope:'self' (the read self §4 prescribes; an unscoped
+  //        associative read spans the whole corpus and does not satisfy the floor);
+  //   (ii) mode:exact of a self/* name (name or names[]);
+  //   (legacy) mode:semantic + plane:'self'.
+  // Any other recall (topic/list/exact of a non-self name) would over-fire → no reset.
   if (name === 'mcp__engram__fos_recall') {
-    if ((tin && tin.mode) !== 'semantic') return false;
-    return (tin && tin.plane) === 'self';
+    const mode = tin && tin.mode;
+    if (mode === 'associative') return tin.scope === 'self'; // project-wide associative must NOT satisfy the floor
+    if (mode === 'exact') {
+      const names = [tin.name, ...(Array.isArray(tin.names) ? tin.names : [])];
+      return names.some((n) => typeof n === 'string' && n.startsWith('self/'));
+    }
+    if (mode === 'semantic') return tin.plane === 'self';
+    return false;
   }
   // fos_memory(action:set) — the self-presence write signal.
   // Other actions (reclassify/restore/tag/untag/decay_update) are NOT self-writes
@@ -383,7 +401,6 @@ function nudge(tipo) {
  */
 function counterNudge(count) {
   emitContext(
-    `◇ GUARD-◇ floor: ${count} dense tool-calls with no resonance/savepoint — ` +
-    `surface self/lived (fos_recall mode=semantic plane=self) or crave ◆?`
+    `◇ ${count} dense calls without a self read — fos_recall({ mode: "associative", scope: "self", context_text: <the now> })`
   );
 }

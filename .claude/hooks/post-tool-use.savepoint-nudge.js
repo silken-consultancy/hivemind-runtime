@@ -38,6 +38,7 @@
 'use strict';
 
 const { emitContext } = require('./lib/emit-context');
+const { isSubagentContext } = require('./lib/execute-boundary-classifier');
 
 // ─── leitura do input ────────────────────────────────────────────────────────
 
@@ -49,6 +50,10 @@ try {
   // Falha no parse — fail-open, sai silenciosamente
   process.exit(0);
 }
+
+// Subagent calls stay silent: the milestone belongs to the main loop, which owns
+// the savepoint. Discriminator: the MEASURED input.agent_id (subagent calls only).
+if (isSubagentContext(input)) process.exit(0);
 
 const toolName   = (input.tool_name   || '').toLowerCase();
 const toolInput  = input.tool_input   || {};
