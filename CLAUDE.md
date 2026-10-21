@@ -36,49 +36,56 @@ exit only (`/clear`, `/resume` and logout leave it open), and a server-side watc
 any session left idle past its threshold with a floor handoff, so the next boot still finds
 a structured `next_note`.
 
-## Dispatch — background roster agents (fetch+inject, on every plan)
+## Dispatch — background roster agents (by reference, on every plan)
 
 Long/hands-on work (the kind `pre-tool-use.build-nudge.js` and
 `post-tool-use.dispatch-nudge.js` nudge you about) does not run in the
-foreground — it dispatches to a **background roster subagent**. The roster
-is served to your plan; the served single-loop /
-serial-dispatch contract (one of the contracts the boot loads) is the
-authority for **when** to dispatch, to which agent and how many at once —
-do not invent that policy here. This section is the **mechanism**: how a
-dispatch happens once you've decided to make one, the same mechanism on every plan.
+foreground — it dispatches to a **background roster subagent**. The served
+dispatch contract (one of the contracts the boot loads) is the authority for
+**when** to dispatch, to which agent and how many at once — do not invent that
+policy here. This section is only the **mechanism**: dispatch by reference.
 
 **The roster is CONSUMED, never materialized.** There is no
 `.claude/agents/*.md` for any roster agent in this tree, and this session
-must never create one — every dispatch fetches the compiled prompt live,
-and `prompt_body` is never written to a file, echoed, logged, or cached
-across sessions.
+must never create one. The main session never holds a role prompt: the
+invoked agent fetches its own.
 
-1. **Discover** (JIT — the first time this session needs to dispatch; cache
-   the result in-session only, never across sessions):
-   `fos_agent({ action: "list" })` → `{agents:[{id, description}], count}`.
-   Match the task to the returned `description` — **never hardcode a roster
-   agent id** anywhere in this tree. An empty list (unseeded roster) is a
-   fail-open degrade to "no dispatch available right now" — say so plainly,
-   never invent an id.
-2. **Fetch** the compiled agent for the chosen id:
-   `fos_agent({ action: "get", id })` →
-   `{id, apiVersion, prompt_body, resolved_model, tools}`. `prompt_body`
-   already carries the governance block and a `## Tools` section; `tools`
-   is the same allowlist, structured, for you to honor when framing the
-   spawn.
-3. **Inject + spawn, background, never foreground:** spawn a subagent with
-   `run_in_background: true` and its instructions set to `prompt_body`
-   followed by the concrete task order for this dispatch — that
-   concatenation IS the injection; nothing is written to disk. Honor
-   `resolved_model.model_id` if it names a concrete model; the sentinel
-   `"inherit"` means keep the parent session's model, never override.
-4. **One at a time when the plan says so:** when your plan allows one dispatch at a
-   time, wait for the running one to report back before starting the next. If
-   the plan's limit cannot be read, work one at a time.
+1. **Discover** (JIT, once per session; cache in-session only):
+   `fos_agent({ action: "list" })` → `{agents:[{id, description, resolved_model}], count}`.
+   The listing never carries a prompt body. Match the task to the returned
+   `description` — **never hardcode a roster agent id**. An empty list (or no
+   fitting agent) means "no dispatch available right now": say so plainly and
+   escalate it to the person; never invent an id or fall back to a generic
+   agent with an improvised prompt.
+2. **Spawn in background** (`run_in_background: true`, never foreground) with
+   the agent's `resolved_model` — a concrete model id is passed exactly,
+   `"inherit"` keeps the parent session's model; never omitted, never
+   substituted. If the listing marks an agent's model configuration as missing
+   or invalid (no resolved model), spawn with that agent's tier and tell the
+   person once that the model configuration is degraded. Send ONLY the roster
+   id and the task order.
+3. **The agent fetches its own role.** The task order tells the agent that its
+   FIRST act, before any other tool call, is `fos_agent({ action: "get", id })`
+   for its own id, adopting `prompt_body` verbatim and honouring the returned
+   `tools` allowlist. When it reports back, check that the report confirms the
+   role was fetched; a report without that confirmation is an unverified role.
+4. **Fallback, declared:** only if the agent reports it cannot reach the
+   engram after one retry, the main session fetches the body itself, injects
+   it verbatim followed only by the task order, and states the fallback.
+5. **Read `dispatch.mode` from the boot — one explicit value, never a limit to
+   interpret.** `swarm` → dispatch in parallel in the background, bounded only
+   by disjoint fronts (each front in its own worktree and branch; serialise
+   fronts that share a tree, a port or a database); `dispatch.cap` is the most
+   in flight (a number, or `"unbounded"`). `single-loop` → one dispatch at a
+   time: wait for the running one to report back before starting the next.
+   `null` is never "unreadable": `max_concurrent: null` means unbounded, and the
+   boot degrades to `single-loop` itself (with `dispatch.reason`) when it
+   cannot read the plan. A boot with no `dispatch.mode` (older server) → one at
+   a time.
 
-**Never:** write a roster prompt to any file, echo or log `prompt_body`
-(including in a nudge or a status line), reuse a fetched prompt across
-sessions, or hardcode a roster agent id.
+**Never:** hold, echo, log or write a `prompt_body` (in a spawn, message,
+nudge, status line or file), reuse a fetched prompt across sessions, hand-author
+or summarize a stand-in for a role prompt, or hardcode a roster agent id.
 
 ## How to write memory — load the contract
 
@@ -109,8 +116,8 @@ Core:
 
 Dispatch (§ Dispatch — background roster agents):
 - `fos_entitlement({action:"get"})`               — self-describe your plan's entitlements
-- `fos_agent({action:"list"})`                     — roster discovery, `{agents:[{id, description}], count}` (JIT, no bodies)
-- `fos_agent({action:"get", id})`                  — fetch the compiled agent to inject, `{prompt_body, resolved_model, tools}`
+- `fos_agent({action:"list"})`                     — roster discovery, `{agents:[{id, description, resolved_model}], count}` (JIT, no bodies)
+- `fos_agent({action:"get", id})`                  — the invoked agent fetches its OWN role with this (first act); the main session does not call it except in the declared fallback
 - `fos_report({...})`                              — a dispatched subagent's completion signal
 
 Planning:
