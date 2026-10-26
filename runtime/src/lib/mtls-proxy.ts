@@ -63,6 +63,9 @@ export interface PortMapEntry {
   scope?: string;
   port: number;
   device_id: string;
+  // the project this target is bound to (slug). Appended as
+  // ?project=<slug> upstream when the client connects without one.
+  project?: string;
   created_at?: string;
   updated_at?: string;
 }
@@ -70,6 +73,24 @@ export interface PortMapEntry {
 interface PortMapFile {
   version: number;
   entries: PortMapEntry[];
+}
+
+const PROJECT_SLUG_RE = /^[a-z0-9-]{2,64}$/;
+function isBindableProject(p: unknown): p is string {
+  return typeof p === 'string' && p !== 'default' && PROJECT_SLUG_RE.test(p);
+}
+
+// buildUpstreamUrl: the upstream URL for one inbound request. Preserves the
+// inbound query; when the listener is pinned to a project and the client sent
+// no `project` param at all, appends ?project=<slug>. A client-supplied
+// ?project= is never touched.
+export function buildUpstreamUrl(upstream: string, inSearch: string, pinnedProject?: string): string {
+  const search = inSearch || '';
+  if (!pinnedProject || !isBindableProject(pinnedProject)) return upstream + search;
+  const params = new URLSearchParams(search);
+  if (params.has('project')) return upstream + search;
+  const base = search === '' || search === '?' ? '?' : `${search}&`;
+  return `${upstream}${base}project=${pinnedProject}`;
 }
 
 // readPortMap: parses <stateDir>/port-map.json, never throws. Absent file,
@@ -105,6 +126,11 @@ export function readPortMap(stateDir: string = DEFAULT_MTLS_STATE_DIR): PortMapE
             `[mtls-proxy] port-map entry for path ${JSON.stringify((entry as { path?: unknown }).path ?? '<unknown>')} has an invalid port (${JSON.stringify(port)}) — skipped`,
           );
           return false;
+        }
+        // Project binding: same shape the server accepts (parseProjectBinding);
+        // anything else (incl. `default`) is dropped, the entry itself stays.
+        if (!isBindableProject((entry as { project?: unknown }).project)) {
+          delete (entry as { project?: unknown }).project;
         }
         return true;
       });
@@ -295,15 +321,24 @@ function loadProxyCertMaterial(
 // Throws synchronously on bind failure (e.g. EADDRINUSE) — callers that bind
 // more than one port (startAllMtlsProxies / reloadNewProxyListeners) MUST
 // catch per-port so one bad port never aborts every other listener.
+const pinnedProjectByServer = new WeakMap<object, string | undefined>();
+
+// listenerProject: the project a bound listener appends to project-less
+// requests (undefined = unbound). Lets a reload tell whether it changed.
+export function listenerProject(server: Bun.Server<undefined>): string | undefined {
+  return pinnedProjectByServer.get(server);
+}
+
 export function bindProxyListener(
   port: number,
   mat: ProxyCertMaterial,
   upstream: string,
   pinnedDeviceId?: string,
+  pinnedProject?: string,
 ): Bun.Server<undefined> {
   const { cert, key, ca, localCert, localKey, upstreamHost } = mat;
 
-  return Bun.serve({
+  const server = Bun.serve({
     hostname: '127.0.0.1',
     port,
     tls: { cert: localCert, key: localKey },
@@ -313,7 +348,7 @@ export function bindProxyListener(
 
       // Fixed upstream path — proxy is purpose-built for one endpoint.
       // Preserve query params from the incoming request.
-      const targetUrl = upstream + (inUrl.search || '');
+      const targetUrl = buildUpstreamUrl(upstream, inUrl.search, pinnedProject);
 
       const upHeaders = buildUpstreamRequestHeaders(req.headers, {
         upstreamHost,
@@ -356,6 +391,8 @@ export function bindProxyListener(
       }
     },
   });
+  pinnedProjectByServer.set(server, isBindableProject(pinnedProject) ? pinnedProject : undefined);
+  return server;
 }
 
 // ── startMtlsProxy ────────────────────────────────────────────────────────────
@@ -432,7 +469,7 @@ export function bindDefaultAndMappedListeners(
       continue;
     }
     try {
-      servers.push(bindProxyListener(entry.port, mat, cfg.upstream, entry.device_id));
+      servers.push(bindProxyListener(entry.port, mat, cfg.upstream, entry.device_id, entry.project));
       boundPorts.add(entry.port);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -473,7 +510,7 @@ export function bindNewMappedListeners(
   for (const entry of readPortMap(stateDir)) {
     if (bound.has(entry.port)) continue;
     try {
-      added.push(bindProxyListener(entry.port, mat, cfg.upstream, entry.device_id));
+      added.push(bindProxyListener(entry.port, mat, cfg.upstream, entry.device_id, entry.project));
       bound.add(entry.port);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -484,11 +521,50 @@ export function bindNewMappedListeners(
   return added;
 }
 
+// ── syncMappedListeners ───────────────────────────────────────────────────────
+// Backs POST /internal/proxy/reload. Like bindNewMappedListeners (binds entries
+// whose port is not bound yet) and ALSO re-pins a bound listener whose
+// port-map entry now names a different project (or none): the old listener is
+// stopped and a new one bound on the same port. Listeners whose entry did not
+// change are never touched. The caller drops `removed` and keeps `added`.
+export function syncMappedListeners(
+  cfg: MtlsProxyCfg,
+  current: Bun.Server<undefined>[],
+  stateDir: string = DEFAULT_MTLS_STATE_DIR,
+): { added: Bun.Server<undefined>[]; removed: Bun.Server<undefined>[] } {
+  const mat = loadProxyCertMaterial(cfg, stateDir);
+  if (!mat) return { added: [], removed: [] };
+
+  const added: Bun.Server<undefined>[] = [];
+  const removed: Bun.Server<undefined>[] = [];
+  const byPort = new Map(current.map((s) => [s.port as number, s]));
+
+  for (const entry of readPortMap(stateDir)) {
+    const live = byPort.get(entry.port);
+    if (live && listenerProject(live) === entry.project) continue;
+    if (live && entry.port === cfg.port) continue; // the shared port is never re-pinned
+    if (live) {
+      live.stop(true);
+      removed.push(live);
+    }
+    try {
+      added.push(bindProxyListener(entry.port, mat, cfg.upstream, entry.device_id, entry.project));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[mtls-proxy] reload: pinned port ${entry.port} (device ${entry.device_id}) bind failed — skipped: ${msg}`);
+    }
+  }
+
+  return { added, removed };
+}
+
 // ── reloadNewProxyListeners ───────────────────────────────────────────────────
 // Thin env-coupled entry point used by server.ts's POST /internal/proxy/reload
 // handler — see bindNewMappedListeners above for the actual logic.
-export function reloadNewProxyListeners(alreadyBoundPorts: number[]): Bun.Server<undefined>[] {
+export function reloadNewProxyListeners(
+  current: Bun.Server<undefined>[],
+): { added: Bun.Server<undefined>[]; removed: Bun.Server<undefined>[] } {
   const cfg = mtlsProxyConfig();
-  if (!cfg) return [];
-  return bindNewMappedListeners(cfg, alreadyBoundPorts);
+  if (!cfg) return { added: [], removed: [] };
+  return syncMappedListeners(cfg, current);
 }

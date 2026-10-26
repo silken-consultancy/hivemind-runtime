@@ -486,12 +486,49 @@ function Get-DirectMcpUrl {
   return $null
 }
 
-function Write-ConnectHints {
+# ---- Project front -------------------------------------------------
+# A session always declares its project, and the project's front (code|studio) is
+# fixed at creation. This install runs no harness, so nothing is launched; the
+# front is read through the local proxy (MCP fos_registry list - the proxy
+# forwards every local path to the one MCP upstream) only to print the MODE and
+# the project-bound URL. Returns @{ Front = 'code'|'studio'|$null; Error = '..' };
+# a missing, unknown or unreadable front is an error, never defaulted to code.
+function Get-ProjectFront([string]$slug) {
+  $fail = { param($m) return @{ Front = $null; Error = $m } }
+  $key = Get-Conf 'FOS_API_KEY' ''
+  if (-not $key) { return (& $fail 'FOS_API_KEY is missing - enrollment incomplete?') }
+  $bodyFile = Join-Path ([IO.Path]::GetTempPath()) ("hivemind-reg-" + [Guid]::NewGuid().ToString('N') + '.json')
+  try {
+    [IO.File]::WriteAllText($bodyFile, '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fos_registry","arguments":{"action":"list"}}}', $Utf8NoBom)
+    $raw = Invoke-Native { & curl.exe -s -k --ssl-no-revoke --max-time 8 -H "x-fos-key: $key" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' --data-binary "@$bodyFile" "https://127.0.0.1:$ProxyPort/v1/mcp" 2>$null }
+  } finally { Remove-Item -LiteralPath $bodyFile -Force -ErrorAction SilentlyContinue }
+  $dataLine = @($raw | Where-Object { $_ -like 'data:*' }) | Select-Object -First 1
+  if (-not $dataLine) { return (& $fail 'the registry could not be read (proxy or network down?)') }
+  try {
+    $env1 = ($dataLine -replace '^data:\s*', '') | ConvertFrom-Json
+    $inner = $env1.result.content[0].text | ConvertFrom-Json
+    $row = @($inner.items | Where-Object { $_.slug -eq $slug -and $_.status -ne 'archived' -and $_.status -ne 'retired' -and $_.owned -ne $false }) | Select-Object -First 1
+  } catch { return (& $fail 'the registry answer could not be parsed') }
+  if (-not $row) { return (& $fail "project '$slug' not found (missing or archived)") }
+  $front = "$($row.front)"
+  if ($front -ne 'code' -and $front -ne 'studio') {
+    return (& $fail "project '$slug' has no valid front (Code or Studio) - contact HiveMind support")
+  }
+  return @{ Front = $front; Error = $null }
+}
+
+function Write-ConnectHints([string]$slug = '', [string]$front = '') {
   $url = "https://127.0.0.1:$ProxyPort/v1/mcp"
+  if ($slug) { $url = "${url}?project=$slug" }
   $webHost = ($Endpoint -split ':')[0]
   Write-Output ''
   Write-Output 'HiveMind proxy is running (proxy-only install - Claude Code is not started).'
   Write-Output ''
+  if ($slug) {
+    $modeLabel = if ($front -eq 'studio') { 'Studio' } else { 'Code' }
+    Write-Output "  Project:  $slug"
+    Write-Output "  Mode:     $modeLabel"
+  }
   Write-Output "  MCP URL:  $url"
   Write-Output ''
   Write-Output '  Connect a client to it:'
@@ -1573,7 +1610,20 @@ function Invoke-Start([string]$slug) {
   Start-Proxy
   Write-Output "[hivemind] proxy running on port $ProxyPort"
   if ($slug) {
-    Write-Err "[hivemind] '$slug' ignored - this install has no Claude Code harness, so no session is opened here."
+    # No launch here (no harness on Windows): resolve the front, print the
+    # project-bound URL and the mode. Unknown/missing/unreadable -> refuse.
+    if ($slug -notmatch '^[A-Za-z0-9._-]+$' -or $slug -eq 'default') {
+      Write-Err "[hivemind] '$slug' is not a valid project slug."
+      exit 1
+    }
+    $pf = Get-ProjectFront $slug
+    if (-not $pf.Front) {
+      Write-Err "[hivemind] error: $($pf.Error). Nothing to connect."
+      exit 1
+    }
+    Write-Output "[hivemind] project '$slug' - mode $(if ($pf.Front -eq 'studio') { 'Studio' } else { 'Code' }); this install has no Claude Code harness, so no session is opened here."
+    Write-ConnectHints $slug $pf.Front
+    exit 0
   }
   Write-ConnectHints
   exit 0
@@ -1638,8 +1688,9 @@ function Invoke-Help {
   Write-Output 'Usage: hivemind [<slug>] | start | stop | status | update | uninstall | autostart on|off|status | --help | --version'
   Write-Output ''
   Write-Output '  hivemind [<slug>]     Proxy-only install: enroll on first run, else start the proxy and'
-  Write-Output '                        print how to connect your MCP client (Claude Code is never started;'
-  Write-Output '                        a slug is ignored).'
+  Write-Output '                        print how to connect your MCP client (Claude Code is never started).'
+  Write-Output '                        With a slug: prints that project''s mode (Code or Studio) and its'
+  Write-Output '                        project-bound MCP URL (?project=<slug>); refuses if the front is unknown.'
   Write-Output '  hivemind start        Same as above.'
   Write-Output '  hivemind stop         Stop the proxy (forced stop of the verified daemon process).'
   Write-Output '  hivemind status       Show daemon, proxy and certificate state.'

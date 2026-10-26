@@ -13,6 +13,7 @@
 #
 # Usage:
 #   hivemind [<slug>]     # start proxy + exec claude; slug = a REAL project (never `default`) or picker
+                          # (the project's front decides the mode: studio -> Studio mode, code -> Code; none -> refused)
 #                          # (proxy-only install: start the proxy + print connect hints, never claude)
 #   hivemind start        # start proxy only (no claude)
 #   hivemind stop         # stop the proxy
@@ -21,7 +22,7 @@
 #   hivemind health       # same checks as status, script-friendly exit code (0/1/2)
 #   hivemind update       # pull-agent: staged+verified+atomic update, auto-rollback
 #   hivemind resume <slug>  # explicit crash recovery: close a dead-holder session, then open
-#   hivemind install [<target>]  # guided setup of another local MCP client (Cursor,
+#   hivemind install [<target>] [--project <slug>|--no-project]  # guided setup of another local MCP client (Cursor,
 #                          # Antigravity, ...) — interactive only, NO default path ever
 #   hivemind uninstall [all|harness] [--yes] [--keep-certs]  # remove everything HiveMind
 #                          # installed, or only the Claude Code harness (lists it first; asks
@@ -202,8 +203,8 @@ _vecho() {
 
 # ── _brand_header: quiet-by-default output still shows this once ───────────
 # Minimal ASCII identity block: small, simple geometry (a single glyph
-# + two lines), NOT a logo/illustration — studio is out of scope here (glyph
-# is a placeholder for studio to revise later). Shows the resolved endpoint
+# + two lines), NOT a logo/illustration (glyph is a placeholder; the Studio
+# mode adds its own line, _mode_banner). Shows the resolved endpoint
 # (HIVEMIND_ENDPOINT, defaulting to the product's own domain) so an endpoint swap via .env is visible at every startup, not just in the .env file.
 _brand_header() {
   echo ""
@@ -990,7 +991,7 @@ cmd_help() {
   echo "  hivemind health       Same checks as status; exit 0=ok 1=degraded 2=down"
   echo "  hivemind update       Pull-agent: staged + verified + atomic update, auto-rollback"
   echo "  hivemind resume <slug>  Explicit crash recovery: close a dead-holder session for <slug>, then open"
-  echo "  hivemind install [<target>]  Guided setup of another local MCP client (Cursor, Antigravity, ...)"
+  echo "  hivemind install [<target>] [--project <slug>|--no-project]  Guided setup of another local MCP client (Cursor, Antigravity, ...)"
   echo "                         Interactive only — detects candidates, asks scope, confirms the exact"
   echo "                         path with you before writing anything. No default path, ever."
   echo "                         Under WSL2 (this runtime's supported environment), a Windows-native"
@@ -2479,6 +2480,7 @@ _open_session_spine() {
 # an existing project during a network blip.
 _list_slugs() {
   _SLUGS_RAW=""
+  _FRONTS_RAW=""
   [ -n "${FOS_API_KEY:-}" ] || return 1
   local _resp
   _resp="$(_mcp_call "fos_registry" '{"action":"list"}' 1)"
@@ -2500,11 +2502,27 @@ _list_slugs() {
         if (it.status === "archived" || it.status === "retired") continue;
         if (it.owned === false) continue;
         if (!it.slug) continue;
-        process.stdout.write(`${it.slug}\t${it.name || it.slug}\n`);
+        // Columns are tab-separated and lines newline-separated: a slug with
+        // any whitespace/control is not a launchable project, and a name has
+        // tab/CR/LF flattened, so a project name can never inject a column or
+        // a row (e.g. a name carrying "<TAB>studio" must not set a front).
+        if (/[\s\x00-\x1f]/.test(it.slug)) continue;
+        const name = String(it.name || it.slug).replace(/[\t\r\n]+/g, " ");
+        // Third column: the front of the project (code or studio), verbatim —
+        // anything else (null, absent, unknown) is judged by
+        // _resolve_project_front, never defaulted here.
+        const front = it.front === "code" || it.front === "studio" ? it.front : "";
+        process.stdout.write(`${it.slug}\t${name}\t${front}\n`);
       }
     } catch { process.exit(3); }
   ' "${_resp}" 2>/dev/null)" || return 1
-  _SLUGS_RAW="${_out}"
+  _FRONTS_RAW=""
+  if [ -n "${_out}" ]; then
+    # _SLUGS_RAW keeps its two-column shape (the picker and
+    # _nondefault_slugs_raw read "slug<TAB>name"); fronts live apart.
+    _SLUGS_RAW="$(printf '%s\n' "${_out}" | cut -f1,2)"
+    _FRONTS_RAW="$(printf '%s\n' "${_out}" | cut -f1,3)"  # slug + front only, never the name
+  fi
   return 0
 }
 
@@ -2621,52 +2639,16 @@ _pick_project() {
 # engram's ONE create rule (RegistryService, fos_registry(action:create) /
 # POST /v1/registry) — the web create form is its client, never this script.
 
-# _seed_engram_mcp_config: re-assert mcpServers.engram in
-# $HIVEMIND_HOME/.claude/.claude.json at OPEN time (measured: the config is user-scope, not project .mcp.json).
-#
-# WHY: cmd_open execs `claude --setting-sources user`, so Claude Code
-# discovers MCP servers ONLY from this user-scope file. The enrollment-time
-# seed (routes/setup.ts ~387-440) writes it ONCE, but Claude Code itself can
-# clobber the file on exit — leaving a future `/mcp` with no engram entry
-# until someone hand-reseeds it. Re-running the same merge-safe write on
-# every open closes that gap without ever needing a second source of truth.
-#
-# MERGE-SAFE, mirrors setup.ts's write EXACTLY (do not reinvent): preserve
-# every OTHER top-level key and every OTHER mcpServers.* entry; overwrite
-# ONLY mcpServers.engram; self-heal a missing/corrupted/non-object top-level
-# document AND a missing/null/array `mcpServers` to {} rather than throwing.
-# NO headers, NO FOS_API_KEY or other secret material in the written entry —
-# the mTLS proxy injects x-fos-key server-side (atomic flip
-# 2026-07-30; setup.ts:414-423) — so this file, readable by anything with fs
-# access to $HIVEMIND_HOME, carries zero secrets regardless of who wrote or
-# reads it. Atomic write (temp file + rename) + chmod 0600, same posture as
-# setup.ts's own write of this file.
-#
-# No new dependency: bun is already a hard requirement of this script
-# (checked in _start_proxy) and is what setup.ts itself runs under, so this
-# reuses the same JS runtime rather than introducing a `node`/`jq` dependency.
-#
-# BEST-EFFORT (same fail-soft posture as _open_session_spine above, "engram
-# outage must not block opening Claude"): any failure here (disk full,
-# permissions, a transient bun hiccup) is logged via _vecho and swallowed —
-# it only degrades the NEXT session's /mcp discovery, never blocks THIS
-# session from opening Claude. Idempotent: running it twice back-to-back
-# produces byte-identical output on the second run.
-# _write_generic_mcp_config: the same merge-safe mcpServers.engram write,
-# EXTRACTED so it can target an ARBITRARY path — not just Claude Code's own
-# $HIVEMIND_HOME/.claude/.claude.json. Shared by _seed_engram_mcp_config
-# below (Claude Code's user-scope file) and `hivemind install`'s carrier
-# for any OTHER local client's
-# own mcp.json-shaped config. $1 = absolute path to write/merge, $2 = port.
+# _write_generic_mcp_config: merge-safe write of mcpServers.engram into an
+# ARBITRARY mcp.json-shaped config — `hivemind install`'s carrier for any
+# local client. $1 = absolute path to write/merge, $2 = port, $3 = optional
+# project slug (written as ?project=<slug>).
 #
 # PORT IS NOW AN EXPLICIT REQUIRED ARG — this used
 # to hardcode the implicit shared "${PROXY_PORT}" as its 2nd positional bun
-# arg; every caller now decides which port an entry points at.
-# _seed_engram_mcp_config (Claude Code's own self-seed) still passes
-# "${PROXY_PORT}" explicitly — that entry stays on the shared/default port,
-# unchanged behavior. `hivemind install`'s guided flow (_install_run) now
-# passes a DEDICATED port allocated by _resolve_target_port_and_device_id
-# below, instead.
+# arg; every caller decides which port an entry points at. `hivemind
+# install`'s guided flow (_install_run) passes a DEDICATED port allocated by
+# _resolve_target_port_and_device_id below.
 #
 # Same contract as before this extraction (behavior-preserving refactor):
 # preserve every other top-level key + mcpServers.* entry; self-heal a
@@ -2680,12 +2662,16 @@ _pick_project() {
 _write_generic_mcp_config() {
   local _target_path="$1"
   local _port="$2"
+  local _project="${3:-}"
   bun -e '
     import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, mkdirSync } from "node:fs";
     import { dirname } from "node:path";
 
     const configPath = process.argv[1];
     const proxyPort = process.argv[2];
+    // optional project -> the written url carries ?project=<slug>
+    // (the proxy also appends the port-map entry project when absent).
+    const project = process.argv[3] || "";
 
     let existing = {};
     if (existsSync(configPath)) {
@@ -2708,7 +2694,7 @@ _write_generic_mcp_config() {
       ...existing,
       mcpServers: {
         ...existingServers,
-        engram: { type: "http", url: `https://127.0.0.1:${proxyPort}/v1/mcp` },
+        engram: { type: "http", url: `https://127.0.0.1:${proxyPort}/v1/mcp${project ? `?project=${project}` : ""}` },
       },
     };
 
@@ -2717,24 +2703,13 @@ _write_generic_mcp_config() {
     writeFileSync(tmpPath, JSON.stringify(merged, null, 2), { mode: 0o600 });
     renameSync(tmpPath, configPath);
     chmodSync(configPath, 0o600);
-  ' "${_target_path}" "${_port}"
+  ' "${_target_path}" "${_port}" "${_project}"
   # code-review fix: stderr used to be swallowed HERE (`2>/dev/null` on the
   # bun invocation), which made every caller's failure branch blind — in
   # particular _install_run's interactive "✗ falha ao gravar <path>" (below)
   # showed NO reason at all (permission denied, disk full, ...), the exact
   # moment a human is standing there waiting to know why. Left un-swallowed
-  # now; each caller decides what to do with stderr — _seed_engram_mcp_config
-  # (best-effort, non-blocking re-seed) captures it into its own -v-gated
-  # line, _install_run (interactive, blocking) surfaces it directly.
-}
-
-_seed_engram_mcp_config() {
-  local _claude_config="${HIVEMIND_HOME}/.claude/.claude.json"
-  local _seed_err
-  if ! _seed_err="$(_write_generic_mcp_config "${_claude_config}" "${PROXY_PORT}" 2>&1)"; then
-    _vecho "[hivemind] aviso: falha ao re-selar mcpServers.engram em .claude.json (não bloqueante)${_seed_err:+: ${_seed_err}}"
-  fi
-  return 0
+  # now; _install_run (interactive, blocking) surfaces it directly.
 }
 
 # ── per-target proxy — port-map.json helpers ───────
@@ -2787,12 +2762,29 @@ _port_map_lookup() {
   ' "${PORT_MAP_FILE}" "${_path}" 2>/dev/null
 }
 
+# _port_map_lookup_project: prints the project recorded for the entry whose
+# `path` matches $1 (nothing when absent, unbound or the map is unreadable).
+_port_map_lookup_project() {
+  local _path="$1"
+  bun -e '
+    import { existsSync, readFileSync } from "node:fs";
+    if (!existsSync(process.argv[1])) process.exit(0);
+    try {
+      const parsed = JSON.parse(readFileSync(process.argv[1], "utf8"));
+      const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+      const hit = entries.find((e) => e && e.path === process.argv[2]);
+      if (hit && typeof hit.project === "string") console.log(hit.project);
+    } catch { /* unreadable -> unbound */ }
+  ' "${PORT_MAP_FILE}" "${_path}" 2>/dev/null
+}
+
 # _port_map_write_entry: merge-safe upsert of ONE entry, keyed on `path` (any
 # prior entry for the same path is replaced, preserving its created_at).
 # Atomic tmp+rename + chmod 0600 — same posture as _write_generic_mcp_config.
-# $1=path $2=target_id $3=scope $4=port $5=device_id.
+# $1=path $2=target_id $3=scope $4=port $5=device_id [$6=project —
+# the slug the proxy appends as ?project= when a client connects without one].
 _port_map_write_entry() {
-  local _path="$1" _target_id="$2" _scope="$3" _port="$4" _device_id="$5"
+  local _path="$1" _target_id="$2" _scope="$3" _port="$4" _device_id="$5" _project="${6:-}"
   bun -e '
     import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, mkdirSync } from "node:fs";
     import { dirname } from "node:path";
@@ -2803,6 +2795,7 @@ _port_map_write_entry() {
     const scope    = process.argv[4];
     const port     = Number(process.argv[5]);
     const deviceId = process.argv[6];
+    const project  = process.argv[7] || "";
 
     let doc = { version: 1, entries: [] };
     if (existsSync(mapPath)) {
@@ -2828,6 +2821,7 @@ _port_map_write_entry() {
       scope: scope || undefined,
       port,
       device_id: deviceId,
+      project: project || undefined,
       created_at: (prior && prior.created_at) || now,
       updated_at: now,
     };
@@ -2839,7 +2833,7 @@ _port_map_write_entry() {
     writeFileSync(tmpPath, JSON.stringify(merged, null, 2), { mode: 0o600 });
     renameSync(tmpPath, mapPath);
     chmodSync(mapPath, 0o600);
-  ' "${PORT_MAP_FILE}" "${_path}" "${_target_id}" "${_scope}" "${_port}" "${_device_id}"
+  ' "${PORT_MAP_FILE}" "${_path}" "${_target_id}" "${_scope}" "${_port}" "${_device_id}" "${_project}"
 }
 
 # _allocate_target_port: lowest free port in
@@ -2886,7 +2880,7 @@ _allocate_target_port() {
 # twice back-to-back for different paths in the same process (idempotent
 # re-install, two-distinct-targets tests below).
 _resolve_target_port_and_device_id() {
-  local _path="$1" _target_id="$2" _scope="$3"
+  local _path="$1" _target_id="$2" _scope="$3" _project="${4:-}"
   mkdir -p "$(dirname "${PORT_MAP_FILE}")" 2>/dev/null || true
   local _lock_file="${PORT_MAP_FILE}.lock"
   local _rc=0
@@ -2895,6 +2889,10 @@ _resolve_target_port_and_device_id() {
     local _existing
     _existing="$(_port_map_lookup "${_path}")"
     if [ -n "${_existing}" ]; then
+      # Idempotent re-install: same port+device_id; the project is refreshed
+      # so re-running `install --project X` rebinds the entry.
+      _port_map_write_entry "${_path}" "${_target_id}" "${_scope}" \
+        "$(printf '%s' "${_existing}" | cut -f1)" "$(printf '%s' "${_existing}" | cut -f2)" "${_project}"
       printf '%s\n' "${_existing}"
       exit 0
     fi
@@ -2903,7 +2901,7 @@ _resolve_target_port_and_device_id() {
     _port="$(_allocate_target_port)" || exit 1
     local _device_id
     _device_id="$(_mint_uuid)"
-    _port_map_write_entry "${_path}" "${_target_id}" "${_scope}" "${_port}" "${_device_id}"
+    _port_map_write_entry "${_path}" "${_target_id}" "${_scope}" "${_port}" "${_device_id}" "${_project}"
     printf '%s\t%s\n' "${_port}" "${_device_id}"
   ) 200>"${_lock_file}" || _rc=$?
   return "${_rc}"
@@ -3118,6 +3116,105 @@ _open_proxy_only() {
   _print_connect_hints
 }
 
+# ── Project front + per-launch MCP connection ───────────────────────────────
+# A session ALWAYS declares its project, and the project's front (code|studio)
+# is fixed at project creation. The launcher reads the front BEFORE it opens
+# anything, launches Studio projects in Studio mode and Code projects in Code
+# mode, and gives every launch its OWN MCP connection bound to the project
+# (`?project=<slug>`). There is no default front: a front that is missing,
+# unknown or unreadable REFUSES the launch (fail closed, never code).
+RUN_DIR="${HIVEMIND_HOME}/run"
+
+# _resolve_project_front <slug>: sets _PROJECT_FRONT to code|studio, or
+# exits 1 with a message. The registry read goes through the local proxy as
+# an MCP call (fos_registry list): the proxy forwards every local path to the
+# one fixed MCP upstream, so a REST GET /v1/registry cannot be routed here.
+_resolve_project_front() {
+  local _slug="$1" _s _f
+  _PROJECT_FRONT=""
+  _list_slugs || _registry_unreachable_abort
+  while IFS=$'\t' read -r _s _f; do
+    if [ "${_s}" = "${_slug}" ]; then _PROJECT_FRONT="${_f:-}"; break; fi
+  done <<< "${_FRONTS_RAW}"
+  case "${_PROJECT_FRONT}" in
+    code|studio) return 0 ;;
+  esac
+  echo "Erro: o projeto '${_slug}' não tem uma frente (Code ou Studio) válida — a sessão não foi aberta." >&2
+  echo "      Entre em contato com o suporte do HiveMind para corrigir o projeto." >&2
+  echo "      Se isso continuar depois de atualizar o HiveMind, o servidor talvez ainda não tenha suporte a esta frente de projeto." >&2
+  _PROJECT_FRONT=""
+  exit 1
+}
+
+# _mode_banner <front> <slug>: Studio gets its own identity line under the
+# brand header. Code stays as it always was (quiet).
+_mode_banner() {
+  if [ "$1" = "studio" ]; then
+    echo "  $(_ok "◆") HiveMind Studio — projeto $2"
+  fi
+}
+
+# _sweep_stale_runs: remove run dirs whose owning launch is gone (SIGKILL,
+# crash, power loss — the exit watcher below could not run). Best effort.
+_sweep_stale_runs() {
+  local _d _pid _now _mt
+  [ -d "${RUN_DIR}" ] || return 0
+  _now="$(date +%s)"
+  for _d in "${RUN_DIR}"/*/; do
+    [ -d "${_d}" ] || continue
+    _pid="$(cat "${_d}pid" 2>/dev/null || true)"
+    case "${_pid}" in
+      ''|*[!0-9]*)
+        # No (or unreadable) pid: a launch may be between mktemp and its pid
+        # write. Live unless the dir is older than 60s.
+        _mt="$(stat -c %Y "${_d%/}" 2>/dev/null || stat -f %m "${_d%/}" 2>/dev/null || echo "${_now}")"
+        [ $(( _now - _mt )) -gt 60 ] || continue
+        ;;
+      *) kill -0 "${_pid}" 2>/dev/null && continue ;;
+    esac
+    rm -rf "${_d}" 2>/dev/null || true
+  done
+  return 0
+}
+
+# _prepare_launch_mcp_config <slug>: writes a PER-LAUNCH config
+# $HIVEMIND_HOME/run/<unique>/mcp.json (dir 0700, file 0600, no secret — the
+# proxy injects the credential) whose engram URL carries ?project=<slug>, and
+# sets _LAUNCH_RUN_DIR / _LAUNCH_MCP_CONFIG. Nothing shared is rewritten, so
+# two launches never race. Returns 1 on any failure (the caller refuses).
+_prepare_launch_mcp_config() {
+  local _slug="$1"
+  _LAUNCH_RUN_DIR=""; _LAUNCH_MCP_CONFIG=""
+  case "${_slug}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "${PROXY_PORT}" in ''|*[!0-9]*) return 1 ;; esac
+  _sweep_stale_runs
+  ( umask 077; mkdir -p "${RUN_DIR}" ) || return 1
+  chmod 700 "${RUN_DIR}" 2>/dev/null || true
+  local _dir
+  _dir="$(umask 077; mktemp -d "${RUN_DIR}/XXXXXXXXXX")" || return 1
+  printf '%s\n' "$$" > "${_dir}/pid" || { rm -rf "${_dir}"; return 1; }
+  ( umask 077; printf '{\n  "mcpServers": {\n    "engram": { "type": "http", "url": "https://127.0.0.1:%s/v1/mcp?project=%s" }\n  }\n}\n' \
+      "${PROXY_PORT}" "${_slug}" > "${_dir}/mcp.json" ) || { rm -rf "${_dir}"; return 1; }
+  chmod 600 "${_dir}/mcp.json" || { rm -rf "${_dir}"; return 1; }
+  _LAUNCH_RUN_DIR="${_dir}"
+  _LAUNCH_MCP_CONFIG="${_dir}/mcp.json"
+}
+
+# _watch_launch_cleanup <run-dir>: the launch ends in `exec claude`, so this
+# shell cannot trap its own exit. A detached watcher on THIS pid (which
+# becomes claude's, exec keeps it) removes the run dir once it is gone — also
+# when the exec itself fails. SIGHUP/SIGINT are ignored so closing the
+# terminal still lets it finish; a SIGKILLed watcher is caught by the sweep.
+_watch_launch_cleanup() {
+  local _dir="$1" _pid="$$"
+  (
+    trap '' HUP INT
+    while kill -0 "${_pid}" 2>/dev/null; do sleep 1; done
+    rm -rf "${_dir}"
+  ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
 cmd_open() {
   # Proxy-only install — everything below this branch is the
   # proxy+harness path, unchanged.
@@ -3146,6 +3243,28 @@ cmd_open() {
     echo "Erro: nenhum projeto resolvido — encerrando." >&2
     exit 1
   fi
+
+  # The project's front decides the mode. Read BEFORE any session is opened;
+  # missing/unknown/unreadable refuses (exit 1) — there is no default.
+  _resolve_project_front "${_project_slug}"
+  local _front="${_PROJECT_FRONT}"
+  _mode_banner "${_front}" "${_project_slug}"
+
+  # Per-launch MCP connection bound to the project. The shared user-scope
+  # .claude.json entry is NOT rewritten here any more (that single shared file
+  # raced between launches); --strict-mcp-config makes this file the only MCP
+  # source of the session. Failing to write it refuses the launch: an unbound
+  # connection is never an acceptable fallback.
+  if ! _prepare_launch_mcp_config "${_project_slug}"; then
+    echo "Erro: não foi possível preparar a conexão MCP do projeto '${_project_slug}' em ${RUN_DIR} — a sessão não foi aberta." >&2
+    exit 1
+  fi
+
+  # A refusal/abort between here and the exec removes the run dir at once (the
+  # EXIT trap never fires on a successful exec, which hands cleanup to the
+  # watcher started right before it).
+  # shellcheck disable=SC2064
+  trap "rm -rf '${_LAUNCH_RUN_DIR}'" EXIT
 
   # ── NO pre-open slug-lock here anymore ───────────────
   # The former double-access lock refused to open a slug
@@ -3199,11 +3318,7 @@ cmd_open() {
     env CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" claude auth login || true
   fi
 
-  # Re-assert mcpServers.engram in the user-scope .claude.json RIGHT BEFORE
-  # exec (papercut d) — closes the window where a prior Claude Code exit
-  # clobbered the enrollment-time seed, without depending on anything else
-  # in cmd_open having run first. Best-effort, never blocks the exec below.
-  _seed_engram_mcp_config
+  _watch_launch_cleanup "${_LAUNCH_RUN_DIR}"
 
   # --setting-sources user (isolation): the isolated CONFIG_DIR
   # already redirects commands/skills/MCP/global-CLAUDE.md (CLAUDE_CONFIG_DIR
@@ -3212,13 +3327,16 @@ cmd_open() {
   # is the scalpel that suppresses project-scoped settings/CLAUDE.md/.mcp.json
   # while keeping the product's user-scoped config intact — intentional, not
   # a side effect (re-measure if the embedded CLI version changes).
+  # --mcp-config <file> --strict-mcp-config (measured on 2.1.303 together with
+  # --setting-sources user): only the flag's servers load.
   exec env \
     CLAUDE_CONFIG_DIR="${HIVEMIND_HOME}/.claude" \
     ENGRAM_SLUG="${_project_slug}" \
     ENGRAM_SESSION_ID="${ENGRAM_SESSION_ID}" \
     ENGRAM_DEVICE_ID="${ENGRAM_DEVICE_ID}" \
     HIVEMIND_HOME="${HIVEMIND_HOME}" \
-    claude --setting-sources user "$@"
+    HIVEMIND_MODE="${_front}" \
+    claude --setting-sources user --mcp-config "${_LAUNCH_MCP_CONFIG}" --strict-mcp-config "$@"
 }
 
 # cmd_resume: explicit crash recovery. NEVER auto-triggered; the user names
@@ -3266,7 +3384,7 @@ cmd_resume() {
 
 # ── install (guided MCP-client installer, platform-agnostic core) ──────
 # `hivemind install [<target>]` walks a human through wiring the SAME generic
-# entry `_seed_engram_mcp_config` already writes for Claude Code itself
+# entry Claude Code itself uses
 # (`mcpServers.engram = {type:"http", url:"https://127.0.0.1:<port>/v1/mcp"}`,
 # HTTPS-loopback-by-default, no stdio, no header/${VAR}
 # dependency for any client — the mTLS proxy injects the credential
@@ -3578,7 +3696,50 @@ _install_abs_path() {
 # fighting a `[ -t 0 ]` check that a pipe can never satisfy. $1 = optional
 # target id arg.
 _install_run() {
-  local _target_arg="${1:-}"
+  local _target_arg="" _project_arg="" _no_project=0
+  local _usage="Uso: hivemind install [<target>] [--project <slug> | --no-project]"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --project)
+        if [ "$#" -lt 2 ] || [ -z "${2}" ] || [[ "${2}" == -* ]]; then
+          echo "Erro: --project precisa de um slug de projeto (recebido: '${2:-}')." >&2
+          echo "      ${_usage}" >&2
+          return 2
+        fi
+        _project_arg="$2"; shift 2 ;;
+      --project=*)
+        _project_arg="${1#--project=}"
+        if [ -z "${_project_arg}" ] || [[ "${_project_arg}" == -* ]]; then
+          echo "Erro: --project precisa de um slug de projeto." >&2
+          echo "      ${_usage}" >&2
+          return 2
+        fi
+        shift ;;
+      --no-project) _no_project=1; shift ;;
+      *)            [ -z "${_target_arg}" ] && _target_arg="$1"; shift ;;
+    esac
+  done
+  if [ -n "${_project_arg}" ] && [ "${_no_project}" -eq 1 ]; then
+    echo "Erro: --project e --no-project não podem ser usados juntos." >&2
+    echo "      ${_usage}" >&2
+    return 2
+  fi
+  # the project this client is bound to. Same shape the server accepts
+  # (^[a-z0-9-]{2,64}$, never `default`) and it must be a real, owned project.
+  if [ -n "${_project_arg}" ]; then
+    if [ "${_project_arg}" = "default" ] || ! [[ "${_project_arg}" =~ ^[a-z0-9-]{2,64}$ ]]; then
+      echo "Erro: projeto inválido '${_project_arg}' (use o slug de um projeto real; 'default' não é um lugar de sessão)." >&2
+      return 2
+    fi
+    if ! _list_slugs; then
+      echo "Erro: não foi possível consultar o registry para validar o projeto '${_project_arg}' — nada escrito." >&2
+      return 1
+    fi
+    if ! _slug_in_candidates "${_project_arg}"; then
+      _no_project_message "Erro: projeto '${_project_arg}' não encontrado (inexistente ou arquivado) — nada escrito."
+      return 1
+    fi
+  fi
 
   local -a _INSTALL_IDS=() _INSTALL_LABELS=()
   _install_target_catalog
@@ -3760,6 +3921,13 @@ _install_run() {
   # write, no minted device_id); the REAL allocate-or-reuse + persist
   # (_resolve_target_port_and_device_id, lock-protected) only runs AFTER
   # the human confirms, so a decline truly writes nothing.
+  # Effective project: an explicit --project wins, --no-project clears on
+  # purpose, and a plain re-install KEEPS what the entry already carries.
+  local _project_eff="${_project_arg}" _project_kept=0
+  if [ -z "${_project_eff}" ] && [ "${_no_project}" -eq 0 ]; then
+    _project_eff="$(_port_map_lookup_project "${_final_path}")"
+    [ -n "${_project_eff}" ] && _project_kept=1
+  fi
   local _scope_for_map="${_INSTALL_SCOPE:-}"
   case "${_chosen_id}" in
     antigravity) _scope_for_map="global" ;; # structurally single-scope
@@ -3775,7 +3943,12 @@ _install_run() {
   echo "  Alvo:    ${_chosen_label:-${_chosen_id}}" >&2
   echo "  Arquivo: ${_final_path}" >&2
   echo "  Porta dedicada: ${_preview_port}" >&2
-  echo "  Entrada: mcpServers.engram = {type:\"http\", url:\"https://127.0.0.1:${_preview_port}/v1/mcp\"}" >&2
+  echo "  Entrada: mcpServers.engram = {type:\"http\", url:\"https://127.0.0.1:${_preview_port}/v1/mcp${_project_eff:+?project=${_project_eff}}\"}" >&2
+  if [ -n "${_project_eff}" ]; then
+    echo "  Projeto: ${_project_eff}$([ "${_project_kept}" -eq 1 ] && echo ' (mantido da instalação anterior)')" >&2
+  else
+    echo "  Projeto: (sem projeto) $(_dim "— este cliente conecta sem projeto e fica sem os agentes operacionais. Use: hivemind install ${_chosen_id} --project <slug>")" >&2
+  fi
   if [ "${_chosen_id}" = "antigravity" ] || [ "${_chosen_id}" = "cursor" ]; then
     echo "  $(_dim "Se este cliente roda nativo no Windows (fora do WSL): a URL 127.0.0.1 acima funciona sem ajuste — o WSL2 já encaminha, por padrão, uma porta de loopback do lado Linux para o localhost do Windows (localhost-forwarding). Nenhuma ponte/relay manual é necessária; confirmado em teste real (Cursor + Cowork).")" >&2
   fi
@@ -3800,7 +3973,7 @@ _install_run() {
   # rather than silently writing a config that doesn't match what the human
   # just confirmed.
   local _port_resolved
-  if ! _port_resolved="$(_resolve_target_port_and_device_id "${_final_path}" "${_chosen_id}" "${_scope_for_map}")"; then
+  if ! _port_resolved="$(_resolve_target_port_and_device_id "${_final_path}" "${_chosen_id}" "${_scope_for_map}" "${_project_eff}")"; then
     echo "  $(_err "✗") falha ao alocar uma porta dedicada para '${_chosen_id}' — nada escrito." >&2
     return 1
   fi
@@ -3812,7 +3985,7 @@ _install_run() {
   fi
 
   local _write_err
-  if _write_err="$(_write_generic_mcp_config "${_final_path}" "${_target_port}" 2>&1)"; then
+  if _write_err="$(_write_generic_mcp_config "${_final_path}" "${_target_port}" "${_project_eff}" 2>&1)"; then
     echo "  $(_ok "✓") gravado: ${_final_path} (device_id ${_target_device_id})" >&2
     # Best-effort: tell an already-running daemon about the freshly-mapped
     # port so it's live immediately, no daemon restart needed
@@ -4186,7 +4359,8 @@ _uninstall_unwire_target() {
       out("skip", "no mcpServers.engram entry");
     }
     const url = servers.engram && typeof servers.engram === "object" ? servers.engram.url : undefined;
-    if (url !== want) {
+    // install may have written ?project=<slug> after the url.
+    if (url !== want && !(typeof url === "string" && url.startsWith(`${want}?project=`))) {
       out("warn", `mcpServers.engram points at ${JSON.stringify(url ?? null)}, not ${want} — not removed (changed after install)`);
     }
     delete servers.engram;

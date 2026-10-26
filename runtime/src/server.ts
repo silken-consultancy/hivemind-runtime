@@ -92,10 +92,13 @@ app.post('/internal/proxy/reload', (c) => {
   if (isSetupOnly) {
     return c.json({ error: 'setup_only_mode', added: [], total: mtlsServers.length }, 409);
   }
-  const alreadyBoundPorts = mtlsServers.map((s) => s.port as number);
-  const added = reloadNewProxyListeners(alreadyBoundPorts);
+  const { added, removed } = reloadNewProxyListeners(mtlsServers);
+  for (const r of removed) {
+    const i = mtlsServers.indexOf(r);
+    if (i >= 0) mtlsServers.splice(i, 1);
+  }
   mtlsServers.push(...added);
-  return c.json({ added: added.map((s) => s.port), total: mtlsServers.length });
+  return c.json({ added: added.map((s) => s.port), rebound: removed.map((s) => s.port), total: mtlsServers.length });
 });
 
 app.onError((err, c) => {
