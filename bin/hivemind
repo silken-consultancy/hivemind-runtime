@@ -673,7 +673,9 @@ _setup_mode() {
 _proxy_ok() {
   [ -n "${MTLS_PROXY_PORT:-}" ] || return 0
   local _code
-  _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+  # x-hivemind-probe: our own health probe — the daemon does not count it as
+  # client activity (else every status/start would keep the proxy "live").
+  _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -H 'x-hivemind-probe: 1' \
     "https://127.0.0.1:${PROXY_PORT}/v1/mcp" 2>/dev/null) || return 1
   [ "${_code}" != "000" ]
 }
@@ -909,6 +911,152 @@ _require_proxy_listening() {
   exit 1
 }
 
+# ── Live-session guard for update ─────────────────────────────────────────────
+# `hivemind update` (and the silent on-launch auto-update) must never kill a
+# proxy that is serving sessions (incident 2026-10-26: an update restarted the
+# proxy and dropped a live Studio session). A runtime counts as "serving" when
+# EITHER the daemon's /sessions registry lists an adopted session (routes/
+# sessions.ts: the launcher adopts the claude pid) OR a client holds an
+# ESTABLISHED TCP connection to the local proxy port (an IDE / Studio MCP
+# client that never went through the launcher). Anything we cannot measure
+# while the runtime is up counts as live (fail-safe: defer, never kill).
+HM_RESTART_PENDING="${HOME}/.engram/cache/hivemind-restart-pending"
+
+# A request on ANY proxy listener within this many seconds counts as live (an IDE
+# idle between prompts holds no in-flight request, but it spoke a moment ago).
+HM_LIVE_WINDOW_S="${HM_LIVE_WINDOW_S:-600}"
+
+# _live_clients_report: prints a one-line reason and returns 0 when live.
+# Live = adopted sessions > 0 OR in-flight connections > 0 OR a request within
+# HM_LIVE_WINDOW_S — the last two aggregated by the daemon over EVERY listener
+# it serves (the default port AND each port-map target; lib/proxy-activity.ts,
+# exposed in GET /sessions). An older daemon without those fields falls back to
+# ss/lsof on the default port. Unreadable while the runtime is up -> live.
+_live_clients_report() {
+  curl -sf --max-time 2 "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1 || return 1
+  local _body _n _c _a _age
+  if _body="$(curl -sf --max-time 3 "http://127.0.0.1:${RUNTIME_PORT}/sessions" 2>/dev/null)"; then
+    _n="$(printf '%s' "${_body}" | sed -n 's/.*"count":\([0-9][0-9]*\).*/\1/p')"
+    if [ -z "${_n}" ]; then echo "unreadable /sessions reply"; return 0; fi
+    if [ "${_n}" -gt 0 ]; then echo "${_n} adopted session(s)"; return 0; fi
+    _a="$(printf '%s' "${_body}" | sed -n 's/.*"proxy_active_connections":\([0-9][0-9]*\).*/\1/p')"
+    if [ -n "${_a}" ]; then
+      if [ "${_a}" -gt 0 ]; then echo "${_a} active proxy connection(s) across all listeners"; return 0; fi
+      _age="$(printf '%s' "${_body}" | sed -n 's/.*"proxy_last_request_age_s":\([0-9][0-9]*\).*/\1/p')"
+      if [ -n "${_age}" ] && [ "${_age}" -lt "${HM_LIVE_WINDOW_S}" ]; then
+        echo "proxy request ${_age}s ago on one of the listeners (window ${HM_LIVE_WINDOW_S}s)"; return 0
+      fi
+      return 1   # the daemon measured every listener: idle
+    fi
+  else
+    echo "/sessions not answering"; return 0
+  fi
+  # Fallback (daemon predates the aggregated counters): default port only.
+  if command -v ss > /dev/null 2>&1; then
+    _c="$(ss -Htn state established "( sport = :${PROXY_PORT} )" 2>/dev/null | grep -c . || true)"
+    if [ "${_c:-0}" -gt 0 ]; then echo "${_c} client connection(s) on proxy port ${PROXY_PORT}"; return 0; fi
+  elif command -v lsof > /dev/null 2>&1; then
+    _c="$(lsof -nP -iTCP:"${PROXY_PORT}" -sTCP:ESTABLISHED -a -c bun 2>/dev/null | grep -c . || true)"
+    if [ "${_c:-0}" -gt 1 ]; then echo "client connection(s) on proxy port ${PROXY_PORT}"; return 0; fi
+  else
+    echo "cannot inspect connections (no ss/lsof)"; return 0
+  fi
+  return 1
+}
+
+# _rsync_claude_state <from .claude dir> <to .claude dir> [rsync flags...]:
+# the Tier-2 copy of the runtime-written .claude state (history, projects/,
+# sessions/, .credentials.json, .claude.json, ...) — EVERYTHING except the four
+# git-managed paths. One definition for the staging copy, the post-swap
+# catch-up and the rollback carry-forward. Modes/times preserved (-a); never
+# prints (a credential file name is fine, its content never goes anywhere).
+_rsync_claude_state() {
+  local _from="$1" _to="$2"
+  shift 2
+  [ -d "${_from}" ] || return 0
+  mkdir -p "${_to}" || return 1
+  rsync -a "$@" \
+    --exclude='/CLAUDE.md' \
+    --exclude='/settings.json' \
+    --exclude='/commands/' \
+    --exclude='/hooks/' \
+    "${_from}/" "${_to}/"
+}
+
+# _carry_state_forward <from home> <to home>: bring files written in <from>
+# since the staging copy over to <to> (newer wins, nothing deleted).
+_carry_state_forward() {
+  local _from="$1" _to="$2"
+  _rsync_claude_state "${_from}/.claude" "${_to}/.claude" --update > /dev/null 2>&1 || \
+    echo "Warning: could not carry newer session state from ${_from} to ${_to}." >&2
+  if [ -f "${_from}/.env" ] && { [ ! -f "${_to}/.env" ] || [ "${_from}/.env" -nt "${_to}/.env" ]; }; then
+    cp -p "${_from}/.env" "${_to}/.env" 2>/dev/null || true
+  fi
+}
+
+# _restart_pending_sha: the version the pending marker waits to start (line 1).
+_restart_pending_sha() { sed -n '1p' "${HM_RESTART_PENDING}" 2>/dev/null; }
+
+# _apply_pending_restart: a previous update swapped the files but left the
+# proxy running (live clients). The first start/launch that finds no live
+# client restarts it onto the new code — with the SAME health check and
+# rollback as cmd_update: a new build that does not come up is rolled back to
+# last-good and the old version restarted (never leaves the user proxy-less).
+# While the marker exists, last-good is the tree the running daemon was loaded
+# from — cmd_update refuses to replace it.
+_apply_pending_restart() {
+  [ -f "${HM_RESTART_PENDING}" ] || return 0
+  # Re-entrancy guard: _start_proxy calls back into this function.
+  [ "${_HM_APPLYING_PENDING:-0}" = "1" ] && return 0
+  if _live_clients_report > /dev/null; then return 0; fi
+  local _new _old _lastgood="${HIVEMIND_HOME}.last-good" _src_head=""
+  _new="$(sed -n '1p' "${HM_RESTART_PENDING}" 2>/dev/null || true)"
+  _old="$(sed -n '2p' "${HM_RESTART_PENDING}" 2>/dev/null || true)"
+  _vecho "[hivemind] applying the restart deferred by the last update (${_new:0:12})"
+  _HM_APPLYING_PENDING=1
+  # Sessions that ended since the swap wrote into the old tree (their open
+  # handles followed the rename): catch the new tree up before the restart.
+  _carry_state_forward "${_lastgood}" "${HIVEMIND_HOME}" || true
+  # Marker cleared first (belt and braces with the guard above).
+  rm -f "${HM_RESTART_PENDING}"
+  cmd_stop > /dev/null 2>&1 || true
+  ( _start_proxy ) || true
+  _check_health || true
+  if [ "${_HEALTH_SEVERITY}" -ge 2 ]; then
+    echo "Error: the deferred restart onto ${_new:0:12} FAILED the health check — rolling back to last-good." >&2
+    # Every step below is best-effort: a failing step must never abort the
+    # rollback before the previous daemon is started again.
+    cmd_stop > /dev/null 2>&1 || true
+    if [ -d "${_lastgood}" ]; then
+      _carry_state_forward "${HIVEMIND_HOME}" "${_lastgood}" || true
+      rm -rf "${HIVEMIND_HOME}" || echo "Warning: could not remove the failed tree ${HIVEMIND_HOME}." >&2
+      mv "${_lastgood}" "${HIVEMIND_HOME}" || echo "Error: could not restore ${_lastgood} to ${HIVEMIND_HOME}." >&2
+      if [ -n "${_old}" ] && [ -d "${HIVEMIND_SOURCE_DIR:-/nonexistent}/.git" ]; then
+        git -C "${HIVEMIND_SOURCE_DIR}" reset --hard "${_old}" > /dev/null 2>&1 || true
+      fi
+      _rollback_installed_binary || echo "Warning: could not restore the installed binary." >&2
+    else
+      echo "Error: no last-good tree to roll back to (${_lastgood})." >&2
+    fi
+    ( _start_proxy ) || true
+    _check_health || true
+    _HM_APPLYING_PENDING=0
+    if [ "${_HEALTH_SEVERITY}" -ge 2 ]; then
+      echo "Error: the rollback finished but the previous version did not come up healthy — run 'hivemind start' or 'hivemind doctor'." >&2
+    else
+      echo "Rolled back — the previous version is running." >&2
+    fi
+    return 0
+  fi
+  _HM_APPLYING_PENDING=0
+  if [ -n "${_new}" ] && [ -d "${HIVEMIND_SOURCE_DIR:-/nonexistent}/.git" ]; then
+    _src_head="$(git -C "${HIVEMIND_SOURCE_DIR}" rev-parse HEAD 2>/dev/null || true)"
+    if [ "${_src_head}" != "${_new}" ]; then
+      echo "Warning: the proxy restarted but the installed version (${_src_head:0:12}) is not the one the update announced (${_new:0:12})." >&2
+    fi
+  fi
+}
+
 # ── _start_proxy: ensure a HEALTHY runtime+proxy is running (idempotent) ──────
 # Reuse only a genuinely healthy runtime: healthz(7777) AND proxy(7779) both OK.
 # If 7777 answers but the proxy is broken (the orphaned/stuck runtime left by an
@@ -918,6 +1066,7 @@ _require_proxy_listening() {
 # than eating the 15s timeout, and the pidfile is never overwritten with a dead
 # PID.
 _start_proxy() {
+  _apply_pending_restart
   # Fast path: an already-healthy runtime+proxy is reused untouched.
   if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/healthz" > /dev/null 2>&1; then
     # Ensure the local HTTPS cert (if present) is trusted BEFORE
@@ -1046,6 +1195,10 @@ cmd_status() {
     echo "  Endpoint:   $(_ok "reachable") (${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443})"
   else
     echo "  Endpoint:   $(_dim "unreachable") (${HIVEMIND_ENDPOINT:-hivemind.ia.br:4443})"
+  fi
+
+  if [ -f "${HM_RESTART_PENDING}" ]; then
+    echo "  Restart pendente (versão $(_restart_pending_sha | cut -c1-12)) — o proxy em execução ainda roda a versão anterior; reinicia no próximo launch sem sessão ativa."
   fi
 }
 
@@ -1679,12 +1832,7 @@ _stage_build() {
   # /hooks/ added later (quota-capture hook is git-managed like
   # CLAUDE.md/settings.json/commands/, not runtime-written).
   if [ -d "${HIVEMIND_HOME}/.claude" ]; then
-    rsync -a \
-      --exclude='/CLAUDE.md' \
-      --exclude='/settings.json' \
-      --exclude='/commands/' \
-      --exclude='/hooks/' \
-      "${HIVEMIND_HOME}/.claude/" "${_target}/.claude/" || return 1
+    _rsync_claude_state "${HIVEMIND_HOME}/.claude" "${_target}/.claude" || return 1
   fi
   return 0
 }
@@ -1724,8 +1872,8 @@ _all_installed_bins() {
   local _d
   IFS=: read -ra _dirs <<< "${PATH}"
   for _d in "${_dirs[@]}"; do
-    [ -n "${_d}" ] && [ -x "${_d}/hivemind" ] && printf '%s\n' "${_d}/hivemind"
-  done | sort -u
+    if [ -n "${_d}" ] && [ -x "${_d}/hivemind" ]; then printf '%s\n' "${_d}/hivemind"; fi
+  done | sort -u || true
 }
 
 # _update_installed_binary / _rollback_installed_binary: the system-PATH
@@ -1781,6 +1929,15 @@ _rollback_installed_binary() {
 }
 
 cmd_update() {
+  # A restart is still pending from an earlier update: ${HIVEMIND_HOME}.last-good
+  # is the tree the running daemon was loaded from, so it must not be replaced.
+  # Try to apply the pending restart first (it only acts with no live client);
+  # if it is still pending the update waits.
+  _apply_pending_restart
+  if [ -f "${HM_RESTART_PENDING}" ]; then
+    echo "Restart pending (version $(_restart_pending_sha | cut -c1-12)); update deferred until the running proxy restarts onto it."
+    return 0
+  fi
   # A dev / legacy source is moved to the managed clone first (fail-open).
   # D1b: only an EXPLICIT `hivemind update` bypasses the 24h clone backoff —
   # the silent on-launch auto-update (_maybe_auto_update → cmd_update) obeys it.
@@ -1864,8 +2021,18 @@ cmd_update() {
     exit 1
   fi
 
+  # Live clients attached -> swap the files but leave the running proxy alone
+  # (it already loaded its code); the restart is deferred to the next launch
+  # with no live client (_apply_pending_restart). No clients -> restart as before.
+  local _defer=0 _live_why
+  if _live_why="$(_live_clients_report)"; then
+    _defer=1
+    echo "Live session(s) attached (${_live_why}) — swapping files, proxy restart deferred to the next launch with none."
+  fi
   echo "Staged — swapping in (atomic)..."
-  cmd_stop > /dev/null 2>&1 || true
+  if [ "${_defer}" = "0" ]; then
+    cmd_stop > /dev/null 2>&1 || true
+  fi
   rm -rf "${_lastgood}"
   # NOTE (deferred, not this pass — team-lead review): each `mv` below is
   # atomic on its own, but the two together are not a single atomic step —
@@ -1883,28 +2050,52 @@ cmd_update() {
   # $HIVEMIND_HOME swap already happened, and the health-check/rollback below
   # (requirement 4) still needs to run regardless of this side-swap's outcome.
   _update_installed_binary || true
+  # Whatever the live .claude wrote between the staging copy and the swap
+  # (OAuth refresh, transcripts, history, sessions): repeat the whole Tier-2
+  # copy, newer wins, never delete. Never lets the older staged snapshot win.
+  _carry_state_forward "${_lastgood}" "${HIVEMIND_HOME}"
 
   # Requirement 4: last-known-good + automatic rollback on a failed
   # post-update health check. _start_proxy exits(1) directly on its own
   # start-up failure (pre-existing behavior, relied on by cmd_start/cmd_open)
   # — run it in a SUBSHELL here so that exit only ends the subshell, not this
   # whole update, letting the rollback logic below actually run.
-  ( _start_proxy ) || true
+  if [ "${_defer}" = "0" ]; then
+    rm -f "${HM_RESTART_PENDING}"
+    ( _start_proxy ) || true
+  else
+    # line 1 = the version waiting to start, line 2 = the one to roll back to.
+    # A failed write must not abort the update (set -e): the files are swapped
+    # either way; worst case the next launch simply does not auto-restart.
+    { mkdir -p "$(dirname "${HM_RESTART_PENDING}")" && printf '%s\n%s\n' "${_after}" "${_before}" > "${HM_RESTART_PENDING}"; } || \
+      echo "Warning: could not write the restart-pending marker (${HM_RESTART_PENDING}); restart the proxy manually to run the new version." >&2
+  fi
   _check_health
 
   if [ "${_HEALTH_SEVERITY}" -ge 2 ]; then
     echo "Error: post-update health check FAILED — rolling back to ${_before:0:12}." >&2
-    cmd_stop > /dev/null 2>&1 || true
+    if [ "${_defer}" = "0" ]; then
+      cmd_stop > /dev/null 2>&1 || true
+    fi
+    # Newer credentials/history written meanwhile survive the rollback.
+    _carry_state_forward "${HIVEMIND_HOME}" "${_lastgood}"
     rm -rf "${HIVEMIND_HOME}"
     mv "${_lastgood}" "${HIVEMIND_HOME}"
     git -C "${HIVEMIND_SOURCE_DIR}" reset --hard "${_before}" > /dev/null 2>&1 || true
     _rollback_installed_binary
-    ( _start_proxy ) || true
+    if [ "${_defer}" = "0" ]; then
+      ( _start_proxy ) || true
+    else
+      rm -f "${HM_RESTART_PENDING}"
+    fi
     echo "Rolled back — running ${_before:0:12}." >&2
     exit 1
   fi
 
   echo "$(_ok "Updated"): ${_before:0:12} -> ${_after:0:12}."
+  if [ "${_defer}" = "1" ]; then
+    echo "The running proxy was left untouched; the new version starts on the next launch with no live session."
+  fi
 }
 
 # _maybe_auto_update: silent on-launch check (approved).

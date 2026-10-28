@@ -37,6 +37,7 @@ import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { mtlsProxyConfig, env } from './env.ts';
+import { isLivenessProbe, noteProxyRequest, registerActivityServer } from './proxy-activity.ts';
 
 // ── ~/.engram/mtls root ──────────────────────────────────────────────────────
 // Production default. Every function below that needs it takes an explicit
@@ -344,6 +345,7 @@ export function bindProxyListener(
     tls: { cert: localCert, key: localKey },
 
     async fetch(req: Request): Promise<Response> {
+      if (!isLivenessProbe(req.headers)) noteProxyRequest(); // liveness for `hivemind update` (GET /sessions), every listener
       const inUrl = new URL(req.url);
 
       // Fixed upstream path — proxy is purpose-built for one endpoint.
@@ -392,6 +394,7 @@ export function bindProxyListener(
     },
   });
   pinnedProjectByServer.set(server, isBindableProject(pinnedProject) ? pinnedProject : undefined);
+  registerActivityServer(server);
   return server;
 }
 

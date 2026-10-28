@@ -31,6 +31,7 @@ import { callMcpTool } from '../lib/backend-mcp-client.ts';
 import { env } from '../lib/env.ts';
 import { persist, load, type PersistedSessionEntry } from '../lib/session-store.ts';
 import { lifecycleEmitter } from '../lib/lifecycle-emitter.ts';
+import { snapshotProxyActivity } from '../lib/proxy-activity.ts';
 
 export const sessions = new Hono();
 
@@ -347,5 +348,14 @@ sessions.get('/', (c) => {
     watching: !!e.pidCleanup,
     heartbeat_active: !!e.heartbeatTimer,
   }));
-  return c.json({ sessions: list, count: list.length });
+  // proxy_* : liveness over EVERY proxy listener (default port + each target
+  // port) — `hivemind update` reads it to avoid restarting under an IDE client
+  // that never adopted a session. Absent on older daemons (the CLI falls back).
+  const act = snapshotProxyActivity();
+  return c.json({
+    sessions: list,
+    count: list.length,
+    proxy_active_connections: act.active_connections,
+    proxy_last_request_age_s: act.last_request_age_s,
+  });
 });
