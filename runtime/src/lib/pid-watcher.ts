@@ -16,7 +16,38 @@
 // existence check. Reconfirm this when/if Windows support is scheduled;
 // not a blocker today (this daemon only runs on Linux/macOS/WSL).
 
+import { readFileSync } from 'node:fs';
+
 type ExitReason = 'exit' | 'kill';
+
+/**
+ * Linux only: true when /proc/<pid>/stat reports state `Z` (zombie: exited,
+ * not yet reaped). kill(pid, 0) succeeds on a zombie, so it reads as alive.
+ * Any read/parse failure -> false (fall back to the kill(0) answer).
+ */
+function isZombie(pid: number): boolean {
+  if (process.platform !== 'linux') return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // "<pid> (<comm>) <state> ..." — comm may contain ')' so cut at the LAST one.
+    return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3) === 'Z';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Shared liveness check. ESRCH -> dead; EPERM (exists, no permission) -> alive;
+ * on Linux a zombie (state Z) -> dead. Windows/macOS keep kill(pid, 0) semantics.
+ */
+export function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch (err: unknown) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+  return !isZombie(pid);
+}
 
 /**
  * Watch an external pid by polling every 2 seconds.
@@ -29,24 +60,15 @@ export function watchPid(pid: number, onExit: (reason: ExitReason) => void): () 
   const timer = setInterval(() => {
     if (closed) return;
 
-    try {
-      // signal 0: check existence without sending a real signal.
-      process.kill(pid, 0);
-      // pid still alive — continue polling.
-    } catch (err: unknown) {
-      // ESRCH = no such process; EPERM = exists but no permission (treat as alive).
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ESRCH') {
-        // pid is gone — fire onExit and stop polling immediately.
-        closed = true;
-        clearInterval(timer);
-        try {
-          onExit('kill');
-        } catch (cbErr) {
-          console.error('[pid-watcher] onExit callback threw:', cbErr);
-        }
+    // ESRCH or a Linux zombie = gone; EPERM/other errors = still alive.
+    if (!pidAlive(pid)) {
+      closed = true;
+      clearInterval(timer);
+      try {
+        onExit('kill');
+      } catch (cbErr) {
+        console.error('[pid-watcher] onExit callback threw:', cbErr);
       }
-      // EPERM or any other error: pid may still be alive — continue polling.
     }
   }, 2_000);
 

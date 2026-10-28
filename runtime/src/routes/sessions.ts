@@ -26,7 +26,7 @@
 
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { watchPid } from '../lib/pid-watcher.ts';
+import { watchPid, pidAlive } from '../lib/pid-watcher.ts';
 import { callMcpTool } from '../lib/backend-mcp-client.ts';
 import { env } from '../lib/env.ts';
 import { persist, load, type PersistedSessionEntry } from '../lib/session-store.ts';
@@ -74,17 +74,6 @@ function persistStore(): void {
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
-
-/** Check pid liveness. ESRCH → dead; EPERM (exists, no permission) → alive. */
-function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: unknown) {
-    const code = (err as NodeJS.ErrnoException).code;
-    return code === 'EPERM';
-  }
-}
 
 /** Pause the session in the backend (best-effort — never throws). */
 async function pauseSessionInBackend(sessionId: string): Promise<void> {
