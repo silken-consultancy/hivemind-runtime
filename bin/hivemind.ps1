@@ -507,10 +507,19 @@ function Get-ProjectFront([string]$slug) {
   try {
     $env1 = ($dataLine -replace '^data:\s*', '') | ConvertFrom-Json
     $inner = $env1.result.content[0].text | ConvertFrom-Json
-    $row = @($inner.items | Where-Object { $_.slug -eq $slug -and $_.status -ne 'archived' -and $_.status -ne 'retired' -and $_.owned -ne $false }) | Select-Object -First 1
+    # StrictMode 2.0 throws on a missing property: every optional JSON key of the
+    # registry answer (slug/status/owned/front) is read through $opt, never directly.
+    # A legacy server (engram v1.72.0) lists rows with neither `owned` nor `front`.
+    $opt = { param($o, $n) if ($null -ne $o -and $o.PSObject.Properties[$n]) { return $o.$n } else { return $null } }
+    $items = @($inner.items)
+    # RT-CAP: a server that advertises no fronts at all (no row carries a `front`
+    # key) is a legacy server -> code, as before fronts existed. Judged over every row.
+    $advertised = @($items | Where-Object { $_ -and $_.PSObject.Properties['front'] }).Count -gt 0
+    $row = @($items | Where-Object { $_ -and ((& $opt $_ 'slug') -eq $slug) -and ((& $opt $_ 'status') -ne 'archived') -and ((& $opt $_ 'status') -ne 'retired') -and ((& $opt $_ 'owned') -ne $false) }) | Select-Object -First 1
   } catch { return (& $fail 'the registry answer could not be parsed') }
   if (-not $row) { return (& $fail "project '$slug' not found (missing or archived)") }
-  $front = "$($row.front)"
+  if (-not $advertised) { return @{ Front = 'code'; Error = $null } }
+  $front = "$(& $opt $row 'front')"
   if ($front -ne 'code' -and $front -ne 'studio') {
     return (& $fail "project '$slug' has no valid front (Code or Studio) - contact HiveMind support")
   }

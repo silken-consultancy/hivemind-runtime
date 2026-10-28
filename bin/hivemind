@@ -2672,6 +2672,7 @@ _open_session_spine() {
 _list_slugs() {
   _SLUGS_RAW=""
   _FRONTS_RAW=""
+  _FRONTS_ADVERTISED=0
   [ -n "${FOS_API_KEY:-}" ] || return 1
   local _resp
   _resp="$(_mcp_call "fos_registry" '{"action":"list"}' 1)"
@@ -2685,6 +2686,11 @@ _list_slugs() {
       const env = JSON.parse(process.argv[1]);
       const inner = JSON.parse(env.result.content[0].text);
       if (!inner || !Array.isArray(inner.items)) process.exit(3);
+      // First line is ALWAYS the capability header (never a project row; read
+      // by position): 1 when ANY row of the answer carries a `front` key (the
+      // server advertises project fronts), 0 when none does (a legacy server
+      // that predates fronts). Judged over every row, before any filtering.
+      process.stdout.write((inner.items.some((it) => it && typeof it === "object" && "front" in it) ? "1" : "0") + "\n");
       for (const it of inner.items) {
         // REAL project = same rule as the backend gate and the web: NOT
         // archived/retired (legacy `inactive` counts as real). Rows the
@@ -2708,6 +2714,9 @@ _list_slugs() {
     } catch { process.exit(3); }
   ' "${_resp}" 2>/dev/null)" || return 1
   _FRONTS_RAW=""
+  _FRONTS_ADVERTISED=0
+  [ "$(printf '%s\n' "${_out}" | head -n 1)" = "1" ] && _FRONTS_ADVERTISED=1
+  _out="$(printf '%s\n' "${_out}" | tail -n +2)"  # drop the capability header
   if [ -n "${_out}" ]; then
     # _SLUGS_RAW keeps its two-column shape (the picker and
     # _nondefault_slugs_raw read "slug<TAB>name"); fronts live apart.
@@ -3313,7 +3322,9 @@ _open_proxy_only() {
 # anything, launches Studio projects in Studio mode and Code projects in Code
 # mode, and gives every launch its OWN MCP connection bound to the project
 # (`?project=<slug>`). There is no default front: a front that is missing,
-# unknown or unreadable REFUSES the launch (fail closed, never code).
+# unknown or unreadable REFUSES the launch (fail closed, never code) — except against a
+# legacy server that advertises no fronts at all (no row has a `front` key):
+# that launch is code, as before fronts existed.
 RUN_DIR="${HIVEMIND_HOME}/run"
 
 # _resolve_project_front <slug>: sets _PROJECT_FRONT to code|studio, or
@@ -3330,6 +3341,11 @@ _resolve_project_front() {
   case "${_PROJECT_FRONT}" in
     code|studio) return 0 ;;
   esac
+  # Legacy server (RT-CAP): NO row of the registry answer carries a `front`
+  # key, so the server does not advertise fronts at all — launch exactly as
+  # before fronts existed (code). A server that DOES advertise fronts keeps the
+  # strict refusal below for a project whose front is missing/invalid.
+  if [ "${_FRONTS_ADVERTISED:-0}" != "1" ]; then _PROJECT_FRONT="code"; return 0; fi
   echo "Erro: o projeto '${_slug}' não tem uma frente (Code ou Studio) válida — a sessão não foi aberta." >&2
   echo "      Entre em contato com o suporte do HiveMind para corrigir o projeto." >&2
   echo "      Se isso continuar depois de atualizar o HiveMind, o servidor talvez ainda não tenha suporte a esta frente de projeto." >&2
