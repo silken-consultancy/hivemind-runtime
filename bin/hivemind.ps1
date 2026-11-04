@@ -395,6 +395,13 @@ function Invoke-SetupMode {
     }
     $st = Invoke-Native { & curl.exe -s --max-time 3 "http://127.0.0.1:$RuntimePort/setup/status" 2>$null }
     if ("$st" -match '"done"\s*:\s*true') { $done = $true; break }
+    if ("$st" -match '"refused"\s*:\s*true') {
+      # Plan without mTLS (Free/Pro): one plain line, stop the setup daemon, exit non-zero - no retry loop.
+      if ((Test-Alive $sp) -and (Test-IsOurDaemon $sp)) { [void](Stop-OurDaemon $sp) }
+      Remove-Item -LiteralPath $SetupPidFile -Force -ErrorAction SilentlyContinue
+      Write-Err "seu plano conecta via HTTPS/MCP; mTLS $([char]0x00E9) Ultra/Enterprise"
+      exit 1
+    }
     Start-Sleep -Seconds 1
   }
   if ((Test-Alive $sp) -and (Test-IsOurDaemon $sp)) { [void](Stop-OurDaemon $sp) }

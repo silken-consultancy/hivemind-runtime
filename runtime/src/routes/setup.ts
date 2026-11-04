@@ -142,6 +142,8 @@ function nonceMatches(expected: string, presented: string): boolean {
   return timingSafeEqual(a, b);
 }
 
+export const MTLS_NOT_IN_PLAN_MSG = 'seu plano conecta via HTTPS/MCP; mTLS é Ultra/Enterprise';
+
 // createSetupRouter — one instance per setup-mode daemon (server.ts mounts it
 // ONLY under --setup-only). State is per-instance, in memory:
 //  - nonce:          the launcher's one-shot secret; null once burned, or if
@@ -156,6 +158,7 @@ export function createSetupRouter(opts: { nonce?: string | null } = {}): Hono {
   let nonce: string | null = opts.nonce && opts.nonce.length > 0 ? opts.nonce : null;
   let enrolling = false;
   let enrollmentDone = false;
+  let refused = false;
 
   router.use('*', async (c, next) => {
     await next();
@@ -191,6 +194,10 @@ export function createSetupRouter(opts: { nonce?: string | null } = {}): Hono {
         nonce = null;
         enrollmentDone = true;
       }
+      if (res.status === 403) {
+        const body = (await res.clone().json().catch(() => null)) as { error?: string } | null;
+        if (body?.error === 'mtls_not_in_plan') refused = true;
+      }
       return res;
     } finally {
       enrolling = false;
@@ -199,7 +206,7 @@ export function createSetupRouter(opts: { nonce?: string | null } = {}): Hono {
 
   // ── GET /setup/status — poll endpoint for CLI ────────────────────────────────
   // The CLI polls this until { done: true } before shutting down the setup server.
-  router.get('/status', (c) => c.json({ done: enrollmentDone }));
+  router.get('/status', (c) => c.json({ done: enrollmentDone, refused }));
 
   return router;
 }
@@ -417,6 +424,19 @@ async function handleEnroll(c: Context): Promise<Response> {
       return c.json({ ok: false, message: `Não foi possível conectar à CA em ${caUrl}: ${msg}` }, 502);
     }
 
+    // The CA refuses certs to plans without mTLS (Free/Pro connect via
+    // HTTPS/MCP). One friendly line, a distinct error code the launcher polls
+    // (/setup/status → refused) — never the raw "CA retornou HTTP 403" dump.
+    let caDenied = false;
+    if (caRes.status === 403) {
+      const denyBody = (await caRes.clone().json().catch(() => null)) as { error?: string; message?: { error?: string } } | null;
+      const code = denyBody?.error ?? denyBody?.message?.error;
+      if (code === 'mtls_access_denied') caDenied = true;
+    }
+    if (caDenied) {
+      for (const f of [keyPath, csrPath]) { try { unlinkSync(f); } catch { /* best-effort: no orphan temp key/CSR on a refusal */ } }
+      return c.json({ ok: false, error: 'mtls_not_in_plan', message: MTLS_NOT_IN_PLAN_MSG }, 403);
+    }
     if (!caRes.ok) {
       const errBody = await caRes.text().catch(() => '');
       return c.json({

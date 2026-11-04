@@ -626,6 +626,15 @@ _setup_mode() {
       | grep -q '"done":true'; then
       break
     fi
+    # The CA refused the cert because the plan has no mTLS (Free/Pro): one
+    # plain line, stop the setup daemon, exit non-zero — no retry loop.
+    if curl -sf "http://127.0.0.1:${RUNTIME_PORT}/setup/status" 2>/dev/null \
+      | grep -q '"refused":true'; then
+      echo "seu plano conecta via HTTPS/MCP; mTLS é Ultra/Enterprise" >&2
+      trap - INT TERM HUP
+      _setup_stop_daemon "${_SETUP_PID}"
+      exit 1
+    fi
     _TRIES=$((_TRIES + 1))
     if [ "${_TRIES}" -ge 300 ]; then
       echo "Timeout: enrollment did not complete in 5 minutes." >&2
