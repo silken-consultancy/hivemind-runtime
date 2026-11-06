@@ -186,6 +186,15 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f __HIVEMIND_HOME__/.claude/hooks/pre-tool-use.env-value-guard.js ]; then exec node __HIVEMIND_HOME__/.claude/hooks/pre-tool-use.env-value-guard.js; fi"
+          }
+        ]
+      },
+      {
         "matcher": "Edit|Write|MultiEdit|Bash",
         "hooks": [
           {
