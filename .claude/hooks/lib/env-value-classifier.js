@@ -39,6 +39,15 @@ const CONTAINER_CLIS = new Set(['docker', 'podman', 'nerdctl', 'docker-compose']
 const INTERPRETERS = /^(node|nodejs|bun|deno|python[\d.]*|perl|ruby)$/;
 // Variable names that usually hold a credential.
 const SECRET_NAME = /(URL|PASS|SECRET|TOKEN|KEY|DSN|PWD|CREDENTIAL)/i;
+// Named printenv is an explicit allowlist (fail-closed), not the SECRET_NAME
+// denylist echo uses: only these names may be printed by it.
+const PRINTENV_ALLOWED = new Set([
+  'ENGRAM_SLUG', 'ENGRAM_SESSION_ID', 'ENGRAM_DEVICE_ID',
+  'HOME', 'USER', 'SHELL', 'PATH', 'PWD', 'LANG', 'TERM',
+]);
+// Wrappers that append operands read from stdin / a file after the argv the
+// classifier judged: a printenv beneath them cannot be analysed.
+const OPERAND_APPENDERS = new Set(['xargs', 'parallel']);
 // Directories whose contents are source, not deployment config: a recursive
 // search for a secret-like word there is a code search.
 const SOURCE_DIRS = new Set([
@@ -57,7 +66,9 @@ const REASONS = {
   'docker-inspect-env':
     'this docker inspect --format template can print env values (only names-only templates or ones that do not touch the env are allowed)',
   'env-print': '`env` with no command prints every variable with its value',
-  printenv: '`printenv` prints variable values',
+  printenv: '`printenv` with no variable name prints every variable with its value',
+  'printenv-named':
+    '`printenv` is limited to ENGRAM_SLUG, ENGRAM_SESSION_ID, ENGRAM_DEVICE_ID, HOME, USER, SHELL, PATH, PWD, LANG and TERM (optionally with -0/--null; not under xargs/parallel; no command substitution among its operands); for any other variable use `echo "$NAME"`',
   'export-print': 'bare `export` / `export -p` prints every exported variable with its value',
   'set-print': 'bare `set` prints every shell variable with its value',
   'declare-print': '`declare -p` / `declare -x` prints variable values',
@@ -580,7 +591,16 @@ function checkTokens(tokens, redirIn, depth, noUnwrap) {
     if (!rest.length) return hit('env-print');
     return checkTokens(rest, [], depth, noUnwrap);
   }
-  if (lead === 'printenv') return hit('printenv');
+  if (lead === 'printenv') {
+    // Bulk dump (no operand) is refused. Named operands must all be on the
+    // PRINTENV_ALLOWED list; anything else is refused.
+    const flags = args.filter((a) => a.startsWith('-'));
+    const names = args.filter((a) => !a.startsWith('-'));
+    if (!names.length) return hit('printenv');
+    if (flags.some((f) => f !== '-0' && f !== '--null')) return hit('printenv-named');
+    if (names.some((n) => !PRINTENV_ALLOWED.has(n))) return hit('printenv-named');
+    return null;
+  }
   if (lead === 'export') {
     if (!args.length || args.every((a) => a === '-p' || a === '--')) return hit('export-print');
     return null;
@@ -680,7 +700,7 @@ function checkTokens(tokens, redirIn, depth, noUnwrap) {
     return null;
   }
 
-  if (WRAPPERS.has(lead)) return noUnwrap ? null : unwrap(args, depth);
+  if (WRAPPERS.has(lead)) return noUnwrap ? null : unwrap(args, depth, lead);
 
   // Any other command reading an env file from stdin.
   if (redirIn.some(isEnvFile)) return hit('env-file-redirect');
@@ -689,8 +709,16 @@ function checkTokens(tokens, redirIn, depth, noUnwrap) {
 
 // Judge every suffix of a wrapper's arguments as a command of its own, plus
 // every multi-word argument as a nested command string.
-function unwrap(args, depth) {
+function unwrap(args, depth, lead) {
   if (depth > MAX_DEPTH) return hit('too-deep');
+  // xargs/parallel append stdin operands after the argv we judge: a printenv
+  // beneath them (any flags, any wrapper chain) can print an unjudged name.
+  if (
+    (OPERAND_APPENDERS.has(lead) || args.some((a) => OPERAND_APPENDERS.has(baseName(a)))) &&
+    args.some((a) => /\bprintenv\b/.test(a))
+  ) {
+    return hit('printenv-named');
+  }
   for (let k = 0; k < args.length; k++) {
     const r = checkTokens(args.slice(k), [], depth, true);
     if (r) return r;
@@ -734,9 +762,21 @@ function analyze(str, depth) {
     const r = analyze(m[1], depth + 1);
     if (r) return r;
   }
+  const hasSubst = /`|\$\(/.test(str);
   for (const seg of splitSegments(str)) {
     const r = checkSegment(seg, depth);
     if (r) return r;
+    // The tokenizer ends a segment at an unquoted backtick or $(, so a
+    // substitution among printenv's operands is invisible to its branch.
+    if (hasSubst) {
+      const l = baseName(seg.tokens.find((t) => !/^[A-Za-z_]\w*=/.test(t) && !SKIP_LEAD.has(t)) || '');
+      if (
+        l === 'printenv' ||
+        ((WRAPPERS.has(l) || l === 'env') && seg.tokens.some((t) => baseName(t) === 'printenv'))
+      ) {
+        return hit('printenv-named');
+      }
+    }
   }
   return null;
 }
