@@ -32,6 +32,7 @@ import { env } from '../lib/env.ts';
 import { persist, load, type PersistedSessionEntry } from '../lib/session-store.ts';
 import { lifecycleEmitter } from '../lib/lifecycle-emitter.ts';
 import { snapshotProxyActivity } from '../lib/proxy-activity.ts';
+import { startHeartbeat, type HeartbeatHandle } from '../lib/heartbeat-cadence.ts';
 
 export const sessions = new Hono();
 
@@ -45,7 +46,7 @@ interface SessionEntry {
   device_id: string;
   pid?: number;
   pidCleanup?: () => void;
-  heartbeatTimer?: ReturnType<typeof setInterval>;
+  heartbeatTimer?: HeartbeatHandle;
 }
 
 const sessionStore = new Map<string, SessionEntry>();
@@ -85,9 +86,9 @@ async function resumeSessionInBackend(sessionId: string): Promise<void> {
   await callMcpTool('fos_session', { action: 'resume', session_id: sessionId });
 }
 
-/** Send a heartbeat for the session (best-effort — never throws). */
-async function sendHeartbeat(sessionId: string): Promise<void> {
-  await callMcpTool('fos_heartbeat', {
+/** Send a heartbeat for the session (best-effort — never throws). Resolves to the reply (carries next_heartbeat_s) or undefined on failure. */
+async function sendHeartbeat(sessionId: string): Promise<unknown> {
+  return callMcpTool('fos_heartbeat', {
     action: 'update',
     session_id: sessionId,
     agent_type: 'claude-code',
@@ -114,9 +115,9 @@ function adoptPid(entry: SessionEntry, pid: number): void {
   // this, a silent-but-alive interactive session goes stale in the
   // backend's eyes and eventually reads as orphan to the watchdog, even
   // though nothing is actually wrong).
-  entry.heartbeatTimer = setInterval(() => {
-    void sendHeartbeat(entry.session_id);
-  }, 30_000);
+  // The cadence is server-driven: the reply's next_heartbeat_s sets the next
+  // beat (clamped; absent -> 30 s). See lib/heartbeat-cadence.ts.
+  entry.heartbeatTimer = startHeartbeat(() => sendHeartbeat(entry.session_id));
 
   // pid-watcher: when the pid dies, PAUSE (not close) — revive-on-return
   //. The daemon is not the judge of whether the session is
@@ -125,7 +126,7 @@ function adoptPid(entry: SessionEntry, pid: number): void {
     console.log(`[sessions] pid ${pid} gone — pausing session ${entry.session_id} (revive-on-return)`);
 
     if (entry.heartbeatTimer) {
-      clearInterval(entry.heartbeatTimer);
+      entry.heartbeatTimer.stop();
       entry.heartbeatTimer = undefined;
     }
     entry.pidCleanup = undefined;
@@ -300,7 +301,7 @@ export async function shutdownSessions(): Promise<void> {
   // Stop all watchers and heartbeats immediately — no timer fires mid-shutdown.
   for (const e of entries) {
     if (e.pidCleanup) { e.pidCleanup(); e.pidCleanup = undefined; }
-    if (e.heartbeatTimer) { clearInterval(e.heartbeatTimer); e.heartbeatTimer = undefined; }
+    if (e.heartbeatTimer) { e.heartbeatTimer.stop(); e.heartbeatTimer = undefined; }
   }
 
   const alive = entries.filter((e): e is SessionEntry & { pid: number } => e.pid !== undefined && pidAlive(e.pid));
