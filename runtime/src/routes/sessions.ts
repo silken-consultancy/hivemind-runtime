@@ -47,6 +47,8 @@ interface SessionEntry {
   pid?: number;
   pidCleanup?: () => void;
   heartbeatTimer?: HeartbeatHandle;
+  /** Launch MCP URL carries session=<uuid>: the server counts this session's calls, so liveness:'activity' may end the beat. */
+  launch_keyed?: boolean;
 }
 
 const sessionStore = new Map<string, SessionEntry>();
@@ -66,6 +68,7 @@ function persistStore(): void {
         slug: e.slug,
         device_id: e.device_id,
         started_at: new Date().toISOString(),
+        ...(e.launch_keyed ? { launch_keyed: true } : {}),
       });
     }
   }
@@ -117,7 +120,7 @@ function adoptPid(entry: SessionEntry, pid: number): void {
   // though nothing is actually wrong).
   // The cadence is server-driven: the reply's next_heartbeat_s sets the next
   // beat (clamped; absent -> 30 s). See lib/heartbeat-cadence.ts.
-  entry.heartbeatTimer = startHeartbeat(() => sendHeartbeat(entry.session_id));
+  entry.heartbeatTimer = startHeartbeat(() => sendHeartbeat(entry.session_id), { honourActivityStop: entry.launch_keyed === true });
 
   // pid-watcher: when the pid dies, PAUSE (not close) — revive-on-return
   //. The daemon is not the judge of whether the session is
@@ -149,6 +152,7 @@ const adoptSchema = z.object({
   session_id: z.string().min(1),
   pid: z.number().int().positive(),
   slug: z.string().min(1),
+  launch_keyed: z.boolean().optional(),
 });
 
 sessions.post('/adopt', async (c) => {
@@ -160,13 +164,14 @@ sessions.post('/adopt', async (c) => {
     return c.json({ error: 'validation_failed', issues: parsed.error.issues }, 400);
   }
 
-  const { session_id, pid, slug } = parsed.data;
+  const { session_id, pid, slug, launch_keyed } = parsed.data;
 
   let entry = sessionStore.get(session_id);
   if (!entry) {
     entry = { session_id, slug, device_id: env.HIVEMIND_DEVICE_ID ?? '' };
     sessionStore.set(session_id, entry);
   }
+  if (launch_keyed === true) entry.launch_keyed = true;
   adoptPid(entry, pid);
 
   return c.json({ ok: true, session_id, pid });
@@ -208,6 +213,11 @@ interface ListActiveResult {
   count: number;
 }
 
+/** Was this session launched with session=<uuid> on its MCP URL (local mirror; unknown -> false = keep beating). */
+function keyedInMirror(mirror: PersistedSessionEntry[], sessionId: string): boolean {
+  return mirror.some((m) => m.session_id === sessionId && m.launch_keyed === true);
+}
+
 export async function reconcileOnStartup(): Promise<void> {
   const deviceId = env.HIVEMIND_DEVICE_ID;
   const result = await callMcpTool<ListActiveResult>('fos_session', { action: 'list_active' });
@@ -221,6 +231,7 @@ export async function reconcileOnStartup(): Promise<void> {
       return;
     }
 
+    const mirror = load(); // read BEFORE any adoptPid: persistStore() rewrites the mirror from the live table
     const mine = result.items.filter((row) => row.device_id === deviceId);
     let revived = 0;
     let skipped = 0;
@@ -231,7 +242,7 @@ export async function reconcileOnStartup(): Promise<void> {
         continue;
       }
       console.log(`[sessions] reconcile: pid ${row.pid} alive — re-adopting session ${row.session_id} (slug=${row.slug})`);
-      const entry: SessionEntry = { session_id: row.session_id, slug: row.slug, device_id: row.device_id };
+      const entry: SessionEntry = { session_id: row.session_id, slug: row.slug, device_id: row.device_id, launch_keyed: keyedInMirror(mirror, row.session_id) };
       sessionStore.set(row.session_id, entry);
       adoptPid(entry, row.pid);
       await resumeSessionInBackend(row.session_id);
@@ -256,7 +267,7 @@ export async function reconcileOnStartup(): Promise<void> {
   for (const e of entries) {
     if (!pidAlive(e.pid)) continue;
     console.log(`[sessions] reconcile (degraded): pid ${e.pid} alive — re-adopting session ${e.session_id}`);
-    const entry: SessionEntry = { session_id: e.session_id, slug: e.slug, device_id: e.device_id };
+    const entry: SessionEntry = { session_id: e.session_id, slug: e.slug, device_id: e.device_id, launch_keyed: e.launch_keyed === true };
     sessionStore.set(e.session_id, entry);
     adoptPid(entry, e.pid);
     void resumeSessionInBackend(e.session_id); // best-effort — the backend may still be down
@@ -336,7 +347,7 @@ sessions.get('/', (c) => {
     session_id: e.session_id,
     pid: e.pid,
     watching: !!e.pidCleanup,
-    heartbeat_active: !!e.heartbeatTimer,
+    heartbeat_active: !!e.heartbeatTimer && !e.heartbeatTimer.stopped(),
   }));
   // proxy_* : liveness over EVERY proxy listener (default port + each target
   // port) — `hivemind update` reads it to avoid restarting under an IDE client

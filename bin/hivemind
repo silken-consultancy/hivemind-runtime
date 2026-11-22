@@ -3416,6 +3416,25 @@ _prepare_launch_mcp_config() {
   _LAUNCH_MCP_CONFIG="${_dir}/mcp.json"
 }
 
+# _add_session_to_launch_mcp_config <session-id>: the server's liveness key is
+# the session id carried on the MCP URL (?project=<slug>&session=<id>), so the
+# per-launch config is rewritten (same file, same 0600) once the session spine
+# has opened. Only a uuid-shaped id is accepted (the exact key shape the server
+# expects); anything else (spine failed / no FOS key / odd value) leaves the
+# URL exactly as it was. Never fails the launch.
+_add_session_to_launch_mcp_config() {
+  local _sid="$1"
+  [ -n "${_LAUNCH_MCP_CONFIG:-}" ] && [ -f "${_LAUNCH_MCP_CONFIG}" ] || return 0
+  case "${_sid}" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
+    *) return 0 ;;
+  esac
+  local _tmp="${_LAUNCH_MCP_CONFIG}.tmp.$$"
+  ( umask 077; sed "s|\(/v1/mcp?project=[A-Za-z0-9._-]*\)\"|\1\&session=${_sid}\"|" "${_LAUNCH_MCP_CONFIG}" > "${_tmp}" ) \
+    && chmod 600 "${_tmp}" && mv -f "${_tmp}" "${_LAUNCH_MCP_CONFIG}" || rm -f "${_tmp}"
+  return 0
+}
+
 # _watch_launch_cleanup <run-dir>: the launch ends in `exec claude`, so this
 # shell cannot trap its own exit. A detached watcher on THIS pid (which
 # becomes claude's, exec keeps it) removes the run dir once it is gone — also
@@ -3496,6 +3515,7 @@ cmd_open() {
   # ANTES do exec (mirrors the launcher flow). Sets ENGRAM_SESSION_ID/
   # ENGRAM_DEVICE_ID (globals, best-effort — see _open_session_spine).
   _open_session_spine "${_project_slug}"
+  _add_session_to_launch_mcp_config "${ENGRAM_SESSION_ID:-}"
 
   # Adopt-before-exec: register this session's pid with
   # the daemon so its pid-watcher + heartbeat (routes/sessions.ts)
@@ -3505,10 +3525,14 @@ cmd_open() {
   # exec preserves the pid.
   # Best-effort, same fail-soft spirit as _open_session_spine itself: a
   # daemon hiccup here must never block the user from opening Claude.
+  # launch_keyed:true only when the per-launch mcp.json really carries this
+  # session id (absent = unkeyed, body identical to before): the runtime then may stop heartbeating on liveness:'activity'.
+  local _keyed=""
+  if [ -n "${ENGRAM_SESSION_ID}" ] && grep -q "session=${ENGRAM_SESSION_ID}\"" "${_LAUNCH_MCP_CONFIG}" 2>/dev/null; then _keyed=",\"launch_keyed\":true"; fi
   if [ -n "${ENGRAM_SESSION_ID}" ]; then
     curl -s -X POST --max-time 3 \
       -H "Content-Type: application/json" \
-      -d "{\"session_id\":\"${ENGRAM_SESSION_ID}\",\"pid\":$$,\"slug\":\"${_project_slug}\"}" \
+      -d "{\"session_id\":\"${ENGRAM_SESSION_ID}\",\"pid\":$$,\"slug\":\"${_project_slug}\"${_keyed}}" \
       "http://127.0.0.1:${RUNTIME_PORT}/sessions/adopt" > /dev/null 2>&1 || true
   fi
 

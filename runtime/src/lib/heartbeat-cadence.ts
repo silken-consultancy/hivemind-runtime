@@ -12,7 +12,16 @@
 //  - send failed (undefined reply / throw) -> retry at 30 s until a beat
 //    succeeds (two transient failures at a long interval could otherwise let
 //    a live session look dead to the watchdog);
-//  - never stops by itself: only stop() ends it (window close / pid gone).
+//  - reply carries liveness === 'activity' (Z8.3 server: liveness is counted
+//    from tool-call activity, not from beats) -> the loop ENDS, nothing is
+//    rescheduled. Only a real reply can do this; a failed send never stops it.
+//    An old server never sends the field, so it keeps beating as above;
+//    the stop is honoured ONLY when the caller says this session's MCP URL
+//    carries session=<uuid> (opts.honourActivityStop): the server answers
+//    'activity' by global mode, but only a keyed session has its calls counted
+//    as that session's liveness; an unkeyed one (Windows launcher, failed spine,
+//    non-cmd_open launch) keeps the advised cadence;
+//  - otherwise never stops by itself: only stop() ends it (window close / pid gone).
 //
 // Clamp rationale: floor 30 s = today's cadence, a server can never make the
 // runtime chatter more than it does now. Ceiling 3600 s only bounds a buggy
@@ -28,6 +37,14 @@ export interface HeartbeatHandle {
   stop(): void;
   /** Seconds the next (or in-flight) beat is/was scheduled after; for diagnostics. */
   currentIntervalS(): number;
+  /** True once stop() was called or the server declared liveness:'activity'. */
+  stopped(): boolean;
+}
+
+/** True when the reply says the server counts activity, so beats are pointless. */
+export function replyIsActivityLiveness(reply: unknown): boolean {
+  if (reply === null || typeof reply !== 'object') return false;
+  return (reply as { liveness?: unknown }).liveness === 'activity';
 }
 
 /** Interval in seconds the reply asks for, or undefined when it asks nothing usable. */
@@ -42,7 +59,11 @@ export function nextIntervalFromReply(reply: unknown): number | undefined {
  * Start beating. The first beat fires after HEARTBEAT_DEFAULT_S (as the old
  * setInterval did). `send` resolves to the reply, or undefined on failure.
  */
-export function startHeartbeat(send: () => Promise<unknown>): HeartbeatHandle {
+export function startHeartbeat(
+  send: () => Promise<unknown>,
+  opts: { honourActivityStop?: boolean } = {},
+): HeartbeatHandle {
+  const honourActivityStop = opts.honourActivityStop === true;
   let intervalS = HEARTBEAT_DEFAULT_S;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -60,6 +81,7 @@ export function startHeartbeat(send: () => Promise<unknown>): HeartbeatHandle {
       reply = undefined; // error: keep current interval
     }
     if (stopped) return; // window closed while the call was in flight
+    if (honourActivityStop && replyIsActivityLiveness(reply)) { stopped = true; return; } // server counts activity: end the loop
     // success: obey the reply (30 s when it is silent); failure: retry at 30 s
     intervalS = reply === undefined
       ? HEARTBEAT_DEFAULT_S
@@ -75,5 +97,6 @@ export function startHeartbeat(send: () => Promise<unknown>): HeartbeatHandle {
       if (timer) { clearTimeout(timer); timer = undefined; }
     },
     currentIntervalS: () => intervalS,
+    stopped: () => stopped,
   };
 }

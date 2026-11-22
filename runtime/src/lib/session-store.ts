@@ -32,6 +32,8 @@ export interface PersistedSessionEntry {
   slug: string;
   device_id: string;
   started_at: string; // ISO-8601
+  /** The launch MCP URL carries session=<uuid> (Z8.5): only then may the heartbeat stop on liveness:'activity'. */
+  launch_keyed?: boolean;
 }
 
 // ---------------------------------------------------------------
